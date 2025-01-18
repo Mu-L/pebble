@@ -9,8 +9,10 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
+	"github.com/cockroachdb/pebble/cockroachkvs"
 	"github.com/cockroachdb/pebble/internal/bytealloc"
 	"github.com/cockroachdb/pebble/objstorage/remote"
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
@@ -57,9 +59,11 @@ func newPebbleDB(dir string) DB {
 	defer cache.Unref()
 	opts := &pebble.Options{
 		Cache:                       cache,
-		Comparer:                    mvccComparer,
+		Comparer:                    &cockroachkvs.Comparer,
 		DisableWAL:                  disableWAL,
 		FormatMajorVersion:          pebble.FormatNewest,
+		KeySchema:                   cockroachkvs.KeySchema.Name,
+		KeySchemas:                  sstable.MakeKeySchemas(&cockroachkvs.KeySchema),
 		L0CompactionThreshold:       2,
 		L0StopWritesThreshold:       1000,
 		LBaseMaxBytes:               64 << 20, // 64 MB
@@ -74,6 +78,9 @@ func newPebbleDB(dir string) DB {
 			return 3
 		},
 	}
+	// In FormatColumnarBlocks (the value of FormatNewest at the time of
+	// writing), columnar blocks are only written if explicitly opted into.
+	opts.Experimental.EnableColumnarBlocks = func() bool { return true }
 
 	for i := 0; i < len(opts.Levels); i++ {
 		l := &opts.Levels[i]
@@ -105,7 +112,7 @@ func newPebbleDB(dir string) DB {
 			// Store all shared objects on local disk, for convenience.
 			"": remote.NewLocalFS(pathToLocalSharedStorage, vfs.Default),
 		})
-		opts.Experimental.CreateOnShared = true
+		opts.Experimental.CreateOnShared = remote.CreateOnSharedAll
 		if secondaryCacheSize != 0 {
 			opts.Experimental.SecondaryCacheSizeBytes = secondaryCacheSize
 		}
@@ -131,7 +138,8 @@ func (p pebbleDB) Flush() error {
 }
 
 func (p pebbleDB) NewIter(opts *pebble.IterOptions) iterator {
-	return p.d.NewIter(opts)
+	iter, _ := p.d.NewIter(opts)
+	return iter
 }
 
 func (p pebbleDB) NewBatch() batch {

@@ -5,11 +5,16 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"time"
 
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/cockroachkvs"
+	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/testkeys"
+	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/tool"
 	"github.com/spf13/cobra"
 )
@@ -28,6 +33,19 @@ var (
 	// If zero, or if !sharedStorageEnabled, secondary cache is
 	// not used.
 	secondaryCacheSize int64
+)
+
+// Define a few default key schemas including the testkey schema. Feeding this
+// schema to the tool ensures the cmd/pebble cli tool natively understands the
+// sstables constructed by our test cases.
+//
+// TODO(jackson): Ideally when a sstable.Reader finds a key schema that's a
+// DefaultKeySchema not already in the KeySchemas constructed with a Comparer
+// that it knows of, it would automatically construct the appropriate KeySchema.
+// Or at least the cli tool should.
+var (
+	testKeysSchema = colblk.DefaultKeySchema(testkeys.Comparer, 16)
+	defaultSchema  = colblk.DefaultKeySchema(base.DefaultComparer, 16)
 )
 
 func main() {
@@ -52,12 +70,21 @@ func main() {
 	)
 
 	rootCmd := &cobra.Command{
-		Use:   "pebble [command] (flags)",
-		Short: "pebble benchmarking/introspection tool",
+		Use:     "pebble [command] (flags)",
+		Short:   "pebble benchmarking/introspection tool",
+		Version: fmt.Sprintf("supported Pebble format versions: %d-%d", pebble.FormatMinSupported, pebble.FormatNewest),
 	}
+	rootCmd.SetVersionTemplate(`{{printf "%s" .Short}}
+{{printf "%s" .Version}}
+`)
 	rootCmd.AddCommand(benchCmd)
 
-	t := tool.New(tool.Comparers(mvccComparer, testkeys.Comparer), tool.Mergers(fauxMVCCMerger))
+	t := tool.New(
+		tool.Comparers(&cockroachkvs.Comparer, testkeys.Comparer),
+		tool.Mergers(fauxMVCCMerger),
+		tool.KeySchema(defaultSchema.Name),
+		tool.KeySchemas(&cockroachkvs.KeySchema, &testKeysSchema, &defaultSchema),
+	)
 	rootCmd.AddCommand(t.Commands...)
 
 	for _, cmd := range []*cobra.Command{replayCmd, scanCmd, syncCmd, tombstoneCmd, writeBenchCmd, ycsbCmd} {

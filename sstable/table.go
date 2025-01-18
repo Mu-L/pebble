@@ -74,6 +74,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/sstable/block"
 )
 
 /*
@@ -184,7 +185,6 @@ Data blocks have some additional features:
 */
 
 const (
-	blockTrailerLen                    = 5
 	blockHandleMaxLenWithoutProperties = 10 + 10
 	// blockHandleLikelyMaxLen can be used for pre-allocating buffers to
 	// reduce memory copies. It is not guaranteed that a block handle will not
@@ -212,7 +212,7 @@ const (
 	metaRangeKeyName   = "pebble.range_key"
 	metaValueIndexName = "pebble.value_index"
 	metaPropertiesName = "rocksdb.properties"
-	metaRangeDelName   = "rocksdb.range_del"
+	metaRangeDelV1Name = "rocksdb.range_del"
 	metaRangeDelV2Name = "rocksdb.range_del2"
 
 	// Index Types.
@@ -231,76 +231,6 @@ const (
 	rocksDBCompressionOptions = "window_bits=-14; level=32767; strategy=0; max_dict_bytes=0; zstd_max_train_bytes=0; enabled=0; "
 )
 
-// ChecksumType specifies the checksum used for blocks.
-type ChecksumType byte
-
-// The available checksum types.
-const (
-	ChecksumTypeNone     ChecksumType = 0
-	ChecksumTypeCRC32c   ChecksumType = 1
-	ChecksumTypeXXHash   ChecksumType = 2
-	ChecksumTypeXXHash64 ChecksumType = 3
-)
-
-// String implements fmt.Stringer.
-func (t ChecksumType) String() string {
-	switch t {
-	case ChecksumTypeCRC32c:
-		return "crc32c"
-	case ChecksumTypeNone:
-		return "none"
-	case ChecksumTypeXXHash:
-		return "xxhash"
-	case ChecksumTypeXXHash64:
-		return "xxhash64"
-	default:
-		panic(errors.Newf("sstable: unknown checksum type: %d", t))
-	}
-}
-
-type blockType byte
-
-const (
-	// The block type gives the per-block compression format.
-	// These constants are part of the file format and should not be changed.
-	// They are different from the Compression constants because the latter
-	// are designed so that the zero value of the Compression type means to
-	// use the default compression (which is snappy).
-	// Not all compression types listed here are supported.
-	noCompressionBlockType     blockType = 0
-	snappyCompressionBlockType blockType = 1
-	zlibCompressionBlockType   blockType = 2
-	bzip2CompressionBlockType  blockType = 3
-	lz4CompressionBlockType    blockType = 4
-	lz4hcCompressionBlockType  blockType = 5
-	xpressCompressionBlockType blockType = 6
-	zstdCompressionBlockType   blockType = 7
-)
-
-// String implements fmt.Stringer.
-func (t blockType) String() string {
-	switch t {
-	case 0:
-		return "none"
-	case 1:
-		return "snappy"
-	case 2:
-		return "zlib"
-	case 3:
-		return "bzip2"
-	case 4:
-		return "lz4"
-	case 5:
-		return "lz4hc"
-	case 6:
-		return "xpress"
-	case 7:
-		return "zstd"
-	default:
-		panic(errors.Newf("sstable: unknown block type: %d", t))
-	}
-}
-
 // legacy (LevelDB) footer format:
 //
 //	metaindex handle (varint64 offset, varint64 size)
@@ -318,84 +248,101 @@ func (t blockType) String() string {
 //	table_magic_number (8 bytes)
 type footer struct {
 	format      TableFormat
-	checksum    ChecksumType
-	metaindexBH BlockHandle
-	indexBH     BlockHandle
-	footerBH    BlockHandle
+	checksum    block.ChecksumType
+	metaindexBH block.Handle
+	indexBH     block.Handle
+	footerBH    block.Handle
 }
 
-func readFooter(f objstorage.Readable) (footer, error) {
-	var footer footer
+// readFooter reads the footer from the end of the file.
+//
+// readHandle is optional.
+func readFooter(
+	ctx context.Context,
+	f objstorage.Readable,
+	readHandle objstorage.ReadHandle,
+	logger base.LoggerAndTracer,
+	fileNum base.DiskFileNum,
+) (footer, error) {
+	var err error
 	size := f.Size()
 	if size < minFooterLen {
-		return footer, base.CorruptionErrorf("pebble/table: invalid table (file size is too small)")
+		return footer{}, base.CorruptionErrorf("pebble/table: invalid table %s (file size is too small)",
+			errors.Safe(fileNum))
 	}
-
 	buf := make([]byte, maxFooterLen)
 	off := size - maxFooterLen
 	if off < 0 {
 		off = 0
 		buf = buf[:size]
 	}
-	if err := f.ReadAt(context.TODO(), buf, off); err != nil {
-		return footer, errors.Wrap(err, "pebble/table: invalid table (could not read footer)")
+	buf, err = block.ReadRaw(ctx, f, readHandle, logger, fileNum, buf, off)
+	if err != nil {
+		return footer{}, err
 	}
+	foot, err := parseFooter(buf, off, size)
+	if err != nil {
+		return footer{}, errors.Wrapf(err, "pebble/table: invalid table %s", errors.Safe(fileNum))
+	}
+	return foot, nil
+}
 
+func parseFooter(buf []byte, off, size int64) (footer, error) {
+	var footer footer
 	switch magic := buf[len(buf)-len(rocksDBMagic):]; string(magic) {
 	case levelDBMagic:
 		if len(buf) < levelDBFooterLen {
-			return footer, base.CorruptionErrorf(
-				"pebble/table: invalid table (footer too short): %d", errors.Safe(len(buf)))
+			return footer, base.CorruptionErrorf("(footer too short): %d", errors.Safe(len(buf)))
 		}
 		footer.footerBH.Offset = uint64(off+int64(len(buf))) - levelDBFooterLen
 		buf = buf[len(buf)-levelDBFooterLen:]
 		footer.footerBH.Length = uint64(len(buf))
 		footer.format = TableFormatLevelDB
-		footer.checksum = ChecksumTypeCRC32c
+		footer.checksum = block.ChecksumTypeCRC32c
 
 	case rocksDBMagic, pebbleDBMagic:
 		// NOTE: The Pebble magic string implies the same footer format as that used
 		// by the RocksDBv2 table format.
 		if len(buf) < rocksDBFooterLen {
-			return footer, base.CorruptionErrorf("pebble/table: invalid table (footer too short): %d", errors.Safe(len(buf)))
+			return footer, base.CorruptionErrorf("(footer too short): %d", errors.Safe(len(buf)))
 		}
 		footer.footerBH.Offset = uint64(off+int64(len(buf))) - rocksDBFooterLen
 		buf = buf[len(buf)-rocksDBFooterLen:]
 		footer.footerBH.Length = uint64(len(buf))
 		version := binary.LittleEndian.Uint32(buf[rocksDBVersionOffset:rocksDBMagicOffset])
 
-		format, err := ParseTableFormat(magic, version)
+		format, err := parseTableFormat(magic, version)
 		if err != nil {
 			return footer, err
 		}
 		footer.format = format
 
-		switch ChecksumType(buf[0]) {
-		case ChecksumTypeCRC32c:
-			footer.checksum = ChecksumTypeCRC32c
-		case ChecksumTypeXXHash64:
-			footer.checksum = ChecksumTypeXXHash64
+		switch block.ChecksumType(buf[0]) {
+		case block.ChecksumTypeCRC32c:
+			footer.checksum = block.ChecksumTypeCRC32c
+		case block.ChecksumTypeXXHash64:
+			footer.checksum = block.ChecksumTypeXXHash64
 		default:
-			return footer, base.CorruptionErrorf("pebble/table: unsupported checksum type %d", errors.Safe(footer.checksum))
+			return footer, base.CorruptionErrorf("(unsupported checksum type %d)", errors.Safe(footer.checksum))
 		}
 		buf = buf[1:]
 
 	default:
-		return footer, base.CorruptionErrorf("pebble/table: invalid table (bad magic number: 0x%x)", magic)
+		return footer, base.CorruptionErrorf("(bad magic number: 0x%x)", magic)
 	}
 
 	{
 		end := uint64(size)
 		var n int
-		footer.metaindexBH, n = decodeBlockHandle(buf)
+		footer.metaindexBH, n = block.DecodeHandle(buf)
 		if n == 0 || footer.metaindexBH.Offset+footer.metaindexBH.Length > end {
-			return footer, base.CorruptionErrorf("pebble/table: invalid table (bad metaindex block handle)")
+			return footer, base.CorruptionErrorf("(bad metaindex block handle)")
 		}
 		buf = buf[n:]
 
-		footer.indexBH, n = decodeBlockHandle(buf)
+		footer.indexBH, n = block.DecodeHandle(buf)
 		if n == 0 || footer.indexBH.Offset+footer.indexBH.Length > end {
-			return footer, base.CorruptionErrorf("pebble/table: invalid table (bad index block handle)")
+			return footer, base.CorruptionErrorf("(bad index block handle)")
 		}
 	}
 
@@ -406,33 +353,29 @@ func (f footer) encode(buf []byte) []byte {
 	switch magic, version := f.format.AsTuple(); magic {
 	case levelDBMagic:
 		buf = buf[:levelDBFooterLen]
-		for i := range buf {
-			buf[i] = 0
-		}
-		n := encodeBlockHandle(buf[0:], f.metaindexBH)
-		encodeBlockHandle(buf[n:], f.indexBH)
+		clear(buf)
+		n := f.metaindexBH.EncodeVarints(buf[0:])
+		f.indexBH.EncodeVarints(buf[n:])
 		copy(buf[len(buf)-len(levelDBMagic):], levelDBMagic)
 
 	case rocksDBMagic, pebbleDBMagic:
 		buf = buf[:rocksDBFooterLen]
-		for i := range buf {
-			buf[i] = 0
-		}
+		clear(buf)
 		switch f.checksum {
-		case ChecksumTypeNone:
-			buf[0] = byte(ChecksumTypeNone)
-		case ChecksumTypeCRC32c:
-			buf[0] = byte(ChecksumTypeCRC32c)
-		case ChecksumTypeXXHash:
-			buf[0] = byte(ChecksumTypeXXHash)
-		case ChecksumTypeXXHash64:
-			buf[0] = byte(ChecksumTypeXXHash64)
+		case block.ChecksumTypeNone:
+			buf[0] = byte(block.ChecksumTypeNone)
+		case block.ChecksumTypeCRC32c:
+			buf[0] = byte(block.ChecksumTypeCRC32c)
+		case block.ChecksumTypeXXHash:
+			buf[0] = byte(block.ChecksumTypeXXHash)
+		case block.ChecksumTypeXXHash64:
+			buf[0] = byte(block.ChecksumTypeXXHash64)
 		default:
 			panic("unknown checksum type")
 		}
 		n := 1
-		n += encodeBlockHandle(buf[n:], f.metaindexBH)
-		encodeBlockHandle(buf[n:], f.indexBH)
+		n += f.metaindexBH.EncodeVarints(buf[n:])
+		n += f.indexBH.EncodeVarints(buf[n:])
 		binary.LittleEndian.PutUint32(buf[rocksDBVersionOffset:], version)
 		copy(buf[len(buf)-len(rocksDBMagic):], magic)
 
@@ -447,7 +390,7 @@ func supportsTwoLevelIndex(format TableFormat) bool {
 	switch format {
 	case TableFormatLevelDB:
 		return false
-	case TableFormatRocksDBv2, TableFormatPebblev1, TableFormatPebblev2, TableFormatPebblev3, TableFormatPebblev4:
+	case TableFormatRocksDBv2, TableFormatPebblev1, TableFormatPebblev2, TableFormatPebblev3, TableFormatPebblev4, TableFormatPebblev5:
 		return true
 	default:
 		panic("sstable: unspecified table format version")

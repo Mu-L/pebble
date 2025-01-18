@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"unsafe"
 
 	"github.com/cockroachdb/pebble/internal/base"
-	"github.com/cockroachdb/pebble/internal/rangekey"
+	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 )
 
 // Block properties are an optional user-facing feature that can be used to
@@ -97,49 +99,59 @@ import (
 type BlockPropertyCollector interface {
 	// Name returns the name of the block property collector.
 	Name() string
-	// Add is called with each new entry added to a data block in the sstable.
-	// The callee can assume that these are in sorted order.
-	Add(key InternalKey, value []byte) error
+
+	// AddPointKey is called with each new key added to a data block in the
+	// sstable. The callee can assume that these are in sorted order.
+	AddPointKey(key InternalKey, value []byte) error
+
+	// AddRangeKeys is called for each range span added to the sstable. The range
+	// key properties are stored separately and don't contribute to data block
+	// properties. They are only used when FinishTable is called.
+	// TODO(radu): clean up this subtle semantic.
+	AddRangeKeys(span keyspan.Span) error
+
+	// AddCollectedWithSuffixReplacement adds previously collected property data
+	// and updates it to reflect a change of suffix on all keys: the old property
+	// data is assumed to be constructed from keys that all have the same
+	// oldSuffix and is recalculated to reflect the same keys but with newSuffix.
+	//
+	// A collector which supports this method must be able to derive its updated
+	// value from its old value and the change being made to the suffix, without
+	// needing to be passed each updated K/V.
+	//
+	// For example, a collector that only inspects values can simply copy its
+	// previously computed property as-is, since key-suffix replacement does not
+	// change values, while a collector that depends only on key suffixes, like
+	// one which collected mvcc-timestamp bounds from timestamp-suffixed keys, can
+	// just set its new bounds from the new suffix, as it is common to all keys,
+	// without needing to recompute it from every key.
+	//
+	// This method is optional (if it is not implemented, it always returns an
+	// error). SupportsSuffixReplacement() can be used to check if this method is
+	// implemented.
+	AddCollectedWithSuffixReplacement(oldProp []byte, oldSuffix, newSuffix []byte) error
+
+	// SupportsSuffixReplacement returns whether the collector supports the
+	// AddCollectedWithSuffixReplacement method.
+	SupportsSuffixReplacement() bool
+
 	// FinishDataBlock is called when all the entries have been added to a
 	// data block. Subsequent Add calls will be for the next data block. It
 	// returns the property value for the finished block.
 	FinishDataBlock(buf []byte) ([]byte, error)
+
 	// AddPrevDataBlockToIndexBlock adds the entry corresponding to the
 	// previous FinishDataBlock to the current index block.
 	AddPrevDataBlockToIndexBlock()
+
 	// FinishIndexBlock is called when an index block, containing all the
 	// key-value pairs since the last FinishIndexBlock, will no longer see new
 	// entries. It returns the property value for the index block.
 	FinishIndexBlock(buf []byte) ([]byte, error)
+
 	// FinishTable is called when the sstable is finished, and returns the
 	// property value for the sstable.
 	FinishTable(buf []byte) ([]byte, error)
-}
-
-// SuffixReplaceableBlockCollector is an extension to the BlockPropertyCollector
-// interface that allows a block property collector to indicate that it supports
-// being *updated* during suffix replacement, i.e. when an existing SST in which
-// all keys have the same key suffix is updated to have a new suffix.
-//
-// A collector which supports being updated in such cases must be able to derive
-// its updated value from its old value and the change being made to the suffix,
-// without needing to be passed each updated K/V.
-//
-// For example, a collector that only inspects values would can simply copy its
-// previously computed property as-is, since key-suffix replacement does not
-// change values, while a collector that depends only on key suffixes, like one
-// which collected mvcc-timestamp bounds from timestamp-suffixed keys, can just
-// set its new bounds from the new suffix, as it is common to all keys, without
-// needing to recompute it from every key.
-//
-// An implementation of DataBlockIntervalCollector can also implement this
-// interface, in which case the BlockPropertyCollector returned by passing it to
-// NewBlockIntervalCollector will also implement this interface automatically.
-type SuffixReplaceableBlockCollector interface {
-	// UpdateKeySuffixes is called when a block is updated to change the suffix of
-	// all keys in the block, and is passed the old value for that prop, if any,
-	// for that block as well as the old and new suffix.
-	UpdateKeySuffixes(oldProp []byte, oldSuffix, newSuffix []byte) error
 }
 
 // BlockPropertyFilter is used in an Iterator to filter sstables and blocks
@@ -189,13 +201,13 @@ type BoundLimitedBlockPropertyFilter interface {
 	// indicates that the filter may be used to filter blocks that exclusively
 	// contain keys ≥ `key`, so long as the blocks' keys also satisfy the upper
 	// bound.
-	KeyIsWithinLowerBound(key *InternalKey) bool
+	KeyIsWithinLowerBound(key []byte) bool
 	// KeyIsWithinUpperBound tests whether the provided internal key falls
 	// within the current upper bound of the filter. A true return value
 	// indicates that the filter may be used to filter blocks that exclusively
 	// contain keys ≤ `key`, so long as the blocks' keys also satisfy the lower
 	// bound.
-	KeyIsWithinUpperBound(key *InternalKey) bool
+	KeyIsWithinUpperBound(key []byte) bool
 }
 
 // BlockIntervalCollector is a helper implementation of BlockPropertyCollector
@@ -217,29 +229,28 @@ type BoundLimitedBlockPropertyFilter interface {
 // independent instances, rather than references to the same collector, as point
 // and range keys are tracked independently.
 type BlockIntervalCollector struct {
-	name   string
-	points DataBlockIntervalCollector
-	ranges DataBlockIntervalCollector
+	name           string
+	mapper         IntervalMapper
+	suffixReplacer BlockIntervalSuffixReplacer
 
-	blockInterval interval
-	indexInterval interval
-	tableInterval interval
+	blockInterval BlockInterval
+	indexInterval BlockInterval
+	tableInterval BlockInterval
 }
 
 var _ BlockPropertyCollector = &BlockIntervalCollector{}
 
-// DataBlockIntervalCollector is the interface used by BlockIntervalCollector
-// that contains the actual logic pertaining to the property. It only
-// maintains state for the current data block, and resets that state in
-// FinishDataBlock. This interface can be used to reduce parsing costs.
-type DataBlockIntervalCollector interface {
-	// Add is called with each new entry added to a data block in the sstable.
-	// The callee can assume that these are in sorted order.
-	Add(key InternalKey, value []byte) error
-	// FinishDataBlock is called when all the entries have been added to a
-	// data block. Subsequent Add calls will be for the next data block. It
-	// returns the [lower, upper) for the finished block.
-	FinishDataBlock() (lower uint64, upper uint64, err error)
+// IntervalMapper is an interface through which a user can define the mapping
+// between keys and intervals. The interval for any collection of keys (e.g. a
+// data block, a table) is the union of intervals for all keys.
+type IntervalMapper interface {
+	// MapPointKey maps a point key to an interval. The interval can be empty, which
+	// means that this key will effectively be ignored.
+	MapPointKey(key InternalKey, value []byte) (BlockInterval, error)
+
+	// MapRangeKeys maps a range key span to an interval. The interval can be
+	// empty, which means that this span will effectively be ignored.
+	MapRangeKeys(span Span) (BlockInterval, error)
 }
 
 // NewBlockIntervalCollector constructs a BlockIntervalCollector with the given
@@ -255,161 +266,174 @@ type DataBlockIntervalCollector interface {
 // If both point and range keys are to be tracked, two independent collectors
 // should be provided, rather than the same collector passed in twice (see the
 // comment on BlockIntervalCollector for more detail)
+// XXX update
 func NewBlockIntervalCollector(
-	name string, pointCollector, rangeCollector DataBlockIntervalCollector,
+	name string, mapper IntervalMapper, suffixReplacer BlockIntervalSuffixReplacer,
 ) BlockPropertyCollector {
-	if pointCollector == nil && rangeCollector == nil {
-		panic("sstable: at least one interval collector must be provided")
+	if mapper == nil {
+		panic("mapper must be provided")
 	}
-	bic := BlockIntervalCollector{
-		name:   name,
-		points: pointCollector,
-		ranges: rangeCollector,
+	return &BlockIntervalCollector{
+		name:           name,
+		mapper:         mapper,
+		suffixReplacer: suffixReplacer,
 	}
-	if _, ok := pointCollector.(SuffixReplaceableBlockCollector); ok {
-		return &suffixReplacementBlockCollectorWrapper{bic}
-	}
-	return &bic
 }
 
-// Name implements the BlockPropertyCollector interface.
+// Name is part of the BlockPropertyCollector interface.
 func (b *BlockIntervalCollector) Name() string {
 	return b.name
 }
 
-// Add implements the BlockPropertyCollector interface.
-func (b *BlockIntervalCollector) Add(key InternalKey, value []byte) error {
-	if rangekey.IsRangeKey(key.Kind()) {
-		if b.ranges != nil {
-			return b.ranges.Add(key, value)
-		}
-	} else if b.points != nil {
-		return b.points.Add(key, value)
+// AddPointKey is part of the BlockPropertyCollector interface.
+func (b *BlockIntervalCollector) AddPointKey(key InternalKey, value []byte) error {
+	interval, err := b.mapper.MapPointKey(key, value)
+	if err != nil {
+		return err
 	}
+	b.blockInterval.UnionWith(interval)
 	return nil
 }
 
-// FinishDataBlock implements the BlockPropertyCollector interface.
-func (b *BlockIntervalCollector) FinishDataBlock(buf []byte) ([]byte, error) {
-	if b.points == nil {
-		return buf, nil
+// AddRangeKeys is part of the BlockPropertyCollector interface.
+func (b *BlockIntervalCollector) AddRangeKeys(span Span) error {
+	if span.Empty() {
+		return nil
 	}
-	var err error
-	b.blockInterval.lower, b.blockInterval.upper, err = b.points.FinishDataBlock()
+	interval, err := b.mapper.MapRangeKeys(span)
 	if err != nil {
-		return buf, err
+		return err
 	}
-	buf = b.blockInterval.encode(buf)
-	b.tableInterval.union(b.blockInterval)
+	// Range keys are not included in block or index intervals; they just apply
+	// directly to the table interval.
+	b.tableInterval.UnionWith(interval)
+	return nil
+}
+
+// AddCollectedWithSuffixReplacement is part of the BlockPropertyCollector interface.
+func (b *BlockIntervalCollector) AddCollectedWithSuffixReplacement(
+	oldProp []byte, oldSuffix, newSuffix []byte,
+) error {
+	i, err := decodeBlockInterval(oldProp)
+	if err != nil {
+		return err
+	}
+	i, err = b.suffixReplacer.ApplySuffixReplacement(i, newSuffix)
+	if err != nil {
+		return err
+	}
+	b.blockInterval.UnionWith(i)
+	return nil
+}
+
+// SupportsSuffixReplacement is part of the BlockPropertyCollector interface.
+func (b *BlockIntervalCollector) SupportsSuffixReplacement() bool {
+	return b.suffixReplacer != nil
+}
+
+// FinishDataBlock is part of the BlockPropertyCollector interface.
+func (b *BlockIntervalCollector) FinishDataBlock(buf []byte) ([]byte, error) {
+	buf = encodeBlockInterval(b.blockInterval, buf)
+	b.tableInterval.UnionWith(b.blockInterval)
 	return buf, nil
 }
 
 // AddPrevDataBlockToIndexBlock implements the BlockPropertyCollector
 // interface.
 func (b *BlockIntervalCollector) AddPrevDataBlockToIndexBlock() {
-	b.indexInterval.union(b.blockInterval)
-	b.blockInterval = interval{}
+	b.indexInterval.UnionWith(b.blockInterval)
+	b.blockInterval = BlockInterval{}
 }
 
 // FinishIndexBlock implements the BlockPropertyCollector interface.
 func (b *BlockIntervalCollector) FinishIndexBlock(buf []byte) ([]byte, error) {
-	buf = b.indexInterval.encode(buf)
-	b.indexInterval = interval{}
+	buf = encodeBlockInterval(b.indexInterval, buf)
+	b.indexInterval = BlockInterval{}
 	return buf, nil
 }
 
 // FinishTable implements the BlockPropertyCollector interface.
 func (b *BlockIntervalCollector) FinishTable(buf []byte) ([]byte, error) {
-	// If the collector is tracking range keys, the range key interval is union-ed
-	// with the point key interval for the table.
-	if b.ranges != nil {
-		var rangeInterval interval
-		var err error
-		rangeInterval.lower, rangeInterval.upper, err = b.ranges.FinishDataBlock()
-		if err != nil {
-			return buf, err
-		}
-		b.tableInterval.union(rangeInterval)
+	return encodeBlockInterval(b.tableInterval, buf), nil
+}
+
+// BlockInterval represents the [Lower, Upper) interval of 64-bit values
+// corresponding to a set of keys. The meaning of the values themselves is
+// opaque to the BlockIntervalCollector.
+//
+// If Lower >= Upper, the interval is the empty set.
+type BlockInterval struct {
+	Lower uint64
+	Upper uint64
+}
+
+// IsEmpty returns true if the interval is empty.
+func (i BlockInterval) IsEmpty() bool {
+	return i.Lower >= i.Upper
+}
+
+// Intersects returns true if the two intervals intersect.
+func (i BlockInterval) Intersects(other BlockInterval) bool {
+	return !i.IsEmpty() && !other.IsEmpty() && i.Upper > other.Lower && i.Lower < other.Upper
+}
+
+// UnionWith extends the receiver to include another interval.
+func (i *BlockInterval) UnionWith(other BlockInterval) {
+	switch {
+	case other.IsEmpty():
+	case i.IsEmpty():
+		*i = other
+	default:
+		i.Lower = min(i.Lower, other.Lower)
+		i.Upper = max(i.Upper, other.Upper)
 	}
-	return b.tableInterval.encode(buf), nil
 }
 
-type interval struct {
-	lower uint64
-	upper uint64
-}
-
-func (i interval) encode(buf []byte) []byte {
-	if i.lower < i.upper {
-		var encoded [binary.MaxVarintLen64 * 2]byte
-		n := binary.PutUvarint(encoded[:], i.lower)
-		n += binary.PutUvarint(encoded[n:], i.upper-i.lower)
-		buf = append(buf, encoded[:n]...)
+func encodeBlockInterval(i BlockInterval, buf []byte) []byte {
+	if i.IsEmpty() {
+		return buf
 	}
-	return buf
+
+	var encoded [binary.MaxVarintLen64 * 2]byte
+	n := binary.PutUvarint(encoded[:], i.Lower)
+	n += binary.PutUvarint(encoded[n:], i.Upper-i.Lower)
+	return append(buf, encoded[:n]...)
 }
 
-func (i *interval) decode(buf []byte) error {
+func decodeBlockInterval(buf []byte) (BlockInterval, error) {
 	if len(buf) == 0 {
-		*i = interval{}
-		return nil
+		return BlockInterval{}, nil
 	}
+	var i BlockInterval
 	var n int
-	i.lower, n = binary.Uvarint(buf)
+	i.Lower, n = binary.Uvarint(buf)
 	if n <= 0 || n >= len(buf) {
-		return base.CorruptionErrorf("cannot decode interval from buf %x", buf)
+		return BlockInterval{}, base.CorruptionErrorf("cannot decode interval from buf %x", buf)
 	}
 	pos := n
-	i.upper, n = binary.Uvarint(buf[pos:])
+	i.Upper, n = binary.Uvarint(buf[pos:])
 	pos += n
 	if pos != len(buf) || n <= 0 {
-		return base.CorruptionErrorf("cannot decode interval from buf %x", buf)
+		return BlockInterval{}, base.CorruptionErrorf("cannot decode interval from buf %x", buf)
 	}
 	// Delta decode.
-	i.upper += i.lower
-	if i.upper < i.lower {
-		return base.CorruptionErrorf("unexpected overflow, upper %d < lower %d", i.upper, i.lower)
+	i.Upper += i.Lower
+	if i.Upper < i.Lower {
+		return BlockInterval{}, base.CorruptionErrorf("unexpected overflow, upper %d < lower %d", i.Upper, i.Lower)
 	}
-	return nil
+	return i, nil
 }
 
-func (i *interval) union(x interval) {
-	if x.lower >= x.upper {
-		// x is the empty set.
-		return
-	}
-	if i.lower >= i.upper {
-		// i is the empty set.
-		*i = x
-		return
-	}
-	// Both sets are non-empty.
-	if x.lower < i.lower {
-		i.lower = x.lower
-	}
-	if x.upper > i.upper {
-		i.upper = x.upper
-	}
-}
-
-func (i interval) intersects(x interval) bool {
-	if i.lower >= i.upper || x.lower >= x.upper {
-		// At least one of the sets is empty.
-		return false
-	}
-	// Neither set is empty.
-	return i.upper > x.lower && i.lower < x.upper
-}
-
-type suffixReplacementBlockCollectorWrapper struct {
-	BlockIntervalCollector
-}
-
-// UpdateKeySuffixes implements the SuffixReplaceableBlockCollector interface.
-func (w *suffixReplacementBlockCollectorWrapper) UpdateKeySuffixes(
-	oldProp []byte, from, to []byte,
-) error {
-	return w.BlockIntervalCollector.points.(SuffixReplaceableBlockCollector).UpdateKeySuffixes(oldProp, from, to)
+// BlockIntervalSuffixReplacer provides methods to conduct just in time
+// adjustments of a passed in block prop interval before filtering.
+type BlockIntervalSuffixReplacer interface {
+	// ApplySuffixReplacement recalculates a previously calculated interval (which
+	// corresponds to an arbitrary collection of keys) under the assumption
+	// that those keys are rewritten with a new prefix.
+	//
+	// Such a transformation is possible when the intervals depend only on the
+	// suffixes.
+	ApplySuffixReplacement(interval BlockInterval, newSuffix []byte) (BlockInterval, error)
 }
 
 // BlockIntervalFilter is an implementation of BlockPropertyFilter when the
@@ -417,7 +441,8 @@ func (w *suffixReplacementBlockCollectorWrapper) UpdateKeySuffixes(
 // the form [lower, upper).
 type BlockIntervalFilter struct {
 	name           string
-	filterInterval interval
+	filterInterval BlockInterval
+	suffixReplacer BlockIntervalSuffixReplacer
 }
 
 var _ BlockPropertyFilter = (*BlockIntervalFilter)(nil)
@@ -426,9 +451,11 @@ var _ BlockPropertyFilter = (*BlockIntervalFilter)(nil)
 // based on an interval property collected by BlockIntervalCollector and the
 // given [lower, upper) bounds. The given name specifies the
 // BlockIntervalCollector's properties to read.
-func NewBlockIntervalFilter(name string, lower uint64, upper uint64) *BlockIntervalFilter {
+func NewBlockIntervalFilter(
+	name string, lower uint64, upper uint64, suffixReplacer BlockIntervalSuffixReplacer,
+) *BlockIntervalFilter {
 	b := new(BlockIntervalFilter)
-	b.Init(name, lower, upper)
+	b.Init(name, lower, upper, suffixReplacer)
 	return b
 }
 
@@ -436,10 +463,13 @@ func NewBlockIntervalFilter(name string, lower uint64, upper uint64) *BlockInter
 // BLockPropertyFilter to filter blocks based on an interval property collected
 // by BlockIntervalCollector and the given [lower, upper) bounds. The given name
 // specifies the BlockIntervalCollector's properties to read.
-func (b *BlockIntervalFilter) Init(name string, lower, upper uint64) {
+func (b *BlockIntervalFilter) Init(
+	name string, lower, upper uint64, suffixReplacer BlockIntervalSuffixReplacer,
+) {
 	*b = BlockIntervalFilter{
 		name:           name,
-		filterInterval: interval{lower: lower, upper: upper},
+		filterInterval: BlockInterval{Lower: lower, Upper: upper},
+		suffixReplacer: suffixReplacer,
 	}
 }
 
@@ -450,11 +480,28 @@ func (b *BlockIntervalFilter) Name() string {
 
 // Intersects implements the BlockPropertyFilter interface.
 func (b *BlockIntervalFilter) Intersects(prop []byte) (bool, error) {
-	var i interval
-	if err := i.decode(prop); err != nil {
+	i, err := decodeBlockInterval(prop)
+	if err != nil {
 		return false, err
 	}
-	return i.intersects(b.filterInterval), nil
+	return i.Intersects(b.filterInterval), nil
+}
+
+// SyntheticSuffixIntersects implements the BlockPropertyFilter interface.
+func (b *BlockIntervalFilter) SyntheticSuffixIntersects(prop []byte, suffix []byte) (bool, error) {
+	if b.suffixReplacer == nil {
+		return false, base.AssertionFailedf("missing SuffixReplacer for SyntheticSuffixIntersects()")
+	}
+	i, err := decodeBlockInterval(prop)
+	if err != nil {
+		return false, err
+	}
+
+	newInterval, err := b.suffixReplacer.ApplySuffixReplacement(i, suffix)
+	if err != nil {
+		return false, err
+	}
+	return newInterval.Intersects(b.filterInterval), nil
 }
 
 // SetInterval adjusts the [lower, upper) bounds used by the filter. It is not
@@ -462,14 +509,31 @@ func (b *BlockIntervalFilter) Intersects(prop []byte) (bool, error) {
 // implementation of BlockPropertyFilterMask.SetSuffix used for range-key
 // masking.
 func (b *BlockIntervalFilter) SetInterval(lower, upper uint64) {
-	b.filterInterval = interval{lower: lower, upper: upper}
+	b.filterInterval = BlockInterval{Lower: lower, Upper: upper}
 }
 
-// When encoding block properties for each block, we cannot afford to encode
-// the name. Instead, the name is mapped to a shortID, in the scope of that
-// sstable, and the shortID is encoded. Since we use a uint8, there is a limit
-// of 256 block property collectors per sstable.
-type shortID uint8
+// When encoding block properties for each block, we cannot afford to encode the
+// name. Instead, the name is mapped to a shortID, in the scope of that sstable,
+// and the shortID is encoded as a single byte (which imposes a limit of of 256
+// block property collectors per sstable).
+// Note that the in-memory type is int16 to avoid overflows (e.g. in loops) and
+// to allow special values like -1 in code.
+type shortID int16
+
+const invalidShortID shortID = -1
+const maxShortID shortID = math.MaxUint8
+const maxPropertyCollectors = int(maxShortID) + 1
+
+func (id shortID) IsValid() bool {
+	return id >= 0 && id <= maxShortID
+}
+
+func (id shortID) ToByte() byte {
+	if invariants.Enabled && !id.IsValid() {
+		panic(fmt.Sprintf("inavlid id %d", id))
+	}
+	return byte(id)
+}
 
 type blockPropertiesEncoder struct {
 	propsBuf []byte
@@ -485,6 +549,11 @@ func (e *blockPropertiesEncoder) resetProps() {
 }
 
 func (e *blockPropertiesEncoder) addProp(id shortID, scratch []byte) {
+	if len(scratch) == 0 {
+		// We omit empty properties. The decoder will know that any missing IDs had
+		// empty values.
+		return
+	}
 	const lenID = 1
 	lenProp := uvarintLen(uint32(len(scratch)))
 	n := lenID + lenProp + len(scratch)
@@ -499,7 +568,7 @@ func (e *blockPropertiesEncoder) addProp(id shortID, scratch []byte) {
 	}
 	pos := len(e.propsBuf)
 	b := e.propsBuf[pos : pos+lenID]
-	b[0] = byte(id)
+	b[0] = id.ToByte()
 	pos += lenID
 	b = e.propsBuf[pos : pos+lenProp]
 	n = binary.PutUvarint(b, uint64(len(scratch)))
@@ -523,16 +592,41 @@ func (e *blockPropertiesEncoder) props() []byte {
 
 type blockPropertiesDecoder struct {
 	props []byte
+
+	// numCollectedProps is the number of collectors that were used when writing
+	// these properties. The encoded properties contain values for shortIDs 0
+	// through numCollectedProps-1, in order (with empty properties omitted).
+	numCollectedProps int
+	nextID            shortID
 }
 
-func (d *blockPropertiesDecoder) done() bool {
-	return len(d.props) == 0
+func makeBlockPropertiesDecoder(numCollectedProps int, propsBuf []byte) blockPropertiesDecoder {
+	return blockPropertiesDecoder{
+		props:             propsBuf,
+		numCollectedProps: numCollectedProps,
+	}
 }
 
-// REQUIRES: !done()
-func (d *blockPropertiesDecoder) next() (id shortID, prop []byte, err error) {
+func (d *blockPropertiesDecoder) Done() bool {
+	return int(d.nextID) >= d.numCollectedProps
+}
+
+// Next returns the property for each shortID between 0 and numCollectedProps-1, in order.
+// Note that some properties might be empty.
+// REQUIRES: !Done()
+func (d *blockPropertiesDecoder) Next() (id shortID, prop []byte, err error) {
+	id = d.nextID
+	d.nextID++
+
+	if len(d.props) == 0 || shortID(d.props[0]) != id {
+		if invariants.Enabled && len(d.props) > 0 && shortID(d.props[0]) < id {
+			panic("shortIDs are not in order")
+		}
+		// This property was omitted because it was empty.
+		return id, nil, nil
+	}
+
 	const lenID = 1
-	id = shortID(d.props[0])
 	propLen, m := binary.Uvarint(d.props[lenID:])
 	n := lenID + m
 	if m <= 0 || propLen == 0 || (n+int(propLen)) > len(d.props) {
@@ -579,6 +673,8 @@ type BlockPropertiesFilterer struct {
 	// collected when the table was built.
 	boundLimitedFilter  BoundLimitedBlockPropertyFilter
 	boundLimitedShortID int
+
+	syntheticSuffix SyntheticSuffix
 }
 
 var blockPropertiesFiltererPool = sync.Pool{
@@ -590,7 +686,9 @@ var blockPropertiesFiltererPool = sync.Pool{
 // newBlockPropertiesFilterer returns a partially initialized filterer. To complete
 // initialization, call IntersectsUserPropsAndFinishInit.
 func newBlockPropertiesFilterer(
-	filters []BlockPropertyFilter, limited BoundLimitedBlockPropertyFilter,
+	filters []BlockPropertyFilter,
+	limited BoundLimitedBlockPropertyFilter,
+	syntheticSuffix SyntheticSuffix,
 ) *BlockPropertiesFilterer {
 	filterer := blockPropertiesFiltererPool.Get().(*BlockPropertiesFilterer)
 	*filterer = BlockPropertiesFilterer{
@@ -598,6 +696,7 @@ func newBlockPropertiesFilterer(
 		shortIDToFiltersIndex: filterer.shortIDToFiltersIndex[:0],
 		boundLimitedFilter:    limited,
 		boundLimitedShortID:   -1,
+		syntheticSuffix:       syntheticSuffix,
 	}
 	return filterer
 }
@@ -619,8 +718,9 @@ func IntersectsTable(
 	filters []BlockPropertyFilter,
 	limited BoundLimitedBlockPropertyFilter,
 	userProperties map[string]string,
+	syntheticSuffix SyntheticSuffix,
 ) (*BlockPropertiesFilterer, error) {
-	f := newBlockPropertiesFilterer(filters, limited)
+	f := newBlockPropertiesFilterer(filters, limited, syntheticSuffix)
 	ok, err := f.intersectsUserPropsAndFinishInit(userProperties)
 	if !ok || err != nil {
 		releaseBlockPropertiesFilterer(f)
@@ -643,15 +743,27 @@ func (f *BlockPropertiesFilterer) intersectsUserPropsAndFinishInit(
 			// considered intersecting.
 			continue
 		}
-		byteProps := []byte(props)
-		if len(byteProps) < 1 {
+		if len(props) < 1 {
 			return false, base.CorruptionErrorf(
 				"block properties for %s is corrupted", f.filters[i].Name())
 		}
-		shortID := shortID(byteProps[0])
-		intersects, err := f.filters[i].Intersects(byteProps[1:])
-		if err != nil || !intersects {
-			return false, err
+		shortID := shortID(props[0])
+		{
+			// Use an unsafe conversion to avoid allocating. Intersects() is not
+			// supposed to modify the given slice.
+			// Note that unsafe.StringData only works if the string is not empty
+			// (which we already checked).
+			byteProps := unsafe.Slice(unsafe.StringData(props), len(props))
+			var intersects bool
+			var err error
+			if len(f.syntheticSuffix) == 0 {
+				intersects, err = f.filters[i].Intersects(byteProps[1:])
+			} else {
+				intersects, err = f.filters[i].SyntheticSuffixIntersects(byteProps[1:], f.syntheticSuffix)
+			}
+			if err != nil || !intersects {
+				return false, err
+			}
 		}
 		// Intersects the sstable, so need to use this filter when
 		// deciding whether to read blocks.
@@ -684,12 +796,11 @@ func (f *BlockPropertiesFilterer) intersectsUserPropsAndFinishInit(
 		// be unused within this file.
 		return true, nil
 	}
-	byteProps := []byte(props)
-	if len(byteProps) < 1 {
+	if len(props) < 1 {
 		return false, base.CorruptionErrorf(
 			"block properties for %s is corrupted", f.boundLimitedFilter.Name())
 	}
-	f.boundLimitedShortID = int(byteProps[0])
+	f.boundLimitedShortID = int(props[0])
 
 	// We don't check for table-level intersection for the bound-limited filter.
 	// The bound-limited filter is treated as vacuously intersecting.
@@ -735,59 +846,40 @@ const (
 	blockMaybeExcluded
 )
 
-func (f *BlockPropertiesFilterer) intersects(props []byte) (ret intersectsResult, err error) {
-	i := 0
-	decoder := blockPropertiesDecoder{props: props}
-	ret = blockIntersects
-	for i < len(f.shortIDToFiltersIndex) {
-		var id int
-		var prop []byte
-		if !decoder.done() {
-			var shortID shortID
-			var err error
-			shortID, prop, err = decoder.next()
-			if err != nil {
-				return ret, err
-			}
-			id = int(shortID)
-		} else {
-			id = math.MaxUint8 + 1
-		}
-		for i < len(f.shortIDToFiltersIndex) && id > i {
-			// The property for this id is not encoded for this block, but there
-			// may still be a filter for this id.
-			if intersects, err := f.intersectsFilter(i, nil); err != nil {
-				return ret, err
-			} else if intersects == blockExcluded {
-				return blockExcluded, nil
-			} else if intersects == blockMaybeExcluded {
-				ret = blockMaybeExcluded
-			}
-			i++
-		}
-		if i >= len(f.shortIDToFiltersIndex) {
-			return ret, nil
-		}
-		// INVARIANT: id <= i. And since i is always incremented by 1, id==i.
-		if id != i {
-			panic(fmt.Sprintf("%d != %d", id, i))
-		}
-		if intersects, err := f.intersectsFilter(i, prop); err != nil {
+func (f *BlockPropertiesFilterer) intersects(props []byte) (intersectsResult, error) {
+	decoder := makeBlockPropertiesDecoder(len(f.shortIDToFiltersIndex), props)
+	ret := blockIntersects
+	for !decoder.Done() {
+		id, prop, err := decoder.Next()
+		if err != nil {
 			return ret, err
-		} else if intersects == blockExcluded {
+		}
+		intersects, err := f.intersectsFilter(id, prop)
+		if err != nil {
+			return ret, err
+		}
+		if intersects == blockExcluded {
 			return blockExcluded, nil
-		} else if intersects == blockMaybeExcluded {
+		}
+		if intersects == blockMaybeExcluded {
 			ret = blockMaybeExcluded
 		}
-		i++
 	}
-	// ret == blockIntersects || ret == blockMaybeExcluded
+	// ret is either blockIntersects or blockMaybeExcluded.
 	return ret, nil
 }
 
-func (f *BlockPropertiesFilterer) intersectsFilter(i int, prop []byte) (intersectsResult, error) {
-	if f.shortIDToFiltersIndex[i] >= 0 {
-		intersects, err := f.filters[f.shortIDToFiltersIndex[i]].Intersects(prop)
+func (f *BlockPropertiesFilterer) intersectsFilter(
+	id shortID, prop []byte,
+) (intersectsResult, error) {
+	var intersects bool
+	var err error
+	if filterIdx := f.shortIDToFiltersIndex[id]; filterIdx >= 0 {
+		if !f.syntheticSuffix.IsSet() {
+			intersects, err = f.filters[filterIdx].Intersects(prop)
+		} else {
+			intersects, err = f.filters[filterIdx].SyntheticSuffixIntersects(prop, f.syntheticSuffix)
+		}
 		if err != nil {
 			return blockIntersects, err
 		}
@@ -795,7 +887,7 @@ func (f *BlockPropertiesFilterer) intersectsFilter(i int, prop []byte) (intersec
 			return blockExcluded, nil
 		}
 	}
-	if i == f.boundLimitedShortID {
+	if int(id) == f.boundLimitedShortID {
 		// The bound-limited filter uses this id.
 		//
 		// The bound-limited filter only applies within a keyspan interval. We
@@ -803,7 +895,11 @@ func (f *BlockPropertiesFilterer) intersectsFilter(i int, prop []byte) (intersec
 		// Intersects determines that there is no intersection, we return
 		// `blockMaybeExcluded` if no other bpf unconditionally excludes the
 		// block.
-		intersects, err := f.boundLimitedFilter.Intersects(prop)
+		if !f.syntheticSuffix.IsSet() {
+			intersects, err = f.boundLimitedFilter.Intersects(prop)
+		} else {
+			intersects, err = f.boundLimitedFilter.SyntheticSuffixIntersects(prop, f.syntheticSuffix)
+		}
 		if err != nil {
 			return blockIntersects, err
 		} else if !intersects {
@@ -811,4 +907,13 @@ func (f *BlockPropertiesFilterer) intersectsFilter(i int, prop []byte) (intersec
 		}
 	}
 	return blockIntersects, nil
+}
+
+func uvarintLen(v uint32) int {
+	i := 0
+	for v >= 0x80 {
+		v >>= 7
+		i++
+	}
+	return i + 1
 }

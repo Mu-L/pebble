@@ -6,13 +6,17 @@ package pebble
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
@@ -25,6 +29,9 @@ import (
 
 // Verify event listener actions, as well as expected filesystem operations.
 func TestEventListener(t *testing.T) {
+	if runtime.GOARCH == "386" {
+		t.Skip("skipped on 32-bit due to slightly varied output")
+	}
 	var d *DB
 	var memLog base.InMemLogger
 	mem := vfs.NewMem()
@@ -47,6 +54,11 @@ func TestEventListener(t *testing.T) {
 				flushEnd(info)
 			}
 			opts := &Options{
+				// The table stats collector runs asynchronously and its
+				// timing is less predictable. It increments nextJobID, which
+				// can make these tests flaky. The TableStatsLoaded event is
+				// tested separately in TestTableStats.
+				DisableTableStats:     true,
 				FS:                    vfs.WithLogging(mem, memLog.Infof),
 				FormatMajorVersion:    internalFormatNewest,
 				EventListener:         &lel,
@@ -54,11 +66,7 @@ func TestEventListener(t *testing.T) {
 				L0CompactionThreshold: 10,
 				WALDir:                "wal",
 			}
-			// The table stats collector runs asynchronously and its
-			// timing is less predictable. It increments nextJobID, which
-			// can make these tests flaky. The TableStatsLoaded event is
-			// tested separately in TestTableStats.
-			opts.private.disableTableStats = true
+			opts.Experimental.EnableColumnarBlocks = func() bool { return true }
 			var err error
 			d, err = Open("db", opts)
 			if err != nil {
@@ -69,7 +77,7 @@ func TestEventListener(t *testing.T) {
 				t = t.Add(time.Second)
 				return t
 			}
-			d.testingAlwaysWaitForCleanup = true
+			d.opts.private.testingAlwaysWaitForCleanup = true
 			return memLog.String()
 
 		case "close":
@@ -130,20 +138,20 @@ func TestEventListener(t *testing.T) {
 
 		case "ingest":
 			memLog.Reset()
-			f, err := mem.Create("ext/0")
+			f, err := mem.Create("ext/0", vfs.WriteCategoryUnspecified)
 			if err != nil {
 				return err.Error()
 			}
 			w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-				TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+				TableFormat: d.TableFormat(),
 			})
-			if err := w.Add(base.MakeInternalKey([]byte("a"), 0, InternalKeyKindSet), nil); err != nil {
+			if err := w.Set([]byte("a"), nil); err != nil {
 				return err.Error()
 			}
 			if err := w.Close(); err != nil {
 				return err.Error()
 			}
-			if err := d.Ingest([]string{"ext/0"}); err != nil {
+			if err := d.Ingest(context.Background(), []string{"ext/0"}); err != nil {
 				return err.Error()
 			}
 			return memLog.String()
@@ -164,14 +172,14 @@ func TestEventListener(t *testing.T) {
 				return err.Error()
 			}
 			writeTable := func(name string, key byte) error {
-				f, err := mem.Create(name)
+				f, err := mem.Create(name, vfs.WriteCategoryUnspecified)
 				if err != nil {
 					return err
 				}
 				w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-					TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+					TableFormat: d.TableFormat(),
 				})
-				if err := w.Add(base.MakeInternalKey([]byte{key}, 0, InternalKeyKindSet), nil); err != nil {
+				if err := w.Set([]byte{key}, nil); err != nil {
 					return err
 				}
 				if err := w.Close(); err != nil {
@@ -186,7 +194,7 @@ func TestEventListener(t *testing.T) {
 			if err := writeTable(tableB, 'b'); err != nil {
 				return err.Error()
 			}
-			if err := d.Ingest([]string{tableA, tableB}); err != nil {
+			if err := d.Ingest(context.Background(), []string{tableA, tableB}); err != nil {
 				return err.Error()
 			}
 
@@ -206,7 +214,7 @@ func TestEventListener(t *testing.T) {
 			d.waitTableStats()
 			d.mu.Unlock()
 
-			return d.Metrics().String()
+			return d.Metrics().StringForTests()
 
 		case "sstables":
 			var buf bytes.Buffer
@@ -318,6 +326,11 @@ func (l redactLogger) Infof(format string, args ...interface{}) {
 	l.logger.Infof("%s", redact.Sprintf(format, args...).Redact())
 }
 
+// Errorf implements the Logger.Errorf interface.
+func (l redactLogger) Errorf(format string, args ...interface{}) {
+	l.logger.Errorf("%s", redact.Sprintf(format, args...).Redact())
+}
+
 // Fatalf implements the Logger.Fatalf interface.
 func (l redactLogger) Fatalf(format string, args ...interface{}) {
 	l.logger.Fatalf("%s", redact.Sprintf(format, args...).Redact())
@@ -331,7 +344,7 @@ func TestEventListenerRedact(t *testing.T) {
 	l := MakeLoggingEventListener(redactLogger{logger: &log})
 	l.WALDeleted(WALDeleteInfo{
 		JobID:   5,
-		FileNum: FileNum(20),
+		FileNum: base.DiskFileNum(20),
 		Err:     errors.Errorf("unredacted error: %s", "unredacted string"),
 	})
 	require.Equal(t, "[JOB 5] WAL delete error: unredacted error: ‹×›\n", log.String())
@@ -368,4 +381,103 @@ func testAllCallbacksSetInEventListener(t *testing.T, e EventListener) {
 		require.Equal(t, reflect.Func, fType.Type.Kind(), "unexpected non-func field: %s", fType.Name)
 		require.False(t, fVal.IsNil(), "unexpected nil field: %s", fType.Name)
 	}
+}
+
+func TestLowDiskReporter(t *testing.T) {
+	const totalBytes = 1000
+	testCases := []struct {
+		// time, as a fraction of lowDiskSpaceFrequency.
+		time       float64
+		availBytes uint64
+		expected   bool
+	}{
+		{time: 1, availBytes: 900, expected: false},
+		{time: 1.1, availBytes: 101, expected: false},
+		// We reached the 10% threshold.
+		{time: 1.2, availBytes: 100, expected: true},
+		{time: 1.5, availBytes: 100, expected: false},
+		{time: 1.9, availBytes: 100, expected: false},
+		// Enough time has passed.
+		{time: 2.3, availBytes: 100, expected: true},
+		{time: 2.4, availBytes: 80, expected: false},
+		// We reached the 5% threshold.
+		{time: 2.5, availBytes: 50, expected: true},
+		{time: 2.6, availBytes: 500, expected: false},
+		{time: 2.7, availBytes: 50, expected: false},
+		{time: 2.8, availBytes: 31, expected: false},
+		// We reached the 3% threshold.
+		{time: 2.9, availBytes: 29, expected: true},
+		// We reached the 2% threshold.
+		{time: 3.0, availBytes: 20, expected: true},
+		// We reached the 1% threshold.
+		{time: 3.1, availBytes: 10, expected: true},
+		{time: 3.2, availBytes: 1, expected: false},
+		// We don't post another event for a higher threshold until enough time has
+		// passed.
+		{time: 3.3, availBytes: 50, expected: false},
+		{time: 4.2, availBytes: 50, expected: true},
+	}
+	var r lowDiskSpaceReporter
+	for _, tc := range testCases {
+		threshold, ok := r.findThreshold(tc.availBytes, totalBytes)
+		result := ok && r.shouldReport(threshold, 123456789+crtime.Mono(tc.time*float64(lowDiskSpaceFrequency)))
+		if result != tc.expected {
+			t.Errorf("time: %v  expected: %t, got %t (threshold=%d,ok=%t)", tc.time, tc.expected, result, threshold, ok)
+		}
+	}
+}
+
+func TestLowDiskSpaceEvent(t *testing.T) {
+	var lastInfo atomic.Value
+
+	listener := &EventListener{
+		LowDiskSpace: func(info LowDiskSpaceInfo) {
+			lastInfo.Store(info)
+		},
+	}
+	fs := &mockDiskUsageFS{
+		FS: vfs.NewMem(),
+	}
+	fs.usage.Store(vfs.DiskUsage{
+		AvailBytes: 1000,
+		TotalBytes: 1000,
+		UsedBytes:  0,
+	})
+
+	opts := &Options{
+		FS:            fs,
+		EventListener: listener,
+	}
+
+	d, err := Open("db", opts)
+	require.NoError(t, err)
+	defer d.Close()
+
+	require.NoError(t, d.Set([]byte("a"), []byte("avalue"), nil))
+	require.NoError(t, d.Flush())
+	require.Nil(t, lastInfo.Load())
+
+	fs.usage.Store(vfs.DiskUsage{
+		AvailBytes: 50,
+		TotalBytes: 1000,
+		UsedBytes:  950,
+	})
+
+	require.NoError(t, d.Set([]byte("b"), []byte("bvalue"), nil))
+	require.NoError(t, d.Flush())
+	require.Equal(t, LowDiskSpaceInfo{
+		AvailBytes:       50,
+		TotalBytes:       1000,
+		PercentThreshold: 5,
+	}, lastInfo.Load())
+}
+
+type mockDiskUsageFS struct {
+	vfs.FS
+
+	usage atomic.Value // vfs.DiskUsage
+}
+
+func (fs *mockDiskUsageFS) GetDiskUsage(path string) (vfs.DiskUsage, error) {
+	return fs.usage.Load().(vfs.DiskUsage), nil
 }

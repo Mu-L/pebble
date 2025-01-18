@@ -5,11 +5,13 @@
 package objstorageprovider
 
 import (
+	"cmp"
 	"context"
 	"io"
 	"os"
-	"sort"
+	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
@@ -18,6 +20,7 @@ import (
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/remoteobjcat"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/sharedcache"
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -35,17 +38,16 @@ type provider struct {
 	mu struct {
 		sync.RWMutex
 
-		remote struct {
-			// catalogBatch accumulates remote object creations and deletions until
-			// Sync is called.
-			catalogBatch remoteobjcat.Batch
+		remote remoteLockedState
 
-			storageObjects map[remote.Locator]remote.Storage
-		}
-
-		// localObjectsChanged is set if non-remote objects were created or deleted
-		// but Sync was not yet called.
-		localObjectsChanged bool
+		// TODO(radu): move these fields to a localLockedState struct.
+		// localObjectsChanged is incremented whenever non-remote objects are created.
+		// The purpose of this counter is to avoid syncing the local filesystem when
+		// only remote objects are changed.
+		localObjectsChangeCounter uint64
+		// localObjectsChangeCounterSynced is the value of localObjectsChangeCounter
+		// value at the time the last completed sync was launched.
+		localObjectsChangeCounterSynced uint64
 
 		// knownObjects maintains information about objects that are known to the provider.
 		// It is initialized with the list of files in the manifest when we open a DB.
@@ -91,15 +93,25 @@ type Settings struct {
 	// out a large chunk of dirty filesystem buffers.
 	BytesPerSync int
 
+	// Local contains fields that are only relevant for files stored on the local
+	// filesystem.
+	Local struct {
+		// TODO(radu): move FSCleaner, NoSyncOnClose, BytesPerSync here.
+
+		// ReadaheadConfig is used to retrieve the current readahead mode; it is
+		// consulted whenever a read handle is initialized.
+		ReadaheadConfig *ReadaheadConfig
+	}
+
 	// Fields here are set only if the provider is to support remote objects
 	// (experimental).
 	Remote struct {
 		StorageFactory remote.StorageFactory
 
-		// If CreateOnShared is true, sstables are created on remote storage using
+		// If CreateOnShared is non-zero, sstables are created on remote storage using
 		// the CreateOnSharedLocator (when the PreferSharedStorage create option is
 		// true).
-		CreateOnShared        bool
+		CreateOnShared        remote.CreateOnSharedStrategy
 		CreateOnSharedLocator remote.Locator
 
 		// CacheSizeBytes is the size of the on-disk block cache for objects
@@ -128,6 +140,70 @@ type Settings struct {
 	}
 }
 
+// ReadaheadConfig is a container for the settings that control the use of
+// read-ahead.
+//
+// It stores two ReadaheadModes:
+//   - Informed is the type of read-ahead for operations that are known to read a
+//     large consecutive chunk of a file.
+//   - Speculative is the type of read-ahead used automatically, when consecutive
+//     reads are detected.
+//
+// The settings can be changed and read atomically.
+type ReadaheadConfig struct {
+	value atomic.Uint32
+}
+
+// These are the default readahead modes when a config is not specified.
+const (
+	defaultReadaheadInformed    = FadviseSequential
+	defaultReadaheadSpeculative = FadviseSequential
+)
+
+// NewReadaheadConfig returns a new readahead config container initialized with
+// default values.
+func NewReadaheadConfig() *ReadaheadConfig {
+	rc := &ReadaheadConfig{}
+	rc.Set(defaultReadaheadInformed, defaultReadaheadSpeculative)
+	return rc
+}
+
+// Set the informed and speculative readahead modes.
+func (rc *ReadaheadConfig) Set(informed, speculative ReadaheadMode) {
+	rc.value.Store(uint32(speculative)<<8 | uint32(informed))
+}
+
+// Informed returns the type of read-ahead for operations that are known to read
+// a large consecutive chunk of a file.
+func (rc *ReadaheadConfig) Informed() ReadaheadMode {
+	return ReadaheadMode(rc.value.Load() & 0xff)
+}
+
+// Speculative returns the type of read-ahead used automatically, when
+// consecutive reads are detected.
+func (rc *ReadaheadConfig) Speculative() ReadaheadMode {
+	return ReadaheadMode(rc.value.Load() >> 8)
+}
+
+// ReadaheadMode indicates the type of read-ahead to use, either for informed
+// read-ahead (e.g. compactions) or speculative read-ahead.
+type ReadaheadMode uint8
+
+const (
+	// NoReadahead disables readahead altogether.
+	NoReadahead ReadaheadMode = iota
+
+	// SysReadahead enables the use of SYS_READAHEAD call to prefetch data.
+	// The prefetch window grows dynamically as consecutive writes are detected.
+	SysReadahead
+
+	// FadviseSequential enables the use of FADV_SEQUENTIAL. For informed
+	// read-ahead, FADV_SEQUENTIAL is used from the beginning. For speculative
+	// read-ahead, SYS_READAHEAD is first used until the window reaches the
+	// maximum size, then we switch to FADV_SEQUENTIAL.
+	FadviseSequential
+)
+
 // DefaultSettings initializes default settings (with no remote storage),
 // suitable for tests and tools.
 func DefaultSettings(fs vfs.FS, dirName string) Settings {
@@ -143,7 +219,13 @@ func DefaultSettings(fs vfs.FS, dirName string) Settings {
 
 // Open creates the provider.
 func Open(settings Settings) (objstorage.Provider, error) {
-	return open(settings)
+	// Note: we can't just `return open(settings)` because in an error case we
+	// would return (*provider)(nil) which is not objstorage.Provider(nil).
+	p, err := open(settings)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 func open(settings Settings) (p *provider, _ error) {
@@ -157,6 +239,10 @@ func open(settings Settings) (p *provider, _ error) {
 			fsDir.Close()
 		}
 	}()
+
+	if settings.Local.ReadaheadConfig == nil {
+		settings.Local.ReadaheadConfig = NewReadaheadConfig()
+	}
 
 	p = &provider{
 		st:    settings,
@@ -242,13 +328,19 @@ func (p *provider) Create(
 	fileNum base.DiskFileNum,
 	opts objstorage.CreateOptions,
 ) (w objstorage.Writable, meta objstorage.ObjectMetadata, err error) {
-	if opts.PreferSharedStorage && p.st.Remote.CreateOnShared {
+	if opts.PreferSharedStorage && p.st.Remote.CreateOnShared != remote.CreateOnSharedNone {
 		w, meta, err = p.sharedCreate(ctx, fileType, fileNum, p.st.Remote.CreateOnSharedLocator, opts)
 	} else {
-		w, meta, err = p.vfsCreate(ctx, fileType, fileNum)
+		var category vfs.DiskWriteCategory
+		if opts.WriteCategory != "" {
+			category = opts.WriteCategory
+		} else {
+			category = vfs.WriteCategoryUnspecified
+		}
+		w, meta, err = p.vfsCreate(ctx, fileType, fileNum, category)
 	}
 	if err != nil {
-		err = errors.Wrapf(err, "creating object %s", errors.Safe(fileNum))
+		err = errors.Wrapf(err, "creating object %s", fileNum)
 		return nil, objstorage.ObjectMetadata{}, err
 	}
 	p.addMetadata(meta)
@@ -285,7 +377,7 @@ func (p *provider) Remove(fileType base.FileType, fileNum base.DiskFileNum) erro
 		// We want to be able to retry a Remove, so we keep the object in our list.
 		// TODO(radu): we should mark the object as "zombie" and not allow any other
 		// operations.
-		return errors.Wrapf(err, "removing object %s", errors.Safe(fileNum))
+		return errors.Wrapf(err, "removing object %s", fileNum)
 	}
 
 	p.removeMetadata(fileNum)
@@ -331,7 +423,7 @@ func (p *provider) LinkOrCopyFromLocal(
 	dstFileNum base.DiskFileNum,
 	opts objstorage.CreateOptions,
 ) (objstorage.ObjectMetadata, error) {
-	shared := opts.PreferSharedStorage && p.st.Remote.CreateOnShared
+	shared := opts.PreferSharedStorage && p.st.Remote.CreateOnShared != remote.CreateOnSharedNone
 	if !shared && srcFS == p.st.FS {
 		// Wrap the normal filesystem with one which wraps newly created files with
 		// vfs.NewSyncingFile.
@@ -397,13 +489,13 @@ func (p *provider) Lookup(
 		return objstorage.ObjectMetadata{}, errors.Wrapf(
 			os.ErrNotExist,
 			"file %s (type %d) unknown to the objstorage provider",
-			errors.Safe(fileNum), errors.Safe(fileType),
+			fileNum, errors.Safe(fileType),
 		)
 	}
 	if meta.FileType != fileType {
-		return objstorage.ObjectMetadata{}, errors.AssertionFailedf(
+		return objstorage.ObjectMetadata{}, base.AssertionFailedf(
 			"file %s type mismatch (known type %d, expected type %d)",
-			errors.Safe(fileNum), errors.Safe(meta.FileType), errors.Safe(fileType),
+			fileNum, errors.Safe(meta.FileType), errors.Safe(fileType),
 		)
 	}
 	return meta, nil
@@ -433,30 +525,70 @@ func (p *provider) List() []objstorage.ObjectMetadata {
 	for _, meta := range p.mu.knownObjects {
 		res = append(res, meta)
 	}
-	sort.Slice(res, func(i, j int) bool {
-		return res[i].DiskFileNum.FileNum() < res[j].DiskFileNum.FileNum()
+	slices.SortFunc(res, func(a, b objstorage.ObjectMetadata) int {
+		return cmp.Compare(a.DiskFileNum, b.DiskFileNum)
 	})
 	return res
 }
 
+// Metrics is part of the objstorage.Provider interface.
+func (p *provider) Metrics() sharedcache.Metrics {
+	if p.remote.cache != nil {
+		return p.remote.cache.Metrics()
+	}
+	return sharedcache.Metrics{}
+}
+
+// CheckpointState is part of the objstorage.Provider interface.
+func (p *provider) CheckpointState(
+	fs vfs.FS, dir string, fileType base.FileType, fileNums []base.DiskFileNum,
+) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range fileNums {
+		if _, ok := p.mu.knownObjects[fileNums[i]]; !ok {
+			return errors.Wrapf(
+				os.ErrNotExist,
+				"file %s (type %d) unknown to the objstorage provider",
+				fileNums[i], errors.Safe(fileType),
+			)
+		}
+		// Prevent this object from deletion, at least for the life of this instance.
+		p.mu.protectedObjects[fileNums[i]] = p.mu.protectedObjects[fileNums[i]] + 1
+	}
+
+	if p.remote.catalog != nil {
+		return p.remote.catalog.Checkpoint(fs, dir)
+	}
+	return nil
+}
+
 func (p *provider) addMetadata(meta objstorage.ObjectMetadata) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.addMetadataLocked(meta)
+}
+
+func (p *provider) addMetadataLocked(meta objstorage.ObjectMetadata) {
 	if invariants.Enabled {
 		meta.AssertValid()
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.mu.knownObjects[meta.DiskFileNum] = meta
 	if meta.IsRemote() {
 		p.mu.remote.catalogBatch.AddObject(remoteobjcat.RemoteObjectMetadata{
-			FileNum:        meta.DiskFileNum,
-			FileType:       meta.FileType,
-			CreatorID:      meta.Remote.CreatorID,
-			CreatorFileNum: meta.Remote.CreatorFileNum,
-			Locator:        meta.Remote.Locator,
-			CleanupMethod:  meta.Remote.CleanupMethod,
+			FileNum:          meta.DiskFileNum,
+			FileType:         meta.FileType,
+			CreatorID:        meta.Remote.CreatorID,
+			CreatorFileNum:   meta.Remote.CreatorFileNum,
+			Locator:          meta.Remote.Locator,
+			CleanupMethod:    meta.Remote.CleanupMethod,
+			CustomObjectName: meta.Remote.CustomObjectName,
 		})
+		if meta.IsExternal() {
+			p.mu.remote.addExternalObject(meta)
+		}
 	} else {
-		p.mu.localObjectsChanged = true
+		p.mu.localObjectsChangeCounter++
 	}
 }
 
@@ -469,10 +601,13 @@ func (p *provider) removeMetadata(fileNum base.DiskFileNum) {
 		return
 	}
 	delete(p.mu.knownObjects, fileNum)
+	if meta.IsExternal() {
+		p.mu.remote.removeExternalObject(meta)
+	}
 	if meta.IsRemote() {
 		p.mu.remote.catalogBatch.DeleteObject(fileNum)
 	} else {
-		p.mu.localObjectsChanged = true
+		p.mu.localObjectsChangeCounter++
 	}
 }
 

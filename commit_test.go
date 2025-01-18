@@ -8,23 +8,24 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/pebble/internal/arenaskl"
+	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 type testCommitEnv struct {
-	logSeqNum     atomic.Uint64
-	visibleSeqNum atomic.Uint64
+	logSeqNum     base.AtomicSeqNum
+	visibleSeqNum base.AtomicSeqNum
 	writeCount    atomic.Uint64
 	applyBuf      struct {
 		sync.Mutex
@@ -44,7 +45,7 @@ func (e *testCommitEnv) env() commitEnv {
 
 func (e *testCommitEnv) apply(b *Batch, mem *memTable) error {
 	e.applyBuf.Lock()
-	e.applyBuf.buf = append(e.applyBuf.buf, b.SeqNum())
+	e.applyBuf.buf = append(e.applyBuf.buf, uint64(b.SeqNum()))
 	e.applyBuf.Unlock()
 	return nil
 }
@@ -64,20 +65,20 @@ func TestCommitQueue(t *testing.T) {
 	for i := range batches {
 		q.enqueue(&batches[i])
 	}
-	if b := q.dequeue(); b != nil {
+	if b := q.dequeueApplied(); b != nil {
 		t.Fatalf("unexpectedly dequeued batch: %p", b)
 	}
 	batches[1].applied.Store(true)
-	if b := q.dequeue(); b != nil {
+	if b := q.dequeueApplied(); b != nil {
 		t.Fatalf("unexpectedly dequeued batch: %p", b)
 	}
 	for i := range batches {
 		batches[i].applied.Store(true)
-		if b := q.dequeue(); b != &batches[i] {
+		if b := q.dequeueApplied(); b != &batches[i] {
 			t.Fatalf("%d: expected batch %p, but found %p", i, &batches[i], b)
 		}
 	}
-	if b := q.dequeue(); b != nil {
+	if b := q.dequeueApplied(); b != nil {
 		t.Fatalf("unexpectedly dequeued batch: %p", b)
 	}
 }
@@ -114,10 +115,10 @@ func TestCommitPipeline(t *testing.T) {
 		t.Fatalf("expected %d written batches, but found %d",
 			n, len(e.applyBuf.buf))
 	}
-	if s := e.logSeqNum.Load(); uint64(n) != s {
+	if s := e.logSeqNum.Load(); base.SeqNum(n) != s {
 		t.Fatalf("expected %d, but found %d", n, s)
 	}
-	if s := e.visibleSeqNum.Load(); uint64(n) != s {
+	if s := e.visibleSeqNum.Load(); base.SeqNum(n) != s {
 		t.Fatalf("expected %d, but found %d", n, s)
 	}
 }
@@ -159,10 +160,10 @@ func TestCommitPipelineSync(t *testing.T) {
 				t.Fatalf("expected %d written batches, but found %d",
 					n, len(e.applyBuf.buf))
 			}
-			if s := e.logSeqNum.Load(); uint64(n) != s {
+			if s := e.logSeqNum.Load(); base.SeqNum(n) != s {
 				t.Fatalf("expected %d, but found %d", n, s)
 			}
-			if s := e.visibleSeqNum.Load(); uint64(n) != s {
+			if s := e.visibleSeqNum.Load(); base.SeqNum(n) != s {
 				t.Fatalf("expected %d, but found %d", n, s)
 			}
 		})
@@ -181,9 +182,9 @@ func TestCommitPipelineAllocateSeqNum(t *testing.T) {
 	for i := 1; i <= n; i++ {
 		go func(i int) {
 			defer wg.Done()
-			p.AllocateSeqNum(i, func(_ uint64) {
+			p.AllocateSeqNum(i, func(_ base.SeqNum) {
 				prepareCount.Add(1)
-			}, func(seqNum uint64) {
+			}, func(_ base.SeqNum) {
 				applyCount.Add(1)
 			})
 		}(i)
@@ -223,7 +224,7 @@ func TestCommitPipelineWALClose(t *testing.T) {
 	// rotate and close the log.
 
 	mem := vfs.NewMem()
-	f, err := mem.Create("test-wal")
+	f, err := mem.Create("test-wal", vfs.WriteCategoryUnspecified)
 	require.NoError(t, err)
 
 	// syncDelayFile will block on the done channel befor returning from Sync
@@ -237,8 +238,8 @@ func TestCommitPipelineWALClose(t *testing.T) {
 	var wal *record.LogWriter
 	var walDone sync.WaitGroup
 	testEnv := commitEnv{
-		logSeqNum:     new(atomic.Uint64),
-		visibleSeqNum: new(atomic.Uint64),
+		logSeqNum:     new(base.AtomicSeqNum),
+		visibleSeqNum: new(base.AtomicSeqNum),
 		apply: func(b *Batch, mem *memTable) error {
 			// At this point, we've called SyncRecord but the sync is blocked.
 			walDone.Done()
@@ -284,6 +285,75 @@ func TestCommitPipelineWALClose(t *testing.T) {
 	}
 }
 
+// TestCommitPipelineLogDataSeqNum ensures committing a KV and a LogData
+// concurrently never publishes the KV's sequence number before it's been fully
+// applied to the memtable (which would violate the consistency of iterators
+// to which that sequence number is visible).
+//
+// A LogData batch reads the 'next sequence number' without incrementing it,
+// effectively sharing the sequence number with the next key committed. It may
+// finish applying to the memtable before the KV that shares its sequence
+// number. However, sequence number publishing ratchets the visible sequence
+// number to the batch's first seqnum + number of batch entries ..., so for e.g.
+// with first seqnum = 5 and number of entries = 3, it will ratchet to 8. This
+// means all seqnums strictly less than 8 are visible. So a LogData batch which
+// also grabbed the first seqnum = 5 before this batch, will ratchet to 5 + 0,
+// which is a noop.
+func TestCommitPipelineLogDataSeqNum(t *testing.T) {
+	var testEnv commitEnv
+	testEnv = commitEnv{
+		logSeqNum:     new(base.AtomicSeqNum),
+		visibleSeqNum: new(base.AtomicSeqNum),
+		apply: func(b *Batch, mem *memTable) error {
+			// Jitter a delay in memtable application to get test coverage of
+			// varying interleavings of which batch completes memtable
+			// application first.
+			time.Sleep(time.Duration(rand.Float64() * 20.0 * float64(time.Millisecond)))
+			// Ensure that our sequence number is not published before we've
+			// returned from apply.
+			//
+			// If b is the Set("foo","bar") batch, the LogData batch sharing the
+			// sequence number may have already entered commitPipeline.publish,
+			// but the sequence number it publishes should not be high enough to
+			// make this batch's KV visible.
+			//
+			// It may set visibleSeqNum = b.SeqNum(), but seqnum X is not
+			// considered visible until the visibleSeqNum is >X.
+			require.False(t, base.Visible(
+				b.SeqNum(),                   // Seqnum of the first KV in the batch b
+				testEnv.visibleSeqNum.Load(), // Snapshot seqnum
+				base.SeqNumMax,               // Indexed batch "seqnum" (unused here)
+			))
+			return nil
+		},
+		write: func(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*memTable, error) {
+			if syncWG != nil {
+				syncWG.Done()
+			}
+			return nil, nil
+		},
+	}
+	testEnv.logSeqNum.Store(base.SeqNumStart)
+	testEnv.visibleSeqNum.Store(base.SeqNumStart)
+	p := newCommitPipeline(testEnv)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		b := &Batch{}
+		require.NoError(t, b.Set([]byte("foo"), []byte("bar"), nil))
+		require.NoError(t, p.Commit(b, false /* sync */, false))
+	}()
+	go func() {
+		defer wg.Done()
+		b := &Batch{}
+		require.NoError(t, b.LogData([]byte("foo"), nil))
+		require.NoError(t, p.Commit(b, false /* sync */, false))
+	}()
+	wg.Wait()
+}
+
 func BenchmarkCommitPipeline(b *testing.B) {
 	for _, noSyncWait := range []bool{false, true} {
 		for _, parallelism := range []int{1, 2, 4, 8, 16, 32, 64, 128} {
@@ -293,8 +363,8 @@ func BenchmarkCommitPipeline(b *testing.B) {
 					mem := newMemTable(memTableOptions{})
 					var wal *record.LogWriter
 					nullCommitEnv := commitEnv{
-						logSeqNum:     new(atomic.Uint64),
-						visibleSeqNum: new(atomic.Uint64),
+						logSeqNum:     new(base.AtomicSeqNum),
+						visibleSeqNum: new(base.AtomicSeqNum),
 						apply: func(b *Batch, mem *memTable) error {
 							err := mem.apply(b, b.SeqNum())
 							if err != nil {
@@ -331,7 +401,7 @@ func BenchmarkCommitPipeline(b *testing.B) {
 					b.ResetTimer()
 
 					b.RunParallel(func(pb *testing.PB) {
-						rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+						rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 						buf := make([]byte, keySize)
 
 						for pb.Next() {
@@ -346,7 +416,7 @@ func BenchmarkCommitPipeline(b *testing.B) {
 									b.Fatal(err)
 								}
 							}
-							batch.release()
+							batch.Close()
 						}
 					})
 				})

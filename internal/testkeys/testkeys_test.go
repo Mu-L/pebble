@@ -7,47 +7,55 @@ package testkeys
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
+	"slices"
 	"testing"
 
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/stretchr/testify/require"
 )
 
 func TestGenerateAlphabetKey(t *testing.T) {
 	testCases := []struct {
-		alphabet string
-		i        int
-		depth    int
-		want     string
+		i     int64
+		depth int
+		want  string
 	}{
-		{"abc", 0, 1, "a"},
-		{"abc", 0, 2, "a"},
-		{"abc", 0, 3, "a"},
+		{0, 1, "a"},
+		{0, 2, "a"},
+		{0, 3, "a"},
 
-		{"abc", 1, 1, "b"},
-		{"abc", 2, 1, "c"},
+		{1, 1, "b"},
+		{2, 1, "c"},
 
-		{"abc", 0, 2, "a"},
-		{"abc", 1, 2, "aa"},
-		{"abc", 2, 2, "ab"},
-		{"abc", 3, 2, "ac"},
-		{"abc", 4, 2, "b"},
-		{"abc", 5, 2, "ba"},
-		{"abc", 6, 2, "bb"},
-		{"abc", 7, 2, "bc"},
-		{"abc", 8, 2, "c"},
-		{"abc", 9, 2, "ca"},
-		{"abc", 10, 2, "cb"},
-		{"abc", 11, 2, "cc"},
+		{0, 2, "a"},
+		{1, 2, "aa"},
+		{2, 2, "ab"},
+		{3, 2, "ac"},
+		{4, 2, "b"},
+		{5, 2, "ba"},
+		{6, 2, "bb"},
+		{7, 2, "bc"},
+		{8, 2, "c"},
+		{9, 2, "ca"},
+		{10, 2, "cb"},
+		{11, 2, "cc"},
 	}
+	testAlphabet := []byte{byte('a'), byte('b'), byte('c')}
+	testInverseAlphabet := map[byte]int64{byte('a'): 0, byte('b'): 1, byte('c'): 2}
 
 	buf := make([]byte, 10)
 	for _, tc := range testCases {
-		kc := keyCount(len(tc.alphabet), tc.depth)
-		n := generateAlphabetKey(buf, []byte(tc.alphabet), tc.i, kc)
+		kc := keyCount(len(testAlphabet), tc.depth)
+		n := generateAlphabetKey(buf, testAlphabet, tc.i, kc)
 		got := string(buf[:n])
 		if got != tc.want {
-			t.Errorf("generateAlphabetKey(%q, %d, %d) = %q, want %q", tc.alphabet, tc.i, kc, got, tc.want)
+			t.Errorf("generateAlphabetKey(%q, %d, %d) = %q, want %q", testAlphabet, tc.i, kc, got, tc.want)
+		}
+		i := computeAlphabetKeyIndex([]byte(got), testInverseAlphabet, tc.depth)
+		if i != tc.i {
+			t.Errorf("computeAlphabetKeyIndex(%q, %d) = %d, want %d", got, tc.depth, i, tc.i)
 		}
 	}
 }
@@ -56,8 +64,12 @@ func TestKeyCount(t *testing.T) {
 	type params struct {
 		n, l int
 	}
-	testCases := map[params]int{
+	testCases := map[params]int64{
 		{26, 1}: 26,
+		{26, 2}: 702,
+		{26, 3}: 18278,
+		{26, 4}: 475254,
+		{26, 5}: 12356630,
 		{52, 1}: 52,
 		{2, 2}:  6,
 		{2, 3}:  14,
@@ -106,7 +118,7 @@ func TestFullKeyspaces(t *testing.T) {
 func TestSlice(t *testing.T) {
 	testCases := []struct {
 		orig Keyspace
-		i, j int
+		i, j int64
 		want string
 	}{
 		{Alpha(1), 1, 25, "b c d e f g h i j k l m n o p q r s t u v w x y"},
@@ -136,27 +148,30 @@ func TestSuffix(t *testing.T) {
 		}
 	}
 
-	for i := 1; i < ks.Count(); i++ {
+	for i := int64(1); i < ks.Count(); i++ {
 		assertCmp(-1, KeyAt(ks, i-1, 1), KeyAt(ks, i, 1))
 		assertCmp(-1, Key(ks, i-1), Key(ks, i))
 		assertCmp(0, Key(ks, i), Key(ks, i))
-		for ts := 2; ts < 11; ts++ {
+		for ts := int64(2); ts < 11; ts++ {
 			assertCmp(+1, KeyAt(ks, i, ts-1), KeyAt(ks, i, ts))
 			assertCmp(-1, KeyAt(ks, i-1, ts-1), KeyAt(ks, i, ts))
 		}
 	}
 
-	// Suffixes should be comparable on their own too.
+	// Test CompareSuffixes.
 	a, b := make([]byte, MaxSuffixLen), make([]byte, MaxSuffixLen)
-	for ts := 2; ts < 150; ts++ {
+	for ts := int64(2); ts < 150; ts++ {
 		an := WriteSuffix(a, ts-1)
 		bn := WriteSuffix(b, ts)
-		assertCmp(+1, a[:an], b[:bn])
+		got := Comparer.CompareRangeSuffixes(a[:an], b[:bn])
+		if want := +1; got != want {
+			t.Errorf("CompareSuffixes(%q, %q) = %d, want %d", a, b, got, want)
+		}
 	}
 }
 
 func TestSuffixLen(t *testing.T) {
-	testCases := map[int]int{
+	testCases := map[int64]int{
 		0:    2,
 		1:    2,
 		5:    2,
@@ -183,7 +198,8 @@ func TestDivvy(t *testing.T) {
 		buf.Reset()
 		switch d.Cmd {
 		case "divvy":
-			var alphaLen, portions int
+			var alphaLen int
+			var portions int64
 			d.ScanArgs(t, "alpha", &alphaLen)
 			d.ScanArgs(t, "portions", &portions)
 
@@ -201,7 +217,7 @@ func TestDivvy(t *testing.T) {
 func keyspaceToString(ks Keyspace) string {
 	var buf bytes.Buffer
 	b := make([]byte, ks.MaxLen())
-	for i := 0; i < ks.Count(); i++ {
+	for i := int64(0); i < ks.Count(); i++ {
 		n := ks.key(b, i)
 		if i > 0 {
 			buf.WriteRune(' ')
@@ -209,4 +225,94 @@ func keyspaceToString(ks Keyspace) string {
 		buf.Write(b[:n])
 	}
 	return buf.String()
+}
+
+func TestRandomPrefixInRange(t *testing.T) {
+	testCases := []struct {
+		a, b            string
+		maxPossibleKeys int
+	}{
+		{a: "abc", b: "def"},
+		{a: "a", b: "aa", maxPossibleKeys: 1},
+		{a: "a", b: "aaa", maxPossibleKeys: 2},
+		{a: "a", b: "ab"},
+		{a: "longcommonprefixabcdef", b: "longcommonprefixb"},
+		{a: "longcommonprefix", b: "longcommonprefixb"},
+		{a: "longcommonprefix", b: "longcommonprefixa", maxPossibleKeys: 1},
+		{a: "longcommonprefix", b: "longcommonprefixaaaaa", maxPossibleKeys: 5},
+		{a: "a", b: "abthiskeywillneedtobetrimmed"},
+		{a: "abthiskeywillneedtobetrimmed", b: "ac"},
+		{a: "abthiskeywillneedtobetrimmed", b: "acthiskeywillneedtobetrimmed"},
+	}
+
+	for i, tc := range testCases {
+		t.Run(fmt.Sprintf("%v", i), func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(0, 0))
+			keys := make(map[string]struct{})
+			for i := 1; i < 100; i++ {
+				key := RandomPrefixInRange([]byte(tc.a), []byte(tc.b), rng)
+				require.True(t, compare([]byte(tc.a), key) <= 0)
+				require.True(t, compare(key, []byte(tc.b)) < 0)
+				keys[string(key)] = struct{}{}
+			}
+			if tc.maxPossibleKeys != 0 {
+				require.Equal(t, len(keys), tc.maxPossibleKeys)
+			} else {
+				// Make sure we are generating many different keys.
+				require.GreaterOrEqual(t, len(keys), 50)
+			}
+		})
+	}
+
+	t.Run("randomized", func(t *testing.T) {
+		rng := rand.New(rand.NewPCG(0, 0))
+		keys := [][]byte{[]byte("a"), []byte("zzz")}
+		for n := 0; n < 1000; n++ {
+			i := rng.IntN(len(keys) - 1)
+			j := i + 1 + rng.IntN(len(keys)-1-i)
+			a, b := keys[i], keys[j]
+			key := RandomPrefixInRange(a, b, rng)
+			if Comparer.Compare(key, a) == 0 {
+				// It is legal to return a.
+				continue
+			}
+			for k := 0; k < len(keys); k++ {
+				v := Comparer.Compare(key, keys[k])
+				if k <= i && v <= 0 || k >= j && v >= 0 {
+					t.Fatalf("RandomPrefixInRange(%q, %q) = %q; but Compare(%q,%q) = %d\n", a, b, key, key, keys[k], v)
+				}
+			}
+			keys = append(keys, key)
+			slices.SortFunc(keys, Comparer.Compare)
+		}
+	})
+}
+
+func TestOverflowPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("did not panic")
+		} else {
+			t.Logf("panic: %v", r)
+		}
+	}()
+	keyCount(6, len(alpha))
+}
+
+func TestComparer(t *testing.T) {
+	if err := base.CheckComparer(Comparer,
+		[][]byte{[]byte("abc"), []byte("d"), []byte("ef")},
+		[][]byte{{}, []byte("@3"), []byte("@2"), []byte("@1")}); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestIgnorableSuffix(t *testing.T) {
+	require.Equal(t, 0, Comparer.Compare([]byte("foo@1"), []byte("foo@1_synthetic")))
+	require.Equal(t, 1, Comparer.Compare([]byte("foo@1"), []byte("foo@2_synthetic")))
+	require.Equal(t, 1, Comparer.Compare([]byte("foo@1_synthetic"), []byte("foo@2")))
+	require.Equal(t, -1, Comparer.CompareRangeSuffixes([]byte("@1"), []byte("@1_synthetic")))
+	require.Equal(t, 1, Comparer.CompareRangeSuffixes([]byte("@1_synthetic"), []byte("@1")))
+	require.Equal(t, 0, Comparer.CompareRangeSuffixes([]byte("@1_synthetic"), []byte("@1_synthetic")))
+	require.Equal(t, 0, Comparer.CompareRangeSuffixes([]byte("@1"), []byte("@1")))
 }

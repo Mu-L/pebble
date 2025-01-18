@@ -5,8 +5,11 @@
 package pebble
 
 import (
+	"context"
+
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/keyspan"
+	"github.com/cockroachdb/pebble/internal/treeprinter"
 )
 
 type errorIter struct {
@@ -16,42 +19,42 @@ type errorIter struct {
 // errorIter implements the base.InternalIterator interface.
 var _ internalIterator = (*errorIter)(nil)
 
-func newErrorIter(err error) *errorIter {
-	return &errorIter{err: err}
+func (c *errorIter) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV {
+	return nil
 }
 
-func (c *errorIter) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, base.LazyValue) {
-	return nil, base.LazyValue{}
+func (c *errorIter) SeekPrefixGE(prefix, key []byte, flags base.SeekGEFlags) *base.InternalKV {
+	return c.SeekPrefixGEStrict(prefix, key, flags)
 }
 
-func (c *errorIter) SeekPrefixGE(
+func (c *errorIter) SeekPrefixGEStrict(
 	prefix, key []byte, flags base.SeekGEFlags,
-) (*base.InternalKey, base.LazyValue) {
-	return nil, base.LazyValue{}
+) *base.InternalKV {
+	return nil
 }
 
-func (c *errorIter) SeekLT(key []byte, flags base.SeekLTFlags) (*InternalKey, base.LazyValue) {
-	return nil, base.LazyValue{}
+func (c *errorIter) SeekLT(key []byte, flags base.SeekLTFlags) *base.InternalKV {
+	return nil
 }
 
-func (c *errorIter) First() (*InternalKey, base.LazyValue) {
-	return nil, base.LazyValue{}
+func (c *errorIter) First() *base.InternalKV {
+	return nil
 }
 
-func (c *errorIter) Last() (*InternalKey, base.LazyValue) {
-	return nil, base.LazyValue{}
+func (c *errorIter) Last() *base.InternalKV {
+	return nil
 }
 
-func (c *errorIter) Next() (*InternalKey, base.LazyValue) {
-	return nil, base.LazyValue{}
+func (c *errorIter) Next() *base.InternalKV {
+	return nil
 }
 
-func (c *errorIter) Prev() (*InternalKey, base.LazyValue) {
-	return nil, base.LazyValue{}
+func (c *errorIter) Prev() *base.InternalKV {
+	return nil
 }
 
-func (c *errorIter) NextPrefix([]byte) (*InternalKey, base.LazyValue) {
-	return nil, base.LazyValue{}
+func (c *errorIter) NextPrefix([]byte) *base.InternalKV {
+	return nil
 }
 
 func (c *errorIter) Error() error {
@@ -68,6 +71,12 @@ func (c *errorIter) String() string {
 
 func (c *errorIter) SetBounds(lower, upper []byte) {}
 
+func (c *errorIter) SetContext(_ context.Context) {}
+
+func (c *errorIter) DebugTree(tp treeprinter.Node) {
+	tp.Childf("%T(%p)", c, c)
+}
+
 type errorKeyspanIter struct {
 	err error
 }
@@ -75,16 +84,14 @@ type errorKeyspanIter struct {
 // errorKeyspanIter implements the keyspan.FragmentIterator interface.
 var _ keyspan.FragmentIterator = (*errorKeyspanIter)(nil)
 
-func newErrorKeyspanIter(err error) *errorKeyspanIter {
-	return &errorKeyspanIter{err: err}
-}
-
-func (*errorKeyspanIter) SeekGE(key []byte) *keyspan.Span { return nil }
-func (*errorKeyspanIter) SeekLT(key []byte) *keyspan.Span { return nil }
-func (*errorKeyspanIter) First() *keyspan.Span            { return nil }
-func (*errorKeyspanIter) Last() *keyspan.Span             { return nil }
-func (*errorKeyspanIter) Next() *keyspan.Span             { return nil }
-func (*errorKeyspanIter) Prev() *keyspan.Span             { return nil }
-func (i *errorKeyspanIter) Error() error                  { return i.err }
-func (i *errorKeyspanIter) Close() error                  { return i.err }
-func (*errorKeyspanIter) String() string                  { return "error" }
+func (i *errorKeyspanIter) SeekGE(key []byte) (*keyspan.Span, error) { return nil, i.err }
+func (i *errorKeyspanIter) SeekLT(key []byte) (*keyspan.Span, error) { return nil, i.err }
+func (i *errorKeyspanIter) First() (*keyspan.Span, error)            { return nil, i.err }
+func (i *errorKeyspanIter) Last() (*keyspan.Span, error)             { return nil, i.err }
+func (i *errorKeyspanIter) Next() (*keyspan.Span, error)             { return nil, i.err }
+func (i *errorKeyspanIter) Prev() (*keyspan.Span, error)             { return nil, i.err }
+func (i *errorKeyspanIter) SetContext(ctx context.Context)           {}
+func (i *errorKeyspanIter) Close()                                   {}
+func (*errorKeyspanIter) String() string                             { return "error" }
+func (*errorKeyspanIter) WrapChildren(wrap keyspan.WrapFn)           {}
+func (i *errorKeyspanIter) DebugTree(tp treeprinter.Node)            { tp.Childf("%T(%p)", i, i) }

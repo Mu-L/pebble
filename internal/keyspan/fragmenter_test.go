@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -24,14 +23,13 @@ func parseSpanSingleKey(t *testing.T, s string, kind base.InternalKeyKind) Span 
 	if len(m) != 5 {
 		t.Fatalf("expected 5 components, but found %d: %s", len(m), s)
 	}
-	seqNum, err := strconv.Atoi(m[1])
-	require.NoError(t, err)
+	seqNum := base.ParseSeqNum(m[1])
 	return Span{
 		Start: []byte(m[2]),
 		End:   []byte(m[3]),
 		Keys: []Key{
 			{
-				Trailer: base.MakeTrailer(uint64(seqNum), kind),
+				Trailer: base.MakeTrailer(seqNum, kind),
 				Value:   []byte(strings.TrimSpace(m[4])),
 			},
 		},
@@ -50,15 +48,6 @@ func buildSpans(
 		},
 	}
 	for _, line := range strings.Split(s, "\n") {
-		if strings.HasPrefix(line, "truncate-and-flush-to ") {
-			parts := strings.Split(line, " ")
-			if len(parts) != 2 {
-				t.Fatalf("expected 2 components, but found %d: %s", len(parts), line)
-			}
-			f.TruncateAndFlushTo([]byte(parts[1]))
-			continue
-		}
-
 		f.Add(parseSpanSingleKey(t, line, kind))
 	}
 	f.Finish()
@@ -114,14 +103,12 @@ func TestFragmenter(t *testing.T) {
 
 	var getRe = regexp.MustCompile(`(\w+)#(\d+)`)
 
-	parseGet := func(t *testing.T, s string) (string, int) {
+	parseGet := func(t *testing.T, s string) (string, base.SeqNum) {
 		m := getRe.FindStringSubmatch(s)
 		if len(m) != 3 {
 			t.Fatalf("expected 3 components, but found %d", len(m))
 		}
-		seq, err := strconv.Atoi(m[2])
-		require.NoError(t, err)
-		return m[1], seq
+		return m[1], base.ParseSeqNum(m[2])
 	}
 
 	var iter FragmentIterator
@@ -130,8 +117,9 @@ func TestFragmenter(t *testing.T) {
 	// read sequence number. Get ignores spans newer than the read sequence
 	// number. This is a simple version of what full processing of range
 	// tombstones looks like.
-	deleted := func(key []byte, seq, readSeq uint64) bool {
-		s := Get(cmp, iter, key)
+	deleted := func(key []byte, seq, readSeq base.SeqNum) bool {
+		s, err := Get(cmp, iter, key)
+		require.NoError(t, err)
 		return s != nil && s.CoversAt(readSeq, seq)
 	}
 
@@ -157,91 +145,18 @@ func TestFragmenter(t *testing.T) {
 			if d.CmdArgs[0].Key != "t" {
 				return fmt.Sprintf("expected timestamp argument, but found %s", d.CmdArgs[0])
 			}
-			readSeq, err := strconv.Atoi(d.CmdArgs[0].Vals[0])
-			require.NoError(t, err)
+			readSeq := base.ParseSeqNum(d.CmdArgs[0].Vals[0])
 
 			var results []string
 			for _, p := range strings.Split(d.Input, " ") {
 				key, seq := parseGet(t, p)
-				if deleted([]byte(key), uint64(seq), uint64(readSeq)) {
+				if deleted([]byte(key), seq, readSeq) {
 					results = append(results, "deleted")
 				} else {
 					results = append(results, "alive")
 				}
 			}
 			return strings.Join(results, " ")
-
-		default:
-			return fmt.Sprintf("unknown command: %s", d.Cmd)
-		}
-	})
-}
-
-func TestFragmenterCovers(t *testing.T) {
-	datadriven.RunTest(t, "testdata/fragmenter_covers", func(t *testing.T, d *datadriven.TestData) string {
-		switch d.Cmd {
-		case "build":
-			f := &Fragmenter{
-				Cmp:    base.DefaultComparer.Compare,
-				Format: base.DefaultComparer.FormatKey,
-				Emit: func(fragmented Span) {
-				},
-			}
-			var buf bytes.Buffer
-			for _, line := range strings.Split(d.Input, "\n") {
-				switch {
-				case strings.HasPrefix(line, "add "):
-					t := parseSpanSingleKey(t, strings.TrimPrefix(line, "add "), base.InternalKeyKindRangeDelete)
-					f.Add(t)
-				case strings.HasPrefix(line, "deleted "):
-					fields := strings.Fields(strings.TrimPrefix(line, "deleted "))
-					key := base.ParseInternalKey(fields[0])
-					snapshot, err := strconv.ParseUint(fields[1], 10, 64)
-					if err != nil {
-						return err.Error()
-					}
-					func() {
-						defer func() {
-							if r := recover(); r != nil {
-								fmt.Fprintf(&buf, "%s: %s\n", key, r)
-							}
-						}()
-						switch f.Covers(key, snapshot) {
-						case NoCover:
-							fmt.Fprintf(&buf, "%s: none\n", key)
-						case CoversInvisibly:
-							fmt.Fprintf(&buf, "%s: invisibly\n", key)
-						case CoversVisibly:
-							fmt.Fprintf(&buf, "%s: visibly\n", key)
-						}
-					}()
-				}
-			}
-			return buf.String()
-
-		default:
-			return fmt.Sprintf("unknown command: %s", d.Cmd)
-		}
-	})
-}
-
-func TestFragmenterTruncateAndFlushTo(t *testing.T) {
-	cmp := base.DefaultComparer.Compare
-	fmtKey := base.DefaultComparer.FormatKey
-
-	datadriven.RunTest(t, "testdata/fragmenter_truncate_and_flush_to", func(t *testing.T, d *datadriven.TestData) string {
-		switch d.Cmd {
-		case "build":
-			return func() (result string) {
-				defer func() {
-					if r := recover(); r != nil {
-						result = fmt.Sprint(r)
-					}
-				}()
-
-				spans := buildSpans(t, cmp, fmtKey, d.Input, base.InternalKeyKindRangeDelete)
-				return formatAlphabeticSpans(spans)
-			}()
 
 		default:
 			return fmt.Sprintf("unknown command: %s", d.Cmd)

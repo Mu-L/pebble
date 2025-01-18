@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/cockroachdb/crlib/crstrings"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/internal/base"
@@ -66,15 +67,15 @@ func TestWorkloadCollector(t *testing.T) {
 				var fileNum uint64
 				var err error
 				td.ScanArgs(t, "filenum", &fileNum)
-				path := base.MakeFilepath(fs, srcDir, base.FileTypeManifest, base.FileNum(fileNum).DiskFileNum())
-				currentManifest, err = fs.Create(path)
+				path := base.MakeFilepath(fs, srcDir, base.FileTypeManifest, base.DiskFileNum(fileNum))
+				currentManifest, err = fs.Create(path, vfs.WriteCategoryUnspecified)
 				require.NoError(t, err)
 				_, err = currentManifest.Write(randData(100))
 				require.NoError(t, err)
 
 				c.onManifestCreated(pebble.ManifestCreateInfo{
 					Path:    path,
-					FileNum: base.FileNum(fileNum),
+					FileNum: base.DiskFileNum(fileNum),
 				})
 				return ""
 			case "flush":
@@ -95,7 +96,7 @@ func TestWorkloadCollector(t *testing.T) {
 					require.NoError(t, err)
 					tableInfo.FileNum = base.FileNum(fileNum)
 
-					p := writeFile(t, fs, srcDir, base.FileTypeTable, tableInfo.FileNum.DiskFileNum(), randData(int(tableInfo.Size)))
+					p := writeFile(t, fs, srcDir, base.FileTypeTable, base.PhysicalTableDiskFileNum(tableInfo.FileNum), randData(int(tableInfo.Size)))
 					fmt.Fprintf(&buf, "created %s\n", p)
 					flushInfo.Output = append(flushInfo.Output, tableInfo)
 
@@ -109,18 +110,14 @@ func TestWorkloadCollector(t *testing.T) {
 				return buf.String()
 			case "ingest":
 				ingestInfo := pebble.TableIngestInfo{}
-				for _, line := range strings.Split(td.Input, "\n") {
-					if line == "" {
-						continue
-					}
-
+				for _, line := range crstrings.Lines(td.Input) {
 					parts := strings.FieldsFunc(line, func(r rune) bool { return unicode.IsSpace(r) || r == ':' })
 					tableInfo := pebble.TableInfo{Size: 10 << 10}
 					fileNum, err := strconv.ParseUint(parts[0], 10, 64)
 					require.NoError(t, err)
 					tableInfo.FileNum = base.FileNum(fileNum)
 
-					p := writeFile(t, fs, srcDir, base.FileTypeTable, tableInfo.FileNum.DiskFileNum(), randData(int(tableInfo.Size)))
+					p := writeFile(t, fs, srcDir, base.FileTypeTable, base.PhysicalTableDiskFileNum(tableInfo.FileNum), randData(int(tableInfo.Size)))
 					fmt.Fprintf(&buf, "created %s\n", p)
 					ingestInfo.Tables = append(ingestInfo.Tables, struct {
 						pebble.TableInfo
@@ -182,7 +179,7 @@ func writeFile(
 	t *testing.T, fs vfs.FS, dir string, typ base.FileType, fileNum base.DiskFileNum, data []byte,
 ) string {
 	path := base.MakeFilepath(fs, dir, typ, fileNum)
-	f, err := fs.Create(path)
+	f, err := fs.Create(path, vfs.WriteCategoryUnspecified)
 	require.NoError(t, err)
 	_, err = f.Write(data)
 	require.NoError(t, err)

@@ -5,8 +5,7 @@
 package sstable
 
 import (
-	"math/rand"
-	"os"
+	randv1 "math/rand"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -14,36 +13,36 @@ import (
 	"testing/quick"
 	"time"
 
+	"github.com/cockroachdb/crlib/testutils/leaktest"
+	"github.com/cockroachdb/pebble/sstable/rowblk"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
 )
 
 func TestPropertiesLoad(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	expected := Properties{
+		CommonProperties: CommonProperties{
+			NumEntries:         1727,
+			NumDeletions:       17,
+			NumRangeDeletions:  17,
+			RawKeySize:         23938,
+			RawValueSize:       1912,
+			NumDataBlocks:      14,
+			CompressionName:    "Snappy",
+			CompressionOptions: "window_bits=-14; level=32767; strategy=0; max_dict_bytes=0; zstd_max_train_bytes=0; enabled=0; ",
+		},
 		ComparerName:           "leveldb.BytewiseComparator",
-		CompressionName:        "Snappy",
-		CompressionOptions:     "window_bits=-14; level=32767; strategy=0; max_dict_bytes=0; zstd_max_train_bytes=0; enabled=0; ",
 		DataSize:               13913,
-		ExternalFormatVersion:  2,
 		IndexSize:              325,
 		MergerName:             "nullptr",
-		NumDataBlocks:          14,
-		NumEntries:             1727,
-		NumDeletions:           17,
-		NumRangeDeletions:      17,
-		PrefixExtractorName:    "nullptr",
-		PropertyCollectorNames: "[KeyCountPropertyCollector]",
-		RawKeySize:             23938,
-		RawValueSize:           1912,
-		UserProperties: map[string]string{
-			"test.key-count": "1727",
-		},
-		WholeKeyFiltering: false,
+		PropertyCollectorNames: "[]",
 	}
 
 	{
 		// Check that we can read properties from a table.
-		f, err := os.Open(filepath.FromSlash("testdata/h.sst"))
+		f, err := vfs.Default.Open(filepath.FromSlash("testdata/h.sst"))
 		require.NoError(t, err)
 
 		r, err := newReader(f, ReaderOptions{})
@@ -59,68 +58,85 @@ func TestPropertiesLoad(t *testing.T) {
 	}
 }
 
-func TestPropertiesSave(t *testing.T) {
-	expected := &Properties{
-		ComparerName:           "comparator name",
-		CompressionName:        "compression name",
-		CompressionOptions:     "compression option",
-		DataSize:               3,
-		ExternalFormatVersion:  4,
-		FilterPolicyName:       "filter policy name",
-		FilterSize:             5,
-		GlobalSeqNum:           8,
-		IndexPartitions:        10,
-		IndexSize:              11,
-		IndexType:              12,
-		IsStrictObsolete:       true,
-		MergerName:             "merge operator name",
-		NumDataBlocks:          14,
-		NumDeletions:           15,
-		NumEntries:             16,
-		NumMergeOperands:       17,
-		NumRangeDeletions:      18,
-		NumRangeKeyDels:        19,
-		NumRangeKeySets:        20,
-		NumRangeKeyUnsets:      21,
-		NumValueBlocks:         22,
-		NumValuesInValueBlocks: 23,
-		PrefixExtractorName:    "prefix extractor name",
-		PrefixFiltering:        true,
-		PropertyCollectorNames: "prefix collector names",
-		RawKeySize:             25,
-		RawValueSize:           26,
-		TopLevelIndexSize:      27,
-		WholeKeyFiltering:      true,
-		UserProperties: map[string]string{
-			"user-prop-a": "1",
-			"user-prop-b": "2",
-		},
-		ValueBlocksSize: 28,
-	}
+var testProps = Properties{
+	CommonProperties: CommonProperties{
+		NumDeletions:            15,
+		NumEntries:              16,
+		NumRangeDeletions:       18,
+		NumRangeKeyDels:         19,
+		NumRangeKeySets:         20,
+		RawKeySize:              25,
+		RawValueSize:            26,
+		NumDataBlocks:           14,
+		NumTombstoneDenseBlocks: 2,
+		CompressionName:         "compression name",
+		CompressionOptions:      "compression option",
+	},
+	ComparerName:           "comparator name",
+	DataSize:               3,
+	FilterPolicyName:       "filter policy name",
+	FilterSize:             5,
+	IndexPartitions:        10,
+	IndexSize:              11,
+	IndexType:              12,
+	IsStrictObsolete:       true,
+	KeySchemaName:          "key schema name",
+	MergerName:             "merge operator name",
+	NumMergeOperands:       17,
+	NumRangeKeyUnsets:      21,
+	NumValueBlocks:         22,
+	NumValuesInValueBlocks: 23,
+	PropertyCollectorNames: "prefix collector names",
+	TopLevelIndexSize:      27,
+	UserProperties: map[string]string{
+		"user-prop-a": "1",
+		"user-prop-b": "2",
+	},
+}
 
-	check1 := func(expected *Properties) {
+func TestPropertiesSave(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	expected := &Properties{}
+	*expected = testProps
+
+	check1 := func(e *Properties) {
 		// Check that we can save properties and read them back.
-		var w rawBlockWriter
-		w.restartInterval = propertiesBlockRestartInterval
-		expected.save(TableFormatPebblev2, &w)
+		var w rowblk.Writer
+		w.RestartInterval = propertiesBlockRestartInterval
+		e.save(TableFormatPebblev2, &w)
 		var props Properties
 
-		require.NoError(t, props.load(w.finish(), 0, make(map[string]struct{})))
+		require.NoError(t, props.load(w.Finish(), make(map[string]struct{})))
 		props.Loaded = nil
-		if diff := pretty.Diff(*expected, props); diff != nil {
+		if diff := pretty.Diff(*e, props); diff != nil {
 			t.Fatalf("%s", strings.Join(diff, "\n"))
 		}
 	}
 
 	check1(expected)
 
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng := randv1.New(randv1.NewSource(time.Now().UnixNano()))
 	for i := 0; i < 1000; i++ {
 		v, _ := quick.Value(reflect.TypeOf(Properties{}), rng)
 		props := v.Interface().(Properties)
 		if props.IndexPartitions == 0 {
 			props.TopLevelIndexSize = 0
 		}
+		props.Loaded = nil
 		check1(&props)
+	}
+}
+
+func BenchmarkPropertiesLoad(b *testing.B) {
+	var w rowblk.Writer
+	w.RestartInterval = propertiesBlockRestartInterval
+	testProps.save(TableFormatPebblev2, &w)
+	block := w.Finish()
+
+	b.ResetTimer()
+	p := &Properties{}
+	for i := 0; i < b.N; i++ {
+		*p = Properties{}
+		require.NoError(b, p.load(block, nil))
 	}
 }

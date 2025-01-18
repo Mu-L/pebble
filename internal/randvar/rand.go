@@ -4,15 +4,11 @@
 
 package randvar
 
-import (
-	"time"
+import "math/rand/v2"
 
-	"golang.org/x/exp/rand"
-)
-
-// NewRand creates a new random number generator seeded with the current time.
+// NewRand creates a new random number generator with a random seed.
 func NewRand() *rand.Rand {
-	return rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	return rand.New(rand.NewPCG(0, rand.Uint64()))
 }
 
 func ensureRand(rng *rand.Rand) *rand.Rand {

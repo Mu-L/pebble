@@ -18,7 +18,11 @@ import (
 // current value of the marker. Callers that may need to move the marker
 // to a new value should use LocateMarker.
 func ReadMarker(fs vfs.FS, dir, markerName string) (string, error) {
-	state, err := scanForMarker(fs, dir, markerName)
+	ls, err := fs.List(dir)
+	if err != nil {
+		return "", err
+	}
+	state, err := scanForMarker(fs, ls, markerName)
 	if err != nil {
 		return "", err
 	}
@@ -29,7 +33,20 @@ func ReadMarker(fs vfs.FS, dir, markerName string) (string, error) {
 // to the Marker that may be used to move the marker and the
 // current value of the marker.
 func LocateMarker(fs vfs.FS, dir, markerName string) (*Marker, string, error) {
-	state, err := scanForMarker(fs, dir, markerName)
+	ls, err := fs.List(dir)
+	if err != nil {
+		return nil, "", err
+	}
+	return LocateMarkerInListing(fs, dir, markerName, ls)
+}
+
+// LocateMarkerInListing is like LocateMarker but takes a listing of the files
+// contained within dir. It's useful when the caller has already listed the
+// directory entries of dir for its own purposes.
+func LocateMarkerInListing(
+	fs vfs.FS, dir, markerName string, ls []string,
+) (*Marker, string, error) {
+	state, err := scanForMarker(fs, ls, markerName)
 	if err != nil {
 		return nil, "", err
 	}
@@ -57,11 +74,7 @@ type scannedState struct {
 	obsolete []string
 }
 
-func scanForMarker(fs vfs.FS, dir, markerName string) (scannedState, error) {
-	ls, err := fs.List(dir)
-	if err != nil {
-		return scannedState{}, err
-	}
+func scanForMarker(fs vfs.FS, ls []string, markerName string) (scannedState, error) {
 	var state scannedState
 	for _, filename := range ls {
 		if !strings.HasPrefix(filename, `marker.`) {
@@ -180,7 +193,7 @@ func (a *Marker) Move(newValue string) error {
 	oldFilename := a.filename
 
 	// Create the new marker.
-	f, err := a.fs.Create(dstPath)
+	f, err := a.fs.Create(dstPath, vfs.WriteCategoryUnspecified)
 	if err != nil {
 		// On a distributed filesystem, an error doesn't guarantee that
 		// the file wasn't created. A retry of the same Move call will

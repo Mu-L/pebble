@@ -5,11 +5,10 @@ list-files build
 ----
 build:
   000002.log
-  CURRENT
   LOCK
   MANIFEST-000001
   OPTIONS-000003
-  marker.format-version.000007.008
+  marker.format-version.000001.013
   marker.manifest.000001.MANIFEST-000001
 
 commit
@@ -27,11 +26,10 @@ build:
   000002.log
   000004.log
   000005.sst
-  CURRENT
   LOCK
   MANIFEST-000001
   OPTIONS-000003
-  marker.format-version.000007.008
+  marker.format-version.000001.013
   marker.manifest.000001.MANIFEST-000001
 
 start
@@ -50,7 +48,7 @@ simple/checkpoint:
   000005.sst
   MANIFEST-000001
   OPTIONS-000003
-  marker.format-version.000001.008
+  marker.format-version.000001.013
   marker.manifest.000001.MANIFEST-000001
 
 commit
@@ -74,14 +72,12 @@ list-files simple
 simple:
   000007.sst
   MANIFEST-000001
-  MANIFEST-000008
   checkpoint
 
 stat simple/MANIFEST-000001 simple/MANIFEST-000008 simple/000007.sst
 ----
 simple/MANIFEST-000001:
-  size: 98
-simple/MANIFEST-000008:
-  size: 122
+  size: 133
+simple/MANIFEST-000008: stat simple/MANIFEST-000008: file does not exist
 simple/000007.sst:
-  size: 686
+  size: 614

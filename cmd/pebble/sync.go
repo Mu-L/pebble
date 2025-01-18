@@ -7,14 +7,15 @@ package main
 import (
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/cockroachkvs"
 	"github.com/cockroachdb/pebble/internal/randvar"
 	"github.com/spf13/cobra"
-	"golang.org/x/exp/rand"
 )
 
 var syncConfig struct {
@@ -66,7 +67,7 @@ func runSync(cmd *cobra.Command, args []string) {
 				go func() {
 					defer wg.Done()
 
-					rand := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+					rand := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 					var raw []byte
 					var buf []byte
 					var block []byte
@@ -86,7 +87,7 @@ func runSync(cmd *cobra.Command, args []string) {
 								}
 							} else {
 								raw = encodeUint32Ascending(raw[:0], rand.Uint32())
-								key := mvccEncode(buf[:0], raw, 0, 0)
+								key := cockroachkvs.EncodeMVCCKey(buf[:0], raw, 0, 0)
 								buf = key[:0]
 								if err := b.Set(key, block, nil); err != nil {
 									log.Fatal(err)

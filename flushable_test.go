@@ -2,7 +2,9 @@ package pebble
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/datadriven"
@@ -46,31 +48,42 @@ func TestIngestedSSTFlushableAPI(t *testing.T) {
 	}
 	reset()
 
-	loadFileMeta := func(paths []string) []*fileMetadata {
-		d.mu.Lock()
-		pendingOutputs := make([]base.DiskFileNum, len(paths))
+	loadFileMeta := func(paths []string, exciseSpan KeyRange, seqNum base.SeqNum) []*fileMetadata {
+		pendingOutputs := make([]base.FileNum, len(paths))
 		for i := range paths {
-			pendingOutputs[i] = d.mu.versions.getNextFileNum().DiskFileNum()
+			pendingOutputs[i] = d.mu.versions.getNextFileNum()
 		}
-		jobID := d.mu.nextJobID
-		d.mu.nextJobID++
-		d.mu.Unlock()
+		jobID := d.newJobID()
 
 		// We can reuse the ingestLoad function for this test even if we're
 		// not actually ingesting a file.
-		lr, err := ingestLoad(d.opts, d.FormatMajorVersion(), paths, nil, nil, d.cacheID, pendingOutputs, d.objProvider, jobID)
-		meta := lr.localMeta
+		lr, err := ingestLoad(context.Background(), d.opts, d.FormatMajorVersion(), paths, nil, nil, d.cacheID, pendingOutputs)
 		if err != nil {
-			panic(err)
+			t.Fatal(err)
+		}
+		meta := make([]*fileMetadata, len(lr.local))
+		if exciseSpan.Valid() {
+			seqNum++
+		}
+		for i := range meta {
+			meta[i] = lr.local[i].fileMetadata
+			if err := setSeqNumInMetadata(meta[i], seqNum+base.SeqNum(i), d.cmp, d.opts.Comparer.FormatKey); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if len(meta) == 0 {
 			// All of the sstables to be ingested were empty. Nothing to do.
 			panic("empty sstable")
 		}
+		// The file cache requires the *fileMetadata to have a positive
+		// reference count. Fake a reference before we try to load the file.
+		for _, f := range meta {
+			f.FileBacking.Ref()
+		}
 
 		// Verify the sstables do not overlap.
-		if err := ingestSortAndVerify(d.cmp, lr, KeyRange{}); err != nil {
-			panic("unsorted sstables")
+		if err := ingestSortAndVerify(d.cmp, lr, exciseSpan); err != nil {
+			t.Fatal(err)
 		}
 
 		// Hard link the sstables into the DB directory. Since the sstables aren't
@@ -78,8 +91,8 @@ func TestIngestedSSTFlushableAPI(t *testing.T) {
 		// (e.g. because the files reside on a different filesystem), ingestLink will
 		// fall back to copying, and if that fails we undo our work and return an
 		// error.
-		if err := ingestLink(jobID, d.opts, d.objProvider, lr, nil /* shared */); err != nil {
-			panic("couldn't hard link sstables")
+		if err := ingestLinkLocal(context.Background(), jobID, d.opts, d.objProvider, lr.local); err != nil {
+			t.Fatal(err)
 		}
 
 		// Fsync the directory we added the tables to. We need to do this at some
@@ -87,12 +100,13 @@ func TestIngestedSSTFlushableAPI(t *testing.T) {
 		// can have the tables referenced in the MANIFEST, but not present in the
 		// directory.
 		if err := d.dataDir.Sync(); err != nil {
-			panic("Couldn't sync data directory")
+			t.Fatal(err)
 		}
 
 		return meta
 	}
 
+	var seqNum uint64
 	datadriven.RunTest(t, "testdata/ingested_flushable_api", func(t *testing.T, td *datadriven.TestData) string {
 		switch td.Cmd {
 		case "reset":
@@ -106,20 +120,32 @@ func TestIngestedSSTFlushableAPI(t *testing.T) {
 		case "flushable":
 			// Creates an ingestedFlushable over the input files.
 			paths := make([]string, 0, len(td.CmdArgs))
+			var exciseSpan KeyRange
+			startSeqNum := base.SeqNum(seqNum)
 			for _, arg := range td.CmdArgs {
-				paths = append(paths, arg.String())
+				switch arg.Key {
+				case "excise":
+					parts := strings.Split(arg.Vals[0], "-")
+					if len(parts) != 2 {
+						return fmt.Sprintf("invalid excise range: %s", arg.Vals[0])
+					}
+					exciseSpan.Start = []byte(parts[0])
+					exciseSpan.End = []byte(parts[1])
+					seqNum++
+				default:
+					paths = append(paths, arg.String())
+					seqNum++
+				}
 			}
 
-			meta := loadFileMeta(paths)
-			flushable = newIngestedFlushable(
-				meta, d.cmp, d.split, d.newIters, d.tableNewRangeKeyIter,
-			)
+			meta := loadFileMeta(paths, exciseSpan, startSeqNum)
+			flushable = newIngestedFlushable(meta, d.opts.Comparer, d.newIters, d.tableNewRangeKeyIter, exciseSpan, base.SeqNum(startSeqNum))
 			return ""
 		case "iter":
 			iter := flushable.newIter(nil)
 			var buf bytes.Buffer
-			for x, _ := iter.First(); x != nil; x, _ = iter.Next() {
-				buf.WriteString(x.String())
+			for x := iter.First(); x != nil; x = iter.Next() {
+				buf.WriteString(x.K.String())
 				buf.WriteString("\n")
 			}
 			iter.Close()
@@ -128,22 +154,30 @@ func TestIngestedSSTFlushableAPI(t *testing.T) {
 			iter := flushable.newRangeKeyIter(nil)
 			var buf bytes.Buffer
 			if iter != nil {
-				for span := iter.First(); span != nil; span = iter.Next() {
+				span, err := iter.First()
+				for ; span != nil; span, err = iter.Next() {
 					buf.WriteString(span.String())
 					buf.WriteString("\n")
 				}
 				iter.Close()
+				if err != nil {
+					fmt.Fprintf(&buf, "err=%q", err.Error())
+				}
 			}
 			return buf.String()
 		case "rangedelIter":
 			iter := flushable.newRangeDelIter(nil)
 			var buf bytes.Buffer
 			if iter != nil {
-				for span := iter.First(); span != nil; span = iter.Next() {
+				span, err := iter.First()
+				for ; span != nil; span, err = iter.Next() {
 					buf.WriteString(span.String())
 					buf.WriteString("\n")
 				}
 				iter.Close()
+				if err != nil {
+					fmt.Fprintf(&buf, "err=%q", err.Error())
+				}
 			}
 			return buf.String()
 		case "readyForFlush":

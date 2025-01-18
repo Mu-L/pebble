@@ -31,14 +31,17 @@ func (p *provider) vfsOpenForReading(
 		}
 		return nil, err
 	}
-	return newFileReadable(file, p.st.FS, filename)
+	return newFileReadable(file, p.st.FS, p.st.Local.ReadaheadConfig, filename)
 }
 
 func (p *provider) vfsCreate(
-	_ context.Context, fileType base.FileType, fileNum base.DiskFileNum,
+	_ context.Context,
+	fileType base.FileType,
+	fileNum base.DiskFileNum,
+	category vfs.DiskWriteCategory,
 ) (objstorage.Writable, objstorage.ObjectMetadata, error) {
 	filename := p.vfsPath(fileType, fileNum)
-	file, err := p.st.FS.Create(filename)
+	file, err := p.st.FS.Create(filename, category)
 	if err != nil {
 		return nil, objstorage.ObjectMetadata{}, err
 	}
@@ -83,19 +86,23 @@ func (p *provider) vfsInit() error {
 
 func (p *provider) vfsSync() error {
 	p.mu.Lock()
-	shouldSync := p.mu.localObjectsChanged
-	p.mu.localObjectsChanged = false
+	counterVal := p.mu.localObjectsChangeCounter
+	lastSynced := p.mu.localObjectsChangeCounterSynced
 	p.mu.Unlock()
 
-	if !shouldSync {
+	if lastSynced >= counterVal {
 		return nil
 	}
 	if err := p.fsDir.Sync(); err != nil {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		p.mu.localObjectsChanged = true
 		return err
 	}
+
+	p.mu.Lock()
+	if p.mu.localObjectsChangeCounterSynced < counterVal {
+		p.mu.localObjectsChangeCounterSynced = counterVal
+	}
+	p.mu.Unlock()
+
 	return nil
 }
 

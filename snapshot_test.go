@@ -7,7 +7,7 @@ package pebble
 import (
 	"bytes"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"reflect"
 	"runtime"
 	"strings"
@@ -15,20 +15,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/crlib/crstrings"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
 
 func TestSnapshotListToSlice(t *testing.T) {
 	testCases := []struct {
-		vals []uint64
+		vals []base.SeqNum
 	}{
 		{nil},
-		{[]uint64{1}},
-		{[]uint64{1, 2, 3}},
-		{[]uint64{3, 2, 1}},
+		{[]base.SeqNum{1}},
+		{[]base.SeqNum{1, 2, 3}},
+		{[]base.SeqNum{3, 2, 1}},
 	}
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
@@ -45,9 +47,9 @@ func TestSnapshotListToSlice(t *testing.T) {
 	}
 }
 
-func TestSnapshot(t *testing.T) {
+func testSnapshotImpl(t *testing.T, newSnapshot func(d *DB) Reader) {
 	var d *DB
-	var snapshots map[string]*Snapshot
+	var snapshots map[string]Reader
 
 	close := func() {
 		for _, s := range snapshots {
@@ -62,9 +64,7 @@ func TestSnapshot(t *testing.T) {
 	defer close()
 
 	randVersion := func() FormatMajorVersion {
-		minVersion := FormatUnusedPrePebblev1MarkedCompacted
-		return FormatMajorVersion(int(minVersion) + rand.Intn(
-			int(internalFormatNewest)-int(minVersion)+1))
+		return FormatMinSupported + FormatMajorVersion(rand.IntN(int(internalFormatNewest-FormatMinSupported)+1))
 	}
 	datadriven.RunTest(t, "testdata/snapshot", func(t *testing.T, td *datadriven.TestData) string {
 		switch td.Cmd {
@@ -87,13 +87,10 @@ func TestSnapshot(t *testing.T) {
 			if err != nil {
 				return err.Error()
 			}
-			snapshots = make(map[string]*Snapshot)
+			snapshots = make(map[string]Reader)
 
-			for _, line := range strings.Split(td.Input, "\n") {
+			for _, line := range crstrings.Lines(td.Input) {
 				parts := strings.Fields(line)
-				if len(parts) == 0 {
-					continue
-				}
 				var err error
 				switch parts[0] {
 				case "set":
@@ -115,7 +112,7 @@ func TestSnapshot(t *testing.T) {
 					if len(parts) != 2 {
 						return fmt.Sprintf("%s expects 1 argument", parts[0])
 					}
-					snapshots[parts[1]] = d.NewSnapshot()
+					snapshots[parts[1]] = newSnapshot(d)
 				case "compact":
 					if len(parts) != 2 {
 						return fmt.Sprintf("%s expects 1 argument", parts[0])
@@ -154,18 +151,15 @@ func TestSnapshot(t *testing.T) {
 				if snapshot == nil {
 					return fmt.Sprintf("unable to find snapshot \"%s\"", name)
 				}
-				iter = snapshot.NewIter(nil)
+				iter, _ = snapshot.NewIter(nil)
 			} else {
-				iter = d.NewIter(nil)
+				iter, _ = d.NewIter(nil)
 			}
 			defer iter.Close()
 
 			var b bytes.Buffer
-			for _, line := range strings.Split(td.Input, "\n") {
+			for _, line := range crstrings.Lines(td.Input) {
 				parts := strings.Fields(line)
-				if len(parts) == 0 {
-					continue
-				}
 				switch parts[0] {
 				case "first":
 					iter.First()
@@ -201,6 +195,19 @@ func TestSnapshot(t *testing.T) {
 		default:
 			return fmt.Sprintf("unknown command: %s", td.Cmd)
 		}
+	})
+}
+
+func TestSnapshot(t *testing.T) {
+	testSnapshotImpl(t, func(d *DB) Reader {
+		return d.NewSnapshot()
+	})
+}
+
+func TestEventuallyFileOnlySnapshot(t *testing.T) {
+	testSnapshotImpl(t, func(d *DB) Reader {
+		// NB: all keys in testdata/snapshot fall within the ASCII keyrange a-z.
+		return d.NewEventuallyFileOnlySnapshot([]KeyRange{{Start: []byte("a"), End: []byte("z")}})
 	})
 }
 
@@ -276,7 +283,7 @@ func TestSnapshotRangeDeletionStress(t *testing.T) {
 			}()
 
 			// Count the keys at this snapshot.
-			iter := snapshots[r].NewIter(nil)
+			iter, _ := snapshots[r].NewIter(nil)
 			var keysFound int
 			for iter.First(); iter.Valid(); iter.Next() {
 				keysFound++

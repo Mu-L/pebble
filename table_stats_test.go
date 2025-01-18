@@ -6,36 +6,36 @@ package pebble
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/datadriven"
-	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/keyspan"
-	"github.com/cockroachdb/pebble/internal/rangekey"
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
 
 func TestTableStats(t *testing.T) {
-	fs := vfs.NewMem()
 	// loadedInfo is protected by d.mu.
 	var loadedInfo *TableStatsInfo
 	opts := &Options{
-		FS: fs,
+		Comparer:                    testkeys.Comparer,
+		DisableAutomaticCompactions: true,
+		FormatMajorVersion:          FormatMinSupported,
+		FS:                          vfs.NewMem(),
 		EventListener: &EventListener{
 			TableStatsLoaded: func(info TableStatsInfo) {
 				loadedInfo = &info
 			},
 		},
+		Logger: testLogger{t},
 	}
-	opts.DisableAutomaticCompactions = true
-	opts.Comparer = testkeys.Comparer
-	opts.FormatMajorVersion = FormatRangeKeys
 
 	d, err := Open("", opts)
 	require.NoError(t, err)
@@ -50,13 +50,13 @@ func TestTableStats(t *testing.T) {
 		switch td.Cmd {
 		case "disable":
 			d.mu.Lock()
-			d.opts.private.disableTableStats = true
+			d.opts.DisableTableStats = true
 			d.mu.Unlock()
 			return ""
 
 		case "enable":
 			d.mu.Lock()
-			d.opts.private.disableTableStats = false
+			d.opts.DisableTableStats = false
 			d.maybeCollectTableStatsLocked()
 			d.mu.Unlock()
 			return ""
@@ -129,6 +129,30 @@ func TestTableStats(t *testing.T) {
 			}
 			return buf.String()
 
+		case "lsm":
+			d.mu.Lock()
+			s := d.mu.versions.currentVersion().String()
+			d.mu.Unlock()
+			return s
+
+		case "build":
+			if err := runBuildCmd(td, d, d.opts.FS); err != nil {
+				return err.Error()
+			}
+			return ""
+
+		case "ingest-and-excise":
+			if err := runIngestAndExciseCmd(td, d, d.opts.FS); err != nil {
+				return err.Error()
+			}
+			// Wait for a possible flush.
+			d.mu.Lock()
+			for d.mu.compact.flushing {
+				d.mu.compact.cond.Wait()
+			}
+			d.mu.Unlock()
+			return ""
+
 		case "wait-pending-table-stats":
 			return runTableStatsCmd(td, d)
 
@@ -152,6 +176,11 @@ func TestTableStats(t *testing.T) {
 			d.mu.Unlock()
 			return s
 
+		case "metadata-stats":
+			// Prints some metadata about some sstable which is currently in the
+			// latest version.
+			return runMetadataCommand(t, td, d)
+
 		case "properties":
 			return runSSTablePropertiesCmd(t, td, d)
 
@@ -163,36 +192,24 @@ func TestTableStats(t *testing.T) {
 
 func TestTableRangeDeletionIter(t *testing.T) {
 	var m *fileMetadata
-	cmp := base.DefaultComparer.Compare
+	cmp := testkeys.Comparer
+	keySchema := colblk.DefaultKeySchema(cmp, 16)
 	fs := vfs.NewMem()
 	datadriven.RunTest(t, "testdata/table_stats_deletion_iter", func(t *testing.T, td *datadriven.TestData) string {
 		switch cmd := td.Cmd; cmd {
 		case "build":
-			f, err := fs.Create("tmp.sst")
+			f, err := fs.Create("tmp.sst", vfs.WriteCategoryUnspecified)
 			if err != nil {
 				return err.Error()
 			}
-			w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
+			w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
+				Comparer:    cmp,
+				KeySchema:   &keySchema,
 				TableFormat: sstable.TableFormatMax,
 			})
 			m = &fileMetadata{}
 			for _, line := range strings.Split(td.Input, "\n") {
-				s := keyspan.ParseSpan(line)
-				// Range dels can be written sequentially. Range keys must be collected.
-				rKeySpan := &keyspan.Span{Start: s.Start, End: s.End}
-				for _, k := range s.Keys {
-					if rangekey.IsRangeKey(k.Kind()) {
-						rKeySpan.Keys = append(rKeySpan.Keys, k)
-					} else {
-						k := base.InternalKey{UserKey: s.Start, Trailer: k.Trailer}
-						if err = w.Add(k, s.End); err != nil {
-							return err.Error()
-						}
-					}
-				}
-				err = rangekey.Encode(rKeySpan, func(k base.InternalKey, v []byte) error {
-					return w.AddRangeKey(k, v)
-				})
+				err = w.EncodeSpan(keyspan.ParseSpan(line))
 				if err != nil {
 					return err.Error()
 				}
@@ -205,15 +222,15 @@ func TestTableRangeDeletionIter(t *testing.T) {
 				return err.Error()
 			}
 			if meta.HasPointKeys {
-				m.ExtendPointKeyBounds(cmp, meta.SmallestPoint, meta.LargestPoint)
+				m.ExtendPointKeyBounds(cmp.Compare, meta.SmallestPoint, meta.LargestPoint)
 			}
 			if meta.HasRangeDelKeys {
-				m.ExtendPointKeyBounds(cmp, meta.SmallestRangeDel, meta.LargestRangeDel)
+				m.ExtendPointKeyBounds(cmp.Compare, meta.SmallestRangeDel, meta.LargestRangeDel)
 			}
 			if meta.HasRangeKeys {
-				m.ExtendRangeKeyBounds(cmp, meta.SmallestRangeKey, meta.LargestRangeKey)
+				m.ExtendRangeKeyBounds(cmp.Compare, meta.SmallestRangeKey, meta.LargestRangeKey)
 			}
-			return m.DebugString(base.DefaultFormatter, false /* verbose */)
+			return m.DebugString(cmp.FormatKey, false /* verbose */)
 		case "spans":
 			f, err := fs.Open("tmp.sst")
 			if err != nil {
@@ -224,19 +241,26 @@ func TestTableRangeDeletionIter(t *testing.T) {
 			if err != nil {
 				return err.Error()
 			}
-			r, err = sstable.NewReader(readable, sstable.ReaderOptions{})
+			r, err = sstable.NewReader(context.Background(), readable, sstable.ReaderOptions{
+				Comparer:   cmp,
+				KeySchemas: sstable.KeySchemas{keySchema.Name: &keySchema},
+			})
 			if err != nil {
 				return err.Error()
 			}
 			defer r.Close()
-			iter, err := newCombinedDeletionKeyspanIter(base.DefaultComparer, r, m)
+			iter, err := newCombinedDeletionKeyspanIter(cmp, r, m)
 			if err != nil {
 				return err.Error()
 			}
 			defer iter.Close()
 			var buf bytes.Buffer
-			for s := iter.First(); s != nil; s = iter.Next() {
+			s, err := iter.First()
+			for ; s != nil; s, err = iter.Next() {
 				buf.WriteString(s.String() + "\n")
+			}
+			if err != nil {
+				return err.Error()
 			}
 			if buf.Len() == 0 {
 				return "(none)"

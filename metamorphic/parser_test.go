@@ -6,24 +6,26 @@ package metamorphic
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/pebble/internal/randvar"
-	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
 )
 
 func TestParser(t *testing.T) {
+	kf := TestkeysKeyFormat
 	datadriven.RunTest(t, "testdata/parser", func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "parse":
-			ops, err := parse([]byte(d.Input))
+			ops, err := parse([]byte(d.Input), parserOpts{
+				parseFormattedUserKey:       kf.ParseFormattedKey,
+				parseFormattedUserKeySuffix: kf.ParseFormattedKeySuffix,
+			})
 			if err != nil {
 				return err.Error()
 			}
-			return formatOps(ops)
+			return formatOps(kf, ops)
 		default:
 			return fmt.Sprintf("unknown command: %s", d.Cmd)
 		}
@@ -31,28 +33,41 @@ func TestParser(t *testing.T) {
 }
 
 func TestParserRandom(t *testing.T) {
-	ops := generate(randvar.NewRand(), 10000, defaultConfig(), newKeyManager())
-	src := formatOps(ops)
+	cfgs := []string{"default", "multiInstance"}
+	for i := range cfgs {
+		t.Run(fmt.Sprintf("config=%s", cfgs[i]), func(t *testing.T) {
+			cfg := DefaultOpConfig()
+			if cfgs[i] == "multiInstance" {
+				cfg = multiInstanceConfig()
+				cfg.numInstances = 2
+			}
+			km := newKeyManager(cfg.numInstances)
+			g := newGenerator(randvar.NewRand(), cfg, km)
+			ops := g.generate(10000)
+			src := formatOps(km.kf, ops)
 
-	parsedOps, err := parse([]byte(src))
-	if err != nil {
-		t.Fatalf("%s\n%s", err, src)
-	}
-
-	if diff := pretty.Diff(ops, parsedOps); diff != nil {
-		t.Fatalf("%s\n%s", strings.Join(diff, "\n"), src)
+			parsedOps, err := parse([]byte(src), parserOpts{})
+			if err != nil {
+				t.Fatalf("%s\n%s", err, src)
+			}
+			require.Equal(t, ops, parsedOps)
+		})
 	}
 }
 
 func TestParserNilBounds(t *testing.T) {
-	formatted := formatOps([]op{
+	kf := TestkeysKeyFormat
+	formatted := formatOps(kf, []op{
 		&newIterOp{
-			readerID: makeObjID(dbTag, 0),
+			readerID: makeObjID(dbTag, 1),
 			iterID:   makeObjID(iterTag, 1),
 			iterOpts: iterOpts{},
 		},
 	})
-	parsedOps, err := parse([]byte(formatted))
+	parsedOps, err := parse([]byte(formatted), parserOpts{
+		parseFormattedUserKey:       kf.ParseFormattedKey,
+		parseFormattedUserKeySuffix: kf.ParseFormattedKeySuffix,
+	})
 	require.NoError(t, err)
 	require.Equal(t, 1, len(parsedOps))
 	v := parsedOps[0].(*newIterOp)

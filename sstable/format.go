@@ -7,6 +7,9 @@ package sstable
 import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/colblk"
+	"github.com/cockroachdb/pebble/sstable/rowblk"
 )
 
 // TableFormat specifies the format version for sstables. The legacy LevelDB
@@ -25,8 +28,15 @@ const (
 	TableFormatPebblev2 // Range keys.
 	TableFormatPebblev3 // Value blocks.
 	TableFormatPebblev4 // DELSIZED tombstones.
+	TableFormatPebblev5 // Columnar blocks.
+	NumTableFormats
 
-	TableFormatMax = TableFormatPebblev4
+	TableFormatMax = NumTableFormats - 1
+
+	// TableFormatMinSupported is the minimum format supported by Pebble.  This
+	// package still supports older formats for uses outside of Pebble
+	// (CockroachDB uses it to read data from backups that could be old).
+	TableFormatMinSupported = TableFormatPebblev1
 )
 
 // TableFormatPebblev4, in addition to DELSIZED, introduces the use of
@@ -133,9 +143,31 @@ const (
 //
 // Note that we do not need to do anything special at write time for
 // SETWITHDEL and SINGLEDEL. This is because these key kinds are treated
-// specially only by compactions, which do not hide obsolete points. For
-// regular reads, SETWITHDEL behaves the same as SET and SINGLEDEL behaves the
-// same as DEL.
+// specially only by compactions, which typically do not hide obsolete points
+// (see exception below). For regular reads, SETWITHDEL behaves the same as
+// SET and SINGLEDEL behaves the same as DEL.
+//
+// 2.1.1 Compaction reads of a foreign sstable
+//
+// Compaction reads of a foreign sstable behave like regular reads in that
+// only non-obsolete points are exposed. Consider a L5 foreign sstable with
+// b.SINGLEDEL that is non-obsolete followed by obsolete b.DEL. And a L6
+// foreign sstable with two b.SETs. The SINGLEDEL will be exposed, and not the
+// DEL, but this is not a correctness issue since only one of the SETs in the
+// L6 sstable will be exposed. However, this works only because we have
+// limited the number of foreign sst levels to two, and is extremely fragile.
+// For robust correctness, non-obsolete SINGLEDELs in foreign sstables should
+// be exposed as DELs.
+//
+// Additionally, to avoid false positive accounting errors in DELSIZED, we
+// should expose them as DEL.
+//
+// NB: as of writing this comment, we do not have end-to-end support for
+// SINGLEDEL for disaggregated storage since pointCollapsingIterator (used by
+// ScanInternal) does not support SINGLEDEL. So the disaggregated key spans
+// are required to never have SINGLEDELs (which is fine for CockroachDB since
+// only the MVCC key space uses disaggregated storage, and SINGLEDELs are only
+// used for the non-MVCC locks and intents).
 //
 // 2.2 Strictness and MERGE
 //
@@ -180,17 +212,16 @@ const (
 //     RANGEDELs when a Pebble-external writer is trying to construct a strict
 //     obsolete sstable.
 
-// ParseTableFormat parses the given magic bytes and version into its
+// parseTableFormat parses the given magic bytes and version into its
 // corresponding internal TableFormat.
-func ParseTableFormat(magic []byte, version uint32) (TableFormat, error) {
+func parseTableFormat(magic []byte, version uint32) (TableFormat, error) {
 	switch string(magic) {
 	case levelDBMagic:
 		return TableFormatLevelDB, nil
 	case rocksDBMagic:
 		if version != rocksDBFormatVersion2 {
 			return TableFormatUnspecified, base.CorruptionErrorf(
-				"pebble/table: unsupported rocksdb format version %d", errors.Safe(version),
-			)
+				"(unsupported rocksdb format version %d)", errors.Safe(version))
 		}
 		return TableFormatRocksDBv2, nil
 	case pebbleDBMagic:
@@ -203,16 +234,29 @@ func ParseTableFormat(magic []byte, version uint32) (TableFormat, error) {
 			return TableFormatPebblev3, nil
 		case 4:
 			return TableFormatPebblev4, nil
+		case 5:
+			return TableFormatPebblev5, nil
 		default:
 			return TableFormatUnspecified, base.CorruptionErrorf(
-				"pebble/table: unsupported pebble format version %d", errors.Safe(version),
-			)
+				"(unsupported pebble format version %d)", errors.Safe(version))
 		}
 	default:
 		return TableFormatUnspecified, base.CorruptionErrorf(
-			"pebble/table: invalid table (bad magic number: 0x%x)", magic,
-		)
+			"(bad magic number: 0x%x)", magic)
 	}
+}
+
+// BlockColumnar returns true iff the table format uses the columnar format for
+// data, index and keyspan blocks.
+func (f TableFormat) BlockColumnar() bool {
+	return f >= TableFormatPebblev5
+}
+
+func (f TableFormat) newIndexIter() block.IndexBlockIterator {
+	if !f.BlockColumnar() {
+		return new(rowblk.IndexIter)
+	}
+	return new(colblk.IndexIter)
 }
 
 // AsTuple returns the TableFormat's (Magic String, Version) tuple.
@@ -230,6 +274,8 @@ func (f TableFormat) AsTuple() (string, uint32) {
 		return pebbleDBMagic, 3
 	case TableFormatPebblev4:
 		return pebbleDBMagic, 4
+	case TableFormatPebblev5:
+		return pebbleDBMagic, 5
 	default:
 		panic("sstable: unknown table format version tuple")
 	}
@@ -238,6 +284,8 @@ func (f TableFormat) AsTuple() (string, uint32) {
 // String returns the TableFormat (Magic String,Version) tuple.
 func (f TableFormat) String() string {
 	switch f {
+	case TableFormatUnspecified:
+		return "unspecified"
 	case TableFormatLevelDB:
 		return "(LevelDB)"
 	case TableFormatRocksDBv2:
@@ -250,7 +298,27 @@ func (f TableFormat) String() string {
 		return "(Pebble,v3)"
 	case TableFormatPebblev4:
 		return "(Pebble,v4)"
+	case TableFormatPebblev5:
+		return "(Pebble,v5)"
 	default:
 		panic("sstable: unknown table format version tuple")
 	}
+}
+
+var tableFormatStrings = func() map[string]TableFormat {
+	strs := make(map[string]TableFormat, NumTableFormats)
+	for f := TableFormatUnspecified; f < NumTableFormats; f++ {
+		strs[f.String()] = f
+	}
+	return strs
+}()
+
+// ParseTableFormatString parses a TableFormat from its human-readable string
+// representation.
+func ParseTableFormatString(s string) (TableFormat, error) {
+	f, ok := tableFormatStrings[s]
+	if !ok {
+		return TableFormatUnspecified, errors.Errorf("unknown table format %q", s)
+	}
+	return f, nil
 }

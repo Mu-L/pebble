@@ -9,17 +9,20 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/arenaskl"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/cache"
+	"github.com/cockroachdb/pebble/internal/invalidating"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/keyspan"
+	"github.com/cockroachdb/pebble/internal/keyspan/keyspanimpl"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/manual"
 	"github.com/cockroachdb/pebble/objstorage"
@@ -27,19 +30,21 @@ import (
 	"github.com/cockroachdb/pebble/rangekey"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/atomicfs"
+	"github.com/cockroachdb/pebble/wal"
 	"github.com/cockroachdb/tokenbucket"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
-	// minTableCacheSize is the minimum size of the table cache, for a single db.
-	minTableCacheSize = 64
+	// minFileCacheSize is the minimum size of the file cache, for a single db.
+	minFileCacheSize = 64
 
-	// numNonTableCacheFiles is an approximation for the number of files
-	// that we don't use for table caches, for a given db.
-	numNonTableCacheFiles = 10
+	// numNonFileCacheFiles is an approximation for the number of files
+	// that we don't account for in the file cache, for a given db.
+	numNonFileCacheFiles = 10
 )
 
 var (
@@ -74,7 +79,11 @@ type Reader interface {
 	// NewIter returns an iterator that is unpositioned (Iterator.Valid() will
 	// return false). The iterator can be positioned via a call to SeekGE,
 	// SeekLT, First or Last.
-	NewIter(o *IterOptions) *Iterator
+	NewIter(o *IterOptions) (*Iterator, error)
+
+	// NewIterWithContext is like NewIter, and additionally accepts a context
+	// for tracing.
+	NewIterWithContext(ctx context.Context, o *IterOptions) (*Iterator, error)
 
 	// Close closes the Reader. It may or may not close any underlying io.Reader
 	// or io.Writer, depending on how the DB was created.
@@ -263,15 +272,19 @@ type DB struct {
 	// recycled.
 	memTableRecycle atomic.Pointer[memTable]
 
-	// The size of the current log file (i.e. db.mu.log.queue[len(queue)-1].
+	// The logical size of the current WAL.
 	logSize atomic.Uint64
+	// The number of input bytes to the log. This is the raw size of the
+	// batches written to the WAL, without the overhead of the record
+	// envelopes.
+	logBytesIn atomic.Uint64
 
 	// The number of bytes available on disk.
-	diskAvailBytes atomic.Uint64
+	diskAvailBytes       atomic.Uint64
+	lowDiskSpaceReporter lowDiskSpaceReporter
 
-	cacheID        uint64
+	cacheID        cache.ID
 	dirname        string
-	walDirname     string
 	opts           *Options
 	cmp            Compare
 	equal          Equal
@@ -280,7 +293,7 @@ type DB struct {
 	abbreviatedKey AbbreviatedKey
 	// The threshold for determining when a batch is "large" and will skip being
 	// inserted into a memtable.
-	largeBatchThreshold int
+	largeBatchThreshold uint64
 	// The current OPTIONS file number.
 	optionsFileNum base.DiskFileNum
 	// The on-disk size of the current OPTIONS file.
@@ -291,11 +304,10 @@ type DB struct {
 
 	fileLock *Lock
 	dataDir  vfs.File
-	walDir   vfs.File
 
-	tableCache           *tableCacheContainer
+	fileCache            *fileCacheContainer
 	newIters             tableNewIters
-	tableNewRangeKeyIter keyspan.TableNewSpanIter
+	tableNewRangeKeyIter keyspanimpl.TableNewSpanIter
 
 	commit *commitPipeline
 
@@ -305,19 +317,11 @@ type DB struct {
 		sync.RWMutex
 		val *readState
 	}
-	// logRecycler holds a set of log file numbers that are available for
-	// reuse. Writing to a recycled log file is faster than to a new log file on
-	// some common filesystems (xfs, and ext3/4) due to avoiding metadata
-	// updates.
-	logRecycler logRecycler
 
 	closed   *atomic.Value
 	closedCh chan struct{}
 
 	cleanupManager *cleanupManager
-	// testingAlwaysWaitForCleanup is set by some tests to force waiting for
-	// obsolete file deletion (to make events deterministic).
-	testingAlwaysWaitForCleanup bool
 
 	// During an iterator close, we may asynchronously schedule read compactions.
 	// We want to wait for those goroutines to finish, before closing the DB.
@@ -364,7 +368,7 @@ type DB struct {
 		// notifications and act as a mechanism for tying together the events and
 		// log messages for a single job such as a flush, compaction, or file
 		// ingestion. Job IDs are not serialized to disk or used for correctness.
-		nextJobID int
+		nextJobID JobID
 
 		// The collection of immutable versions and state about the log and visible
 		// sequence numbers. Use the pointer here to ensure the atomic fields in
@@ -372,30 +376,33 @@ type DB struct {
 		versions *versionSet
 
 		log struct {
-			// The queue of logs, containing both flushed and unflushed logs. The
-			// flushed logs will be a prefix, the unflushed logs a suffix. The
-			// delimeter between flushed and unflushed logs is
-			// versionSet.minUnflushedLogNum.
-			queue []fileInfo
-			// The number of input bytes to the log. This is the raw size of the
-			// batches written to the WAL, without the overhead of the record
-			// envelopes.
-			bytesIn uint64
-			// The LogWriter is protected by commitPipeline.mu. This allows log
-			// writes to be performed without holding DB.mu, but requires both
+			// manager is not protected by mu, but calls to Create must be
+			// serialized, and happen after the previous writer is closed.
+			manager wal.Manager
+			// The Writer is protected by commitPipeline.mu. This allows log writes
+			// to be performed without holding DB.mu, but requires both
 			// commitPipeline.mu and DB.mu to be held when rotating the WAL/memtable
-			// (i.e. makeRoomForWrite).
-			*record.LogWriter
-			// Can be nil.
+			// (i.e. makeRoomForWrite). Can be nil.
+			writer  wal.Writer
 			metrics struct {
+				// fsyncLatency has its own internal synchronization, and is not
+				// protected by mu.
 				fsyncLatency prometheus.Histogram
+				// Updated whenever a wal.Writer is closed.
 				record.LogWriterMetrics
 			}
-			registerLogWriterForTesting func(w *record.LogWriter)
 		}
 
 		mem struct {
-			// The current mutable memTable.
+			// The current mutable memTable. Readers of the pointer may hold
+			// either DB.mu or commitPipeline.mu.
+			//
+			// Its internal fields are protected by commitPipeline.mu. This
+			// allows batch commits to be performed without DB.mu as long as no
+			// memtable rotation is required.
+			//
+			// Both commitPipeline.mu and DB.mu must be held when rotating the
+			// memtable.
 			mutable *memTable
 			// Queue of flushables (the mutable memtable is at end). Elements are
 			// added to the end of the slice and removed from the beginning. Once an
@@ -407,7 +414,7 @@ type DB struct {
 			// is allocated up to Options.MemTableSize. This reduces the memory
 			// footprint of memtables when lots of DB instances are used concurrently
 			// in test environments.
-			nextSize int
+			nextSize uint64
 		}
 
 		compact struct {
@@ -417,14 +424,19 @@ type DB struct {
 			cond sync.Cond
 			// True when a flush is in progress.
 			flushing bool
-			// The number of ongoing compactions.
+			// The number of ongoing non-download compactions.
 			compactingCount int
+			// The number of download compactions.
+			downloadingCount int
 			// The list of deletion hints, suggesting ranges for delete-only
 			// compactions.
 			deletionHints []deleteCompactionHint
 			// The list of manual compactions. The next manual compaction to perform
 			// is at the start of the list. New entries are added to the end.
 			manual []*manualCompaction
+			// downloads is the list of pending download tasks. The next download to
+			// perform is at the start of the list. New entries are added to the end.
+			downloads []*downloadSpanTask
 			// inProgress is the set of in-progress flushes and compactions.
 			// It's used in the calculation of some metrics and to initialize L0
 			// sublevels' state. Some of the compactions contained within this
@@ -447,7 +459,7 @@ type DB struct {
 			flushWriteThroughput ThroughputMetric
 			// The idle start time for the flush "loop", i.e., when the flushing
 			// bool above transitions to false.
-			noOngoingFlushStartTime time.Time
+			noOngoingFlushStartTime crtime.Mono
 		}
 
 		// Non-zero when file cleaning is disabled. The disabled count acts as a
@@ -493,6 +505,14 @@ type DB struct {
 			pending []newFileEntry
 			// validating is set to true when validation is running.
 			validating bool
+		}
+
+		// annotators contains various instances of manifest.Annotator which
+		// should be protected from concurrent access.
+		annotators struct {
+			totalSize    *manifest.Annotator[uint64]
+			remoteSize   *manifest.Annotator[uint64]
+			externalSize *manifest.Annotator[uint64]
 		}
 	}
 
@@ -546,7 +566,7 @@ func (d *DB) getInternal(key []byte, b *Batch, s *Snapshot) ([]byte, io.Closer, 
 
 	// Determine the seqnum to read at after grabbing the read state (current and
 	// memtables) above.
-	var seqNum uint64
+	var seqNum base.SeqNum
 	if s != nil {
 		seqNum = s.seqNum
 	} else {
@@ -557,16 +577,22 @@ func (d *DB) getInternal(key []byte, b *Batch, s *Snapshot) ([]byte, io.Closer, 
 
 	get := &buf.get
 	*get = getIter{
-		logger:   d.opts.Logger,
-		cmp:      d.cmp,
-		equal:    d.equal,
+		comparer: d.opts.Comparer,
 		newIters: d.newIters,
 		snapshot: seqNum,
-		key:      key,
-		batch:    b,
-		mem:      readState.memtables,
-		l0:       readState.current.L0SublevelFiles,
-		version:  readState.current,
+		iterOpts: IterOptions{
+			// TODO(sumeer): replace with a parameter provided by the caller.
+			Category:                      categoryGet,
+			logger:                        d.opts.Logger,
+			snapshotForHideObsoletePoints: seqNum,
+		},
+		key: key,
+		// Compute the key prefix for bloom filtering.
+		prefix:  key[:d.opts.Comparer.Split(key)],
+		batch:   b,
+		mem:     readState.memtables,
+		l0:      readState.current.L0SublevelFiles,
+		version: readState.current,
 	}
 
 	// Strip off memtables which cannot possibly contain the seqNum being read
@@ -613,8 +639,7 @@ func (d *DB) Set(key, value []byte, opts *WriteOptions) error {
 		return err
 	}
 	// Only release the batch on success.
-	b.release()
-	return nil
+	return b.Close()
 }
 
 // Delete deletes the value for the given key. Deletes are blind all will
@@ -628,8 +653,7 @@ func (d *DB) Delete(key []byte, opts *WriteOptions) error {
 		return err
 	}
 	// Only release the batch on success.
-	b.release()
-	return nil
+	return b.Close()
 }
 
 // DeleteSized behaves identically to Delete, but takes an additional
@@ -652,8 +676,7 @@ func (d *DB) DeleteSized(key []byte, valueSize uint32, opts *WriteOptions) error
 		return err
 	}
 	// Only release the batch on success.
-	b.release()
-	return nil
+	return b.Close()
 }
 
 // SingleDelete adds an action to the batch that single deletes the entry for key.
@@ -667,8 +690,7 @@ func (d *DB) SingleDelete(key []byte, opts *WriteOptions) error {
 		return err
 	}
 	// Only release the batch on success.
-	b.release()
-	return nil
+	return b.Close()
 }
 
 // DeleteRange deletes all of the keys (and values) in the range [start,end)
@@ -683,8 +705,7 @@ func (d *DB) DeleteRange(start, end []byte, opts *WriteOptions) error {
 		return err
 	}
 	// Only release the batch on success.
-	b.release()
-	return nil
+	return b.Close()
 }
 
 // Merge adds an action to the DB that merges the value at key with the new
@@ -699,8 +720,7 @@ func (d *DB) Merge(key, value []byte, opts *WriteOptions) error {
 		return err
 	}
 	// Only release the batch on success.
-	b.release()
-	return nil
+	return b.Close()
 }
 
 // LogData adds the specified to the batch. The data will be written to the
@@ -715,8 +735,7 @@ func (d *DB) LogData(data []byte, opts *WriteOptions) error {
 		return err
 	}
 	// Only release the batch on success.
-	b.release()
-	return nil
+	return b.Close()
 }
 
 // RangeKeySet sets a range key mapping the key range [start, end) at the MVCC
@@ -732,8 +751,7 @@ func (d *DB) RangeKeySet(start, end, suffix, value []byte, opts *WriteOptions) e
 		return err
 	}
 	// Only release the batch on success.
-	b.release()
-	return nil
+	return b.Close()
 }
 
 // RangeKeyUnset removes a range key mapping the key range [start, end) at the
@@ -751,8 +769,7 @@ func (d *DB) RangeKeyUnset(start, end, suffix []byte, opts *WriteOptions) error 
 		return err
 	}
 	// Only release the batch on success.
-	b.release()
-	return nil
+	return b.Close()
 }
 
 // RangeKeyDelete deletes all of the range keys in the range [start,end)
@@ -769,8 +786,7 @@ func (d *DB) RangeKeyDelete(start, end []byte, opts *WriteOptions) error {
 		return err
 	}
 	// Only release the batch on success.
-	b.release()
-	return nil
+	return b.Close()
 }
 
 // Apply the operations contained in the batch to the DB. If the batch is large
@@ -779,6 +795,8 @@ func (d *DB) RangeKeyDelete(start, end []byte, opts *WriteOptions) error {
 // reuse them.
 //
 // It is safe to modify the contents of the arguments after Apply returns.
+//
+// Apply returns ErrInvalidBatch if the provided batch is invalid in any way.
 func (d *DB) Apply(batch *Batch, opts *WriteOptions) error {
 	return d.applyInternal(batch, opts, false)
 }
@@ -807,6 +825,9 @@ func (d *DB) applyInternal(batch *Batch, opts *WriteOptions, noSyncWait bool) er
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
+	if batch.committing {
+		panic("pebble: batch already committing")
+	}
 	if batch.applied.Load() {
 		panic("pebble: batch already applied")
 	}
@@ -822,27 +843,31 @@ func (d *DB) applyInternal(batch *Batch, opts *WriteOptions, noSyncWait bool) er
 		return errors.New("pebble: WAL disabled")
 	}
 
-	if batch.minimumFormatMajorVersion != FormatMostCompatible {
-		if fmv := d.FormatMajorVersion(); fmv < batch.minimumFormatMajorVersion {
-			panic(fmt.Sprintf(
-				"pebble: batch requires at least format major version %d (current: %d)",
-				batch.minimumFormatMajorVersion, fmv,
-			))
-		}
+	if fmv := d.FormatMajorVersion(); fmv < batch.minimumFormatMajorVersion {
+		panic(fmt.Sprintf(
+			"pebble: batch requires at least format major version %d (current: %d)",
+			batch.minimumFormatMajorVersion, fmv,
+		))
 	}
 
 	if batch.countRangeKeys > 0 {
 		if d.split == nil {
 			return errNoSplit
 		}
-		// TODO(jackson): Assert that all range key operands are suffixless.
 	}
+	batch.committing = true
 
 	if batch.db == nil {
-		batch.refreshMemTableSize()
+		if err := batch.refreshMemTableSize(); err != nil {
+			return err
+		}
 	}
-	if int(batch.memTableSize) >= d.largeBatchThreshold {
-		batch.flushable = newFlushableBatch(batch, d.opts.Comparer)
+	if batch.memTableSize >= d.largeBatchThreshold {
+		var err error
+		batch.flushable, err = newFlushableBatch(batch, d.opts.Comparer)
+		if err != nil {
+			return err
+		}
 	}
 	if err := d.commit.Commit(batch, sync, noSyncWait); err != nil {
 		// There isn't much we can do on an error here. The commit pipeline will be
@@ -915,45 +940,49 @@ func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*mem
 		b.flushable.setSeqNum(b.SeqNum())
 		if !d.opts.DisableWAL {
 			var err error
-			size, err = d.mu.log.SyncRecord(repr, syncWG, syncErr)
+			size, err = d.mu.log.writer.WriteRecord(repr, wal.SyncOptions{Done: syncWG, Err: syncErr}, b)
 			if err != nil {
 				panic(err)
 			}
 		}
 	}
 
-	d.mu.Lock()
-
 	var err error
-	if !b.ingestedSSTBatch {
-		// Batches which contain keys of kind InternalKeyKindIngestSST will
-		// never be applied to the memtable, so we don't need to make room for
-		// write. For the other cases, switch out the memtable if there was not
-		// enough room to store the batch.
-		err = d.makeRoomForWrite(b)
-	}
-
-	if err == nil && !d.opts.DisableWAL {
-		d.mu.log.bytesIn += uint64(len(repr))
-	}
-
-	// Grab a reference to the memtable while holding DB.mu. Note that for
-	// non-flushable batches (b.flushable == nil) makeRoomForWrite() added a
-	// reference to the memtable which will prevent it from being flushed until
-	// we unreference it. This reference is dropped in DB.commitApply().
+	// Grab a reference to the memtable. We don't hold DB.mu, but we do hold
+	// d.commit.mu. It's okay for readers of d.mu.mem.mutable to only hold one of
+	// d.commit.mu or d.mu, because memtable rotations require holding both.
 	mem := d.mu.mem.mutable
-
-	d.mu.Unlock()
+	// Batches which contain keys of kind InternalKeyKindIngestSST will
+	// never be applied to the memtable, so we don't need to make room for
+	// write.
+	if !b.ingestedSSTBatch {
+		// Flushable batches will require a rotation of the memtable regardless,
+		// so only attempt an optimistic reservation of space in the current
+		// memtable if this batch is not a large flushable batch.
+		if b.flushable == nil {
+			err = d.mu.mem.mutable.prepare(b)
+		}
+		if b.flushable != nil || err == arenaskl.ErrArenaFull {
+			// Slow path.
+			// We need to acquire DB.mu and rotate the memtable.
+			func() {
+				d.mu.Lock()
+				defer d.mu.Unlock()
+				err = d.makeRoomForWrite(b)
+				mem = d.mu.mem.mutable
+			}()
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-
 	if d.opts.DisableWAL {
 		return mem, nil
 	}
+	d.logBytesIn.Add(uint64(len(repr)))
 
 	if b.flushable == nil {
-		size, err = d.mu.log.SyncRecord(repr, syncWG, syncErr)
+		size, err = d.mu.log.writer.WriteRecord(repr, wal.SyncOptions{Done: syncWG, Err: syncErr}, b)
 		if err != nil {
 			panic(err)
 		}
@@ -980,42 +1009,86 @@ var iterAllocPool = sync.Pool{
 	},
 }
 
+// snapshotIterOpts denotes snapshot-related iterator options when calling
+// newIter. These are the possible cases for a snapshotIterOpts:
+//   - No snapshot: All fields are zero values.
+//   - Classic snapshot: Only `seqNum` is set. The latest readState will be used
+//     and the specified seqNum will be used as the snapshot seqNum.
+//   - EventuallyFileOnlySnapshot (EFOS) behaving as a classic snapshot. Only
+//     the `seqNum` is set. The latest readState will be used
+//     and the specified seqNum will be used as the snapshot seqNum.
+//   - EFOS in file-only state: Only `seqNum` and `vers` are set. All the
+//     relevant SSTs are referenced by the *version.
+//   - EFOS that has been excised but is in alwaysCreateIters mode (tests only).
+//     Only `seqNum` and `readState` are set.
+type snapshotIterOpts struct {
+	seqNum    base.SeqNum
+	vers      *version
+	readState *readState
+}
+
+type batchIterOpts struct {
+	batchOnly bool
+}
+type newIterOpts struct {
+	snapshot snapshotIterOpts
+	batch    batchIterOpts
+}
+
 // newIter constructs a new iterator, merging in batch iterators as an extra
 // level.
-func (d *DB) newIter(ctx context.Context, batch *Batch, s *Snapshot, o *IterOptions) *Iterator {
+func (d *DB) newIter(
+	ctx context.Context, batch *Batch, newIterOpts newIterOpts, o *IterOptions,
+) *Iterator {
+	if newIterOpts.batch.batchOnly {
+		if batch == nil {
+			panic("batchOnly is true, but batch is nil")
+		}
+		if newIterOpts.snapshot.vers != nil {
+			panic("batchOnly is true, but snapshotIterOpts is initialized")
+		}
+	}
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
-	if o.rangeKeys() {
-		if d.FormatMajorVersion() < FormatRangeKeys {
-			panic(fmt.Sprintf(
-				"pebble: range keys require at least format major version %d (current: %d)",
-				FormatRangeKeys, d.FormatMajorVersion(),
-			))
-		}
-	}
+	seqNum := newIterOpts.snapshot.seqNum
 	if o != nil && o.RangeKeyMasking.Suffix != nil && o.KeyTypes != IterKeyTypePointsAndRanges {
 		panic("pebble: range key masking requires IterKeyTypePointsAndRanges")
 	}
-	if (batch != nil || s != nil) && (o != nil && o.OnlyReadGuaranteedDurable) {
+	if (batch != nil || seqNum != 0) && (o != nil && o.OnlyReadGuaranteedDurable) {
 		// We could add support for OnlyReadGuaranteedDurable on snapshots if
 		// there was a need: this would require checking that the sequence number
 		// of the snapshot has been flushed, by comparing with
 		// DB.mem.queue[0].logSeqNum.
 		panic("OnlyReadGuaranteedDurable is not supported for batches or snapshots")
 	}
-	// Grab and reference the current readState. This prevents the underlying
-	// files in the associated version from being deleted if there is a current
-	// compaction. The readState is unref'd by Iterator.Close().
-	readState := d.loadReadState()
+	var readState *readState
+	var newIters tableNewIters
+	var newIterRangeKey keyspanimpl.TableNewSpanIter
+	if !newIterOpts.batch.batchOnly {
+		// Grab and reference the current readState. This prevents the underlying
+		// files in the associated version from being deleted if there is a current
+		// compaction. The readState is unref'd by Iterator.Close().
+		if newIterOpts.snapshot.vers == nil {
+			if newIterOpts.snapshot.readState != nil {
+				readState = newIterOpts.snapshot.readState
+				readState.ref()
+			} else {
+				// NB: loadReadState() calls readState.ref().
+				readState = d.loadReadState()
+			}
+		} else {
+			// vers != nil
+			newIterOpts.snapshot.vers.Ref()
+		}
 
-	// Determine the seqnum to read at after grabbing the read state (current and
-	// memtables) above.
-	var seqNum uint64
-	if s != nil {
-		seqNum = s.seqNum
-	} else {
-		seqNum = d.mu.versions.visibleSeqNum.Load()
+		// Determine the seqnum to read at after grabbing the read state (current and
+		// memtables) above.
+		if seqNum == 0 {
+			seqNum = d.mu.versions.visibleSeqNum.Load()
+		}
+		newIters = d.newIters
+		newIterRangeKey = d.tableNewRangeKeyIter
 	}
 
 	// Bundle various structures under a single umbrella in order to allocate
@@ -1028,13 +1101,16 @@ func (d *DB) newIter(ctx context.Context, batch *Batch, s *Snapshot, o *IterOpti
 		merge:               d.merge,
 		comparer:            *d.opts.Comparer,
 		readState:           readState,
+		version:             newIterOpts.snapshot.vers,
 		keyBuf:              buf.keyBuf,
 		prefixOrFullSeekKey: buf.prefixOrFullSeekKey,
 		boundsBuf:           buf.boundsBuf,
 		batch:               batch,
-		newIters:            d.newIters,
-		newIterRangeKey:     d.tableNewRangeKeyIter,
+		fc:                  d.fileCache,
+		newIters:            newIters,
+		newIterRangeKey:     newIterRangeKey,
 		seqNum:              seqNum,
+		batchOnlyIter:       newIterOpts.batch.batchOnly,
 	}
 	if o != nil {
 		dbi.opts = *o
@@ -1057,7 +1133,10 @@ func (d *DB) newIter(ctx context.Context, batch *Batch, s *Snapshot, o *IterOpti
 func finishInitializingIter(ctx context.Context, buf *iterAlloc) *Iterator {
 	// Short-hand.
 	dbi := &buf.dbi
-	memtables := dbi.readState.memtables
+	var memtables flushableList
+	if dbi.readState != nil {
+		memtables = dbi.readState.memtables
+	}
 	if dbi.opts.OnlyReadGuaranteedDurable {
 		memtables = nil
 	} else {
@@ -1083,7 +1162,7 @@ func finishInitializingIter(ctx context.Context, buf *iterAlloc) *Iterator {
 	}
 
 	if dbi.opts.rangeKeys() {
-		dbi.rangeKeyMasking.init(dbi, dbi.comparer.Compare, dbi.comparer.Split)
+		dbi.rangeKeyMasking.init(dbi, &dbi.comparer)
 
 		// When iterating over both point and range keys, don't create the
 		// range-key iterator stack immediately if we can avoid it. This
@@ -1119,6 +1198,7 @@ func finishInitializingIter(ctx context.Context, buf *iterAlloc) *Iterator {
 				},
 			}
 			dbi.iter = &dbi.lazyCombinedIter
+			dbi.iter = invalidating.MaybeWrapIfInvariants(dbi.iter)
 		} else {
 			dbi.lazyCombinedIter.combinedIterState = combinedIterState{
 				initialized: true,
@@ -1139,7 +1219,11 @@ func finishInitializingIter(ctx context.Context, buf *iterAlloc) *Iterator {
 			// dbi already had an initialized range key iterator, in case the point
 			// iterator changed or the range key masking suffix changed.
 			dbi.rangeKey.iiter.Init(&dbi.comparer, dbi.iter, dbi.rangeKey.rangeKeyIter,
-				&dbi.rangeKeyMasking, dbi.opts.LowerBound, dbi.opts.UpperBound)
+				keyspan.InterleavingIterOpts{
+					Mask:       &dbi.rangeKeyMasking,
+					LowerBound: dbi.opts.LowerBound,
+					UpperBound: dbi.opts.UpperBound,
+				})
 			dbi.iter = &dbi.rangeKey.iiter
 		}
 	} else {
@@ -1178,25 +1262,31 @@ func finishInitializingIter(ctx context.Context, buf *iterAlloc) *Iterator {
 // iteration is invalid in those cases.
 func (d *DB) ScanInternal(
 	ctx context.Context,
+	category block.Category,
 	lower, upper []byte,
 	visitPointKey func(key *InternalKey, value LazyValue, iterInfo IteratorLevel) error,
-	visitRangeDel func(start, end []byte, seqNum uint64) error,
+	visitRangeDel func(start, end []byte, seqNum SeqNum) error,
 	visitRangeKey func(start, end []byte, keys []rangekey.Key) error,
 	visitSharedFile func(sst *SharedSSTMeta) error,
+	visitExternalFile func(sst *ExternalFile) error,
 ) error {
 	scanInternalOpts := &scanInternalOptions{
-		visitPointKey:    visitPointKey,
-		visitRangeDel:    visitRangeDel,
-		visitRangeKey:    visitRangeKey,
-		visitSharedFile:  visitSharedFile,
-		skipSharedLevels: visitSharedFile != nil,
+		category:          category,
+		visitPointKey:     visitPointKey,
+		visitRangeDel:     visitRangeDel,
+		visitRangeKey:     visitRangeKey,
+		visitSharedFile:   visitSharedFile,
+		visitExternalFile: visitExternalFile,
 		IterOptions: IterOptions{
 			KeyTypes:   IterKeyTypePointsAndRanges,
 			LowerBound: lower,
 			UpperBound: upper,
 		},
 	}
-	iter := d.newInternalIter(nil /* snapshot */, scanInternalOpts)
+	iter, err := d.newInternalIter(ctx, snapshotIterOpts{} /* snapshot */, scanInternalOpts)
+	if err != nil {
+		return err
+	}
 	defer iter.close()
 	return scanInternalImpl(ctx, lower, upper, iter, scanInternalOpts)
 }
@@ -1208,40 +1298,52 @@ func (d *DB) ScanInternal(
 // TODO(bilal): This method has a lot of similarities with db.newIter as well as
 // finishInitializingIter. Both pairs of methods should be refactored to reduce
 // this duplication.
-func (d *DB) newInternalIter(s *Snapshot, o *scanInternalOptions) *scanInternalIterator {
+func (d *DB) newInternalIter(
+	ctx context.Context, sOpts snapshotIterOpts, o *scanInternalOptions,
+) (*scanInternalIterator, error) {
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
 	// Grab and reference the current readState. This prevents the underlying
 	// files in the associated version from being deleted if there is a current
 	// compaction. The readState is unref'd by Iterator.Close().
-	readState := d.loadReadState()
+	var readState *readState
+	if sOpts.vers == nil {
+		if sOpts.readState != nil {
+			readState = sOpts.readState
+			readState.ref()
+		} else {
+			readState = d.loadReadState()
+		}
+	}
+	if sOpts.vers != nil {
+		sOpts.vers.Ref()
+	}
 
 	// Determine the seqnum to read at after grabbing the read state (current and
 	// memtables) above.
-	var seqNum uint64
-	if s == nil {
+	seqNum := sOpts.seqNum
+	if seqNum == 0 {
 		seqNum = d.mu.versions.visibleSeqNum.Load()
-	} else {
-		seqNum = s.seqNum
 	}
 
 	// Bundle various structures under a single umbrella in order to allocate
 	// them together.
 	buf := iterAllocPool.Get().(*iterAlloc)
 	dbi := &scanInternalIterator{
+		ctx:             ctx,
+		db:              d,
 		comparer:        d.opts.Comparer,
 		merge:           d.opts.Merger.Merge,
 		readState:       readState,
+		version:         sOpts.vers,
 		alloc:           buf,
 		newIters:        d.newIters,
 		newIterRangeKey: d.tableNewRangeKeyIter,
 		seqNum:          seqNum,
 		mergingIter:     &buf.merging,
 	}
-	if o != nil {
-		dbi.opts = *o
-	}
+	dbi.opts = *o
 	dbi.opts.logger = d.opts.Logger
 	if d.opts.private.disableLazyCombinedIteration {
 		dbi.opts.disableLazyCombinedIteration = true
@@ -1249,9 +1351,14 @@ func (d *DB) newInternalIter(s *Snapshot, o *scanInternalOptions) *scanInternalI
 	return finishInitializingInternalIter(buf, dbi)
 }
 
-func finishInitializingInternalIter(buf *iterAlloc, i *scanInternalIterator) *scanInternalIterator {
+func finishInitializingInternalIter(
+	buf *iterAlloc, i *scanInternalIterator,
+) (*scanInternalIterator, error) {
 	// Short-hand.
-	memtables := i.readState.memtables
+	var memtables flushableList
+	if i.readState != nil {
+		memtables = i.readState.memtables
+	}
 	// We only need to read from memtables which contain sequence numbers older
 	// than seqNum. Trim off newer memtables.
 	for j := len(memtables) - 1; j >= 0; j-- {
@@ -1262,22 +1369,29 @@ func finishInitializingInternalIter(buf *iterAlloc, i *scanInternalIterator) *sc
 	}
 	i.initializeBoundBufs(i.opts.LowerBound, i.opts.UpperBound)
 
-	i.constructPointIter(memtables, buf)
+	if err := i.constructPointIter(i.opts.category, memtables, buf); err != nil {
+		return nil, err
+	}
 
 	// For internal iterators, we skip the lazy combined iteration optimization
 	// entirely, and create the range key iterator stack directly.
 	i.rangeKey = iterRangeKeyStateAllocPool.Get().(*iteratorRangeKeyState)
 	i.rangeKey.init(i.comparer.Compare, i.comparer.Split, &i.opts.IterOptions)
-	i.constructRangeKeyIter()
+	if err := i.constructRangeKeyIter(); err != nil {
+		return nil, err
+	}
 
 	// Wrap the point iterator (currently i.iter) with an interleaving
 	// iterator that interleaves range keys pulled from
 	// i.rangeKey.rangeKeyIter.
 	i.rangeKey.iiter.Init(i.comparer, i.iter, i.rangeKey.rangeKeyIter,
-		nil /* mask */, i.opts.LowerBound, i.opts.UpperBound)
+		keyspan.InterleavingIterOpts{
+			LowerBound: i.opts.LowerBound,
+			UpperBound: i.opts.UpperBound,
+		})
 	i.iter = &i.rangeKey.iiter
 
-	return i
+	return i, nil
 }
 
 func (i *Iterator) constructPointIter(
@@ -1287,7 +1401,19 @@ func (i *Iterator) constructPointIter(
 		// Already have one.
 		return
 	}
-	internalOpts := internalIterOpts{stats: &i.stats.InternalStats}
+	internalOpts := internalIterOpts{
+		stats: &i.stats.InternalStats,
+	}
+	// If the file cache has a sstable stats collector, ask it for an
+	// accumulator for this iterator's configured category and QoS. All SSTable
+	// iterators created by this Iterator will accumulate their stats to it as
+	// they Close during iteration.
+	if collector := i.fc.dbOpts.sstStatsCollector; collector != nil {
+		internalOpts.iterStatsAccumulator = collector.Accumulator(
+			uint64(uintptr(unsafe.Pointer(i))),
+			i.opts.Category,
+		)
+	}
 	if i.opts.RangeKeyMasking.Filter != nil {
 		internalOpts.boundLimitedFilter = &i.rangeKeyMasking
 	}
@@ -1304,17 +1430,24 @@ func (i *Iterator) constructPointIter(
 	if i.batch != nil {
 		numMergingLevels++
 	}
-	numMergingLevels += len(memtables)
 
-	current := i.readState.current
-	numMergingLevels += len(current.L0SublevelFiles)
-	numLevelIters += len(current.L0SublevelFiles)
-	for level := 1; level < len(current.Levels); level++ {
-		if current.Levels[level].Empty() {
-			continue
+	var current *version
+	if !i.batchOnlyIter {
+		numMergingLevels += len(memtables)
+
+		current = i.version
+		if current == nil {
+			current = i.readState.current
 		}
-		numMergingLevels++
-		numLevelIters++
+		numMergingLevels += len(current.L0SublevelFiles)
+		numLevelIters += len(current.L0SublevelFiles)
+		for level := 1; level < len(current.Levels); level++ {
+			if current.Levels[level].Empty() {
+				continue
+			}
+			numMergingLevels++
+			numLevelIters++
+		}
 	}
 
 	if numMergingLevels > cap(mlevels) {
@@ -1327,12 +1460,8 @@ func (i *Iterator) constructPointIter(
 	// Top-level is the batch, if any.
 	if i.batch != nil {
 		if i.batch.index == nil {
-			// This isn't an indexed batch. Include an error iterator so that
-			// the resulting iterator correctly surfaces ErrIndexed.
-			mlevels = append(mlevels, mergingIterLevel{
-				iter:         newErrorIter(ErrNotIndexed),
-				rangeDelIter: newErrorKeyspanIter(ErrNotIndexed),
-			})
+			// This isn't an indexed batch. We shouldn't have gotten this far.
+			panic(errors.AssertionFailedf("creating an iterator over an unindexed batch"))
 		} else {
 			i.batch.initInternalIter(&i.opts, &i.batchPointIter)
 			i.batch.initRangeDelIter(&i.opts, &i.batchRangeDelIter, i.batchSeqNum)
@@ -1352,47 +1481,48 @@ func (i *Iterator) constructPointIter(
 		}
 	}
 
-	// Next are the memtables.
-	for j := len(memtables) - 1; j >= 0; j-- {
-		mem := memtables[j]
-		mlevels = append(mlevels, mergingIterLevel{
-			iter:         mem.newIter(&i.opts),
-			rangeDelIter: mem.newRangeDelIter(&i.opts),
-		})
-	}
-
-	// Next are the file levels: L0 sub-levels followed by lower levels.
-	mlevelsIndex := len(mlevels)
-	levelsIndex := len(levels)
-	mlevels = mlevels[:numMergingLevels]
-	levels = levels[:numLevelIters]
-	i.opts.snapshotForHideObsoletePoints = buf.dbi.seqNum
-	addLevelIterForFiles := func(files manifest.LevelIterator, level manifest.Level) {
-		li := &levels[levelsIndex]
-
-		li.init(
-			ctx, i.opts, i.comparer.Compare, i.comparer.Split, i.newIters, files, level, internalOpts)
-		li.initRangeDel(&mlevels[mlevelsIndex].rangeDelIter)
-		li.initBoundaryContext(&mlevels[mlevelsIndex].levelIterBoundaryContext)
-		li.initCombinedIterState(&i.lazyCombinedIter.combinedIterState)
-		mlevels[mlevelsIndex].iter = li
-
-		levelsIndex++
-		mlevelsIndex++
-	}
-
-	// Add level iterators for the L0 sublevels, iterating from newest to
-	// oldest.
-	for i := len(current.L0SublevelFiles) - 1; i >= 0; i-- {
-		addLevelIterForFiles(current.L0SublevelFiles[i].Iter(), manifest.L0Sublevel(i))
-	}
-
-	// Add level iterators for the non-empty non-L0 levels.
-	for level := 1; level < len(current.Levels); level++ {
-		if current.Levels[level].Empty() {
-			continue
+	if !i.batchOnlyIter {
+		// Next are the memtables.
+		for j := len(memtables) - 1; j >= 0; j-- {
+			mem := memtables[j]
+			mlevels = append(mlevels, mergingIterLevel{
+				iter:         mem.newIter(&i.opts),
+				rangeDelIter: mem.newRangeDelIter(&i.opts),
+			})
 		}
-		addLevelIterForFiles(current.Levels[level].Iter(), manifest.Level(level))
+
+		// Next are the file levels: L0 sub-levels followed by lower levels.
+		mlevelsIndex := len(mlevels)
+		levelsIndex := len(levels)
+		mlevels = mlevels[:numMergingLevels]
+		levels = levels[:numLevelIters]
+		i.opts.snapshotForHideObsoletePoints = buf.dbi.seqNum
+		addLevelIterForFiles := func(files manifest.LevelIterator, level manifest.Layer) {
+			li := &levels[levelsIndex]
+
+			li.init(ctx, i.opts, &i.comparer, i.newIters, files, level, internalOpts)
+			li.initRangeDel(&mlevels[mlevelsIndex])
+			li.initCombinedIterState(&i.lazyCombinedIter.combinedIterState)
+			mlevels[mlevelsIndex].levelIter = li
+			mlevels[mlevelsIndex].iter = invalidating.MaybeWrapIfInvariants(li)
+
+			levelsIndex++
+			mlevelsIndex++
+		}
+
+		// Add level iterators for the L0 sublevels, iterating from newest to
+		// oldest.
+		for i := len(current.L0SublevelFiles) - 1; i >= 0; i-- {
+			addLevelIterForFiles(current.L0SublevelFiles[i].Iter(), manifest.L0Sublevel(i))
+		}
+
+		// Add level iterators for the non-empty non-L0 levels.
+		for level := 1; level < len(current.Levels); level++ {
+			if current.Levels[level].Empty() {
+				continue
+			}
+			addLevelIterForFiles(current.Levels[level].Iter(), manifest.Level(level))
+		}
 	}
 	buf.merging.init(&i.opts, &i.stats.InternalStats, i.comparer.Compare, i.comparer.Split, mlevels...)
 	if len(mlevels) <= cap(buf.levelsPositioned) {
@@ -1401,14 +1531,20 @@ func (i *Iterator) constructPointIter(
 	buf.merging.snapshot = i.seqNum
 	buf.merging.batchSnapshot = i.batchSeqNum
 	buf.merging.combinedIterState = &i.lazyCombinedIter.combinedIterState
-	i.pointIter = &buf.merging
+	i.pointIter = invalidating.MaybeWrapIfInvariants(&buf.merging).(topLevelIterator)
 	i.merging = &buf.merging
 }
 
 // NewBatch returns a new empty write-only batch. Any reads on the batch will
 // return an error. If the batch is committed it will be applied to the DB.
-func (d *DB) NewBatch() *Batch {
-	return newBatch(d)
+func (d *DB) NewBatch(opts ...BatchOption) *Batch {
+	return newBatch(d, opts...)
+}
+
+// NewBatchWithSize is mostly identical to NewBatch, but it will allocate the
+// the specified memory space for the internal slice in advance.
+func (d *DB) NewBatchWithSize(size int, opts ...BatchOption) *Batch {
+	return newBatchWithSize(d, size, opts...)
 }
 
 // NewIndexedBatch returns a new empty read-write batch. Any reads on the batch
@@ -1420,6 +1556,12 @@ func (d *DB) NewIndexedBatch() *Batch {
 	return newIndexedBatch(d, d.opts.Comparer)
 }
 
+// NewIndexedBatchWithSize is mostly identical to NewIndexedBatch, but it will
+// allocate the specified memory space for the internal slice in advance.
+func (d *DB) NewIndexedBatchWithSize(size int) *Batch {
+	return newIndexedBatchWithSize(d, d.opts.Comparer, size)
+}
+
 // NewIter returns an iterator that is unpositioned (Iterator.Valid() will
 // return false). The iterator can be positioned via a call to SeekGE, SeekLT,
 // First or Last. The iterator provides a point-in-time view of the current DB
@@ -1428,14 +1570,14 @@ func (d *DB) NewIndexedBatch() *Batch {
 // to maintain a long-lived point-in-time view of the DB state can lead to an
 // apparent memory and disk usage leak. Use snapshots (see NewSnapshot) for
 // point-in-time snapshots which avoids these problems.
-func (d *DB) NewIter(o *IterOptions) *Iterator {
+func (d *DB) NewIter(o *IterOptions) (*Iterator, error) {
 	return d.NewIterWithContext(context.Background(), o)
 }
 
 // NewIterWithContext is like NewIter, and additionally accepts a context for
 // tracing.
-func (d *DB) NewIterWithContext(ctx context.Context, o *IterOptions) *Iterator {
-	return d.newIter(ctx, nil /* batch */, nil /* snapshot */, o)
+func (d *DB) NewIterWithContext(ctx context.Context, o *IterOptions) (*Iterator, error) {
+	return d.newIter(ctx, nil /* batch */, newIterOpts{}, o), nil
 }
 
 // NewSnapshot returns a point-in-time view of the current DB state. Iterators
@@ -1459,6 +1601,22 @@ func (d *DB) NewSnapshot() *Snapshot {
 	d.mu.snapshots.pushBack(s)
 	d.mu.Unlock()
 	return s
+}
+
+// NewEventuallyFileOnlySnapshot returns a point-in-time view of the current DB
+// state, similar to NewSnapshot, but with consistency constrained to the
+// provided set of key ranges. See the comment at EventuallyFileOnlySnapshot for
+// its semantics.
+func (d *DB) NewEventuallyFileOnlySnapshot(keyRanges []KeyRange) *EventuallyFileOnlySnapshot {
+	if err := d.closed.Load(); err != nil {
+		panic(err)
+	}
+	for i := range keyRanges {
+		if i > 0 && d.cmp(keyRanges[i-1].End, keyRanges[i].Start) > 0 {
+			panic("pebble: key ranges for eventually-file-only-snapshot not in order")
+		}
+	}
+	return d.makeEventuallyFileOnlySnapshot(keyRanges)
 }
 
 // Close closes the DB.
@@ -1497,7 +1655,7 @@ func (d *DB) Close() error {
 
 	defer d.opts.Cache.Unref()
 
-	for d.mu.compact.compactingCount > 0 || d.mu.compact.flushing {
+	for d.mu.compact.compactingCount > 0 || d.mu.compact.downloadingCount > 0 || d.mu.compact.flushing {
 		d.mu.compact.cond.Wait()
 	}
 	for d.mu.tableStats.loading {
@@ -1512,12 +1670,16 @@ func (d *DB) Close() error {
 		err = errors.Errorf("pebble: %d unexpected in-progress compactions", errors.Safe(n))
 	}
 	err = firstError(err, d.mu.formatVers.marker.Close())
-	err = firstError(err, d.tableCache.close())
+	err = firstError(err, d.fileCache.close())
 	if !d.opts.ReadOnly {
-		err = firstError(err, d.mu.log.Close())
-	} else if d.mu.log.LogWriter != nil {
+		if d.mu.log.writer != nil {
+			_, err2 := d.mu.log.writer.Close()
+			err = firstError(err, err2)
+		}
+	} else if d.mu.log.writer != nil {
 		panic("pebble: log-writer should be nil in read-only mode")
 	}
+	err = firstError(err, d.mu.log.manager.Close())
 	err = firstError(err, d.fileLock.Close())
 
 	// Note that versionSet.close() only closes the MANIFEST. The versions list
@@ -1525,9 +1687,6 @@ func (d *DB) Close() error {
 	err = firstError(err, d.mu.versions.close())
 
 	err = firstError(err, d.dataDir.Close())
-	if d.dataDir != d.walDir {
-		err = firstError(err, d.walDir.Close())
-	}
 
 	d.readState.val.unrefLocked()
 
@@ -1563,7 +1722,7 @@ func (d *DB) Close() error {
 	// Since we called d.readState.val.unrefLocked() above, we are expected to
 	// manually schedule deletion of obsolete files.
 	if len(d.mu.versions.obsoleteTables) > 0 {
-		d.deleteObsoleteFiles(d.mu.nextJobID)
+		d.deleteObsoleteFiles(d.newJobIDLocked())
 	}
 
 	d.mu.Unlock()
@@ -1616,16 +1775,12 @@ func (d *DB) Compact(start, end []byte, parallelize bool) error {
 		return errors.Errorf("Compact start %s is not less than end %s",
 			d.opts.Comparer.FormatKey(start), d.opts.Comparer.FormatKey(end))
 	}
-	iStart := base.MakeInternalKey(start, InternalKeySeqNumMax, InternalKeyKindMax)
-	iEnd := base.MakeInternalKey(end, 0, 0)
-	m := (&fileMetadata{}).ExtendPointKeyBounds(d.cmp, iStart, iEnd)
-	meta := []*fileMetadata{m}
 
 	d.mu.Lock()
 	maxLevelWithFiles := 1
 	cur := d.mu.versions.currentVersion()
 	for level := 0; level < numLevels; level++ {
-		overlaps := cur.Overlaps(level, d.cmp, start, end, iEnd.IsExclusiveSentinel())
+		overlaps := cur.Overlaps(level, base.UserKeyBoundsInclusive(start, end))
 		if !overlaps.Empty() {
 			maxLevelWithFiles = level + 1
 		}
@@ -1640,25 +1795,31 @@ func (d *DB) Compact(start, end []byte, parallelize bool) error {
 		// overlaps.
 		for i := len(d.mu.mem.queue) - 1; i >= 0; i-- {
 			mem := d.mu.mem.queue[i]
-			if ingestMemtableOverlaps(d.cmp, mem, meta) {
-				var err error
-				if mem.flushable == d.mu.mem.mutable {
-					// We have to hold both commitPipeline.mu and DB.mu when calling
-					// makeRoomForWrite(). Lock order requirements elsewhere force us to
-					// unlock DB.mu in order to grab commitPipeline.mu first.
-					d.mu.Unlock()
-					d.commit.mu.Lock()
-					d.mu.Lock()
-					defer d.commit.mu.Unlock()
-					if mem.flushable == d.mu.mem.mutable {
-						// Only flush if the active memtable is unchanged.
-						err = d.makeRoomForWrite(nil)
-					}
-				}
-				mem.flushForced = true
-				d.maybeScheduleFlush()
-				return mem, err
+			var anyOverlaps bool
+			mem.computePossibleOverlaps(func(b bounded) shouldContinue {
+				anyOverlaps = true
+				return stopIteration
+			}, KeyRange{Start: start, End: end})
+			if !anyOverlaps {
+				continue
 			}
+			var err error
+			if mem.flushable == d.mu.mem.mutable {
+				// We have to hold both commitPipeline.mu and DB.mu when calling
+				// makeRoomForWrite(). Lock order requirements elsewhere force us to
+				// unlock DB.mu in order to grab commitPipeline.mu first.
+				d.mu.Unlock()
+				d.commit.mu.Lock()
+				d.mu.Lock()
+				defer d.commit.mu.Unlock()
+				if mem.flushable == d.mu.mem.mutable {
+					// Only flush if the active memtable is unchanged.
+					err = d.makeRoomForWrite(nil)
+				}
+			}
+			mem.flushForced = true
+			d.maybeScheduleFlush()
+			return mem, err
 		}
 		return nil, nil
 	}()
@@ -1673,9 +1834,15 @@ func (d *DB) Compact(start, end []byte, parallelize bool) error {
 	}
 
 	for level := 0; level < maxLevelWithFiles; {
-		if err := d.manualCompact(
-			iStart.UserKey, iEnd.UserKey, level, parallelize); err != nil {
-			return err
+		for {
+			if err := d.manualCompact(
+				start, end, level, parallelize); err != nil {
+				if errors.Is(err, ErrCancelledCompaction) {
+					continue
+				}
+				return err
+			}
+			break
 		}
 		level++
 		if level == numLevels-1 {
@@ -1690,7 +1857,7 @@ func (d *DB) Compact(start, end []byte, parallelize bool) error {
 func (d *DB) manualCompact(start, end []byte, level int, parallelize bool) error {
 	d.mu.Lock()
 	curr := d.mu.versions.currentVersion()
-	files := curr.Overlaps(level, d.cmp, start, end, false)
+	files := curr.Overlaps(level, base.UserKeyBoundsInclusive(start, end))
 	if files.Empty() {
 		d.mu.Unlock()
 		return nil
@@ -1737,41 +1904,17 @@ func (d *DB) splitManualCompaction(
 	if level == 0 {
 		endLevel = baseLevel
 	}
-	keyRanges := calculateInuseKeyRanges(curr, d.cmp, level, endLevel, start, end)
+	keyRanges := curr.CalculateInuseKeyRanges(level, endLevel, start, end)
 	for _, keyRange := range keyRanges {
 		splitCompactions = append(splitCompactions, &manualCompaction{
 			level: level,
 			done:  make(chan error, 1),
 			start: keyRange.Start,
-			end:   keyRange.End,
+			end:   keyRange.End.Key,
 			split: true,
 		})
 	}
 	return splitCompactions
-}
-
-// DownloadSpan is a key range passed to the Download method.
-type DownloadSpan struct {
-	StartKey []byte
-	// EndKey is exclusive.
-	EndKey []byte
-}
-
-// Download ensures that the LSM does not use any external sstables for the
-// given key ranges. It does so by performing appropriate compactions so that
-// all external data becomes available locally.
-//
-// Note that calling this method does not imply that all other compactions stop;
-// it simply informs Pebble of a list of spans for which external data should be
-// downloaded with high priority.
-//
-// The method returns once no external sstasbles overlap the given spans, the
-// context is canceled, or an error is hit.
-//
-// TODO(radu): consider passing a priority/impact knob to express how important
-// the download is (versus live traffic performance, LSM health).
-func (d *DB) Download(ctx context.Context, spans []DownloadSpan) error {
-	return errors.Errorf("not implemented")
 }
 
 // Flush the memtable to stable storage.
@@ -1811,18 +1954,19 @@ func (d *DB) AsyncFlush() (<-chan struct{}, error) {
 // Metrics returns metrics about the database.
 func (d *DB) Metrics() *Metrics {
 	metrics := &Metrics{}
-	recycledLogsCount, recycledLogSize := d.logRecycler.stats()
+	walStats := d.mu.log.manager.Stats()
 
 	d.mu.Lock()
 	vers := d.mu.versions.currentVersion()
 	*metrics = d.mu.versions.metrics
 	metrics.Compact.EstimatedDebt = d.mu.versions.picker.estimatedCompactionDebt(0)
 	metrics.Compact.InProgressBytes = d.mu.versions.atomicInProgressBytes.Load()
-	metrics.Compact.NumInProgress = int64(d.mu.compact.compactingCount)
+	// TODO(radu): split this to separate the download compactions.
+	metrics.Compact.NumInProgress = int64(d.mu.compact.compactingCount + d.mu.compact.downloadingCount)
 	metrics.Compact.MarkedFiles = vers.Stats.MarkedForCompaction
 	metrics.Compact.Duration = d.mu.compact.duration
 	for c := range d.mu.compact.inProgress {
-		if c.kind != compactionKindFlush {
+		if c.kind != compactionKindFlush && c.kind != compactionKindIngestedFlushable {
 			metrics.Compact.Duration += d.timeNow().Sub(c.beganAt)
 		}
 	}
@@ -1839,27 +1983,24 @@ func (d *DB) Metrics() *Metrics {
 	metrics.MemTable.Count = int64(len(d.mu.mem.queue))
 	metrics.MemTable.ZombieCount = d.memTableCount.Load() - metrics.MemTable.Count
 	metrics.MemTable.ZombieSize = uint64(d.memTableReserved.Load()) - metrics.MemTable.Size
-	metrics.WAL.ObsoleteFiles = int64(recycledLogsCount)
-	metrics.WAL.ObsoletePhysicalSize = recycledLogSize
+	metrics.WAL.ObsoleteFiles = int64(walStats.ObsoleteFileCount)
+	metrics.WAL.ObsoletePhysicalSize = walStats.ObsoleteFileSize
+	metrics.WAL.Files = int64(walStats.LiveFileCount)
+	// The current WAL's size (d.logSize) is the logical size, which may be less
+	// than the WAL's physical size if it was recycled. walStats.LiveFileSize
+	// includes the physical size of all live WALs, but for the current WAL it
+	// reflects the physical size when it was opened. So it is possible that
+	// d.atomic.logSize has exceeded that physical size. We allow for this
+	// anomaly.
+	metrics.WAL.PhysicalSize = walStats.LiveFileSize
+	metrics.WAL.BytesIn = d.logBytesIn.Load()
 	metrics.WAL.Size = d.logSize.Load()
-	// The current WAL size (d.atomic.logSize) is the current logical size,
-	// which may be less than the WAL's physical size if it was recycled.
-	// The file sizes in d.mu.log.queue are updated to the physical size
-	// during WAL rotation. Use the larger of the two for the current WAL. All
-	// the previous WALs's fileSizes in d.mu.log.queue are already updated.
-	metrics.WAL.PhysicalSize = metrics.WAL.Size
-	if len(d.mu.log.queue) > 0 && metrics.WAL.PhysicalSize < d.mu.log.queue[len(d.mu.log.queue)-1].fileSize {
-		metrics.WAL.PhysicalSize = d.mu.log.queue[len(d.mu.log.queue)-1].fileSize
-	}
-	for i, n := 0, len(d.mu.log.queue)-1; i < n; i++ {
-		metrics.WAL.PhysicalSize += d.mu.log.queue[i].fileSize
-	}
-
-	metrics.WAL.BytesIn = d.mu.log.bytesIn // protected by d.mu
 	for i, n := 0, len(d.mu.mem.queue)-1; i < n; i++ {
 		metrics.WAL.Size += d.mu.mem.queue[i].logSize
 	}
 	metrics.WAL.BytesWritten = metrics.Levels[0].BytesIn + metrics.WAL.Size
+	metrics.WAL.Failover = walStats.Failover
+
 	if p := d.mu.versions.picker; p != nil {
 		compactions := d.getInProgressCompactionInfoLocked(nil)
 		for level, score := range p.getScores(compactions) {
@@ -1867,37 +2008,55 @@ func (d *DB) Metrics() *Metrics {
 		}
 	}
 	metrics.Table.ZombieCount = int64(len(d.mu.versions.zombieTables))
-	for _, size := range d.mu.versions.zombieTables {
-		metrics.Table.ZombieSize += size
+	for _, info := range d.mu.versions.zombieTables {
+		metrics.Table.ZombieSize += info.FileSize
+		if info.isLocal {
+			metrics.Table.Local.ZombieSize += info.FileSize
+		}
 	}
 	metrics.private.optionsFileSize = d.optionsFileSize
 
 	// TODO(jackson): Consider making these metrics optional.
-	metrics.Keys.RangeKeySetsCount = countRangeKeySetFragments(vers)
-	metrics.Keys.TombstoneCount = countTombstones(vers)
+	metrics.Keys.RangeKeySetsCount = *rangeKeySetsAnnotator.MultiLevelAnnotation(vers.RangeKeyLevels[:])
+	metrics.Keys.TombstoneCount = *tombstonesAnnotator.MultiLevelAnnotation(vers.Levels[:])
 
 	d.mu.versions.logLock()
 	metrics.private.manifestFileSize = uint64(d.mu.versions.manifest.Size())
+	backingCount, backingTotalSize := d.mu.versions.virtualBackings.Stats()
+	metrics.Table.BackingTableCount = uint64(backingCount)
+	metrics.Table.BackingTableSize = backingTotalSize
 	d.mu.versions.logUnlock()
 
 	metrics.LogWriter.FsyncLatency = d.mu.log.metrics.fsyncLatency
 	if err := metrics.LogWriter.Merge(&d.mu.log.metrics.LogWriterMetrics); err != nil {
-		d.opts.Logger.Infof("metrics error: %s", err)
+		d.opts.Logger.Errorf("metrics error: %s", err)
 	}
 	metrics.Flush.WriteThroughput = d.mu.compact.flushWriteThroughput
 	if d.mu.compact.flushing {
 		metrics.Flush.NumInProgress = 1
 	}
 	for i := 0; i < numLevels; i++ {
-		metrics.Levels[i].Additional.ValueBlocksSize = valueBlocksSizeForLevel(vers, i)
+		metrics.Levels[i].Additional.ValueBlocksSize = *valueBlockSizeAnnotator.LevelAnnotation(vers.Levels[i])
+		compressionTypes := compressionTypeAnnotator.LevelAnnotation(vers.Levels[i])
+		metrics.Table.CompressedCountUnknown += int64(compressionTypes.unknown)
+		metrics.Table.CompressedCountSnappy += int64(compressionTypes.snappy)
+		metrics.Table.CompressedCountZstd += int64(compressionTypes.zstd)
+		metrics.Table.CompressedCountNone += int64(compressionTypes.none)
 	}
 
 	d.mu.Unlock()
 
 	metrics.BlockCache = d.opts.Cache.Metrics()
-	metrics.TableCache, metrics.Filter = d.tableCache.metrics()
-	metrics.TableIters = int64(d.tableCache.iterCount())
+	metrics.FileCache, metrics.Filter = d.fileCache.metrics()
+	metrics.TableIters = int64(d.fileCache.iterCount())
+	metrics.CategoryStats = d.fileCache.dbOpts.sstStatsCollector.GetStats()
+
+	metrics.SecondaryCacheMetrics = d.objProvider.Metrics()
+
 	metrics.Uptime = d.timeNow().Sub(d.openedAt)
+
+	metrics.manualMemory = manual.GetMetrics()
+
 	return metrics
 }
 
@@ -1937,8 +2096,7 @@ func WithKeyRangeFilter(start, end []byte) SSTablesOption {
 
 // WithApproximateSpanBytes enables capturing the approximate number of bytes that
 // overlap the provided key span for each sstable.
-// NOTE: this option can only be used with WithKeyRangeFilter and WithProperties
-// provided.
+// NOTE: This option requires WithKeyRangeFilter.
 func WithApproximateSpanBytes() SSTablesOption {
 	return func(opt *sstablesOptions) {
 		opt.withApproximateSpanBytes = true
@@ -1965,7 +2123,20 @@ const (
 	// or lifecycle management. An example of an external file is a file restored
 	// from a backup.
 	BackingTypeExternal
+	backingTypeCount
 )
+
+var backingTypeToString = [backingTypeCount]string{
+	BackingTypeLocal:         "local",
+	BackingTypeShared:        "shared",
+	BackingTypeSharedForeign: "shared-foreign",
+	BackingTypeExternal:      "external",
+}
+
+// String implements fmt.Stringer.
+func (b BackingType) String() string {
+	return backingTypeToString[b]
+}
 
 // SSTableInfo export manifest.TableInfo with sstable.Properties alongside
 // other file backing info.
@@ -1973,15 +2144,18 @@ type SSTableInfo struct {
 	manifest.TableInfo
 	// Virtual indicates whether the sstable is virtual.
 	Virtual bool
-	// BackingSSTNum is the file number associated with backing sstable which
-	// backs the sstable associated with this SSTableInfo. If Virtual is false,
-	// then BackingSSTNum == FileNum.
-	BackingSSTNum base.FileNum
+	// BackingSSTNum is the disk file number associated with the backing sstable.
+	// If Virtual is false, BackingSSTNum == PhysicalTableDiskFileNum(FileNum).
+	BackingSSTNum base.DiskFileNum
 	// BackingType is the type of storage backing this sstable.
 	BackingType BackingType
 	// Locator is the remote.Locator backing this sstable, if the backing type is
 	// not BackingTypeLocal.
 	Locator remote.Locator
+	// ApproximateSpanBytes describes the approximate number of bytes within the
+	// sstable that fall within a particular span. It's populated only when the
+	// ApproximateSpanBytes option is passed into DB.SSTables.
+	ApproximateSpanBytes uint64 `json:"ApproximateSpanBytes,omitempty"`
 
 	// Properties is the sstable properties of this table. If Virtual is true,
 	// then the Properties are associated with the backing sst.
@@ -1998,11 +2172,8 @@ func (d *DB) SSTables(opts ...SSTablesOption) ([][]SSTableInfo, error) {
 		fn(opt)
 	}
 
-	if opt.withApproximateSpanBytes && !opt.withProperties {
-		return nil, errors.Errorf("Cannot use WithApproximateSpanBytes without WithProperties option.")
-	}
 	if opt.withApproximateSpanBytes && (opt.start == nil || opt.end == nil) {
-		return nil, errors.Errorf("Cannot use WithApproximateSpanBytes without WithKeyRangeFilter option.")
+		return nil, errors.Errorf("cannot use WithApproximateSpanBytes without WithKeyRangeFilter option")
 	}
 
 	// Grab and reference the current readState.
@@ -2025,12 +2196,15 @@ func (d *DB) SSTables(opts ...SSTablesOption) ([][]SSTableInfo, error) {
 		iter := srcLevels[i].Iter()
 		j := 0
 		for m := iter.First(); m != nil; m = iter.Next() {
-			if opt.start != nil && opt.end != nil && !m.Overlaps(d.opts.Comparer.Compare, opt.start, opt.end, true /* exclusive end */) {
-				continue
+			if opt.start != nil && opt.end != nil {
+				b := base.UserKeyBoundsEndExclusive(opt.start, opt.end)
+				if !m.Overlaps(d.opts.Comparer.Compare, &b) {
+					continue
+				}
 			}
 			destTables[j] = SSTableInfo{TableInfo: m.TableInfo()}
 			if opt.withProperties {
-				p, err := d.tableCache.getTableProperties(
+				p, err := d.fileCache.getTableProperties(
 					m,
 				)
 				if err != nil {
@@ -2039,7 +2213,7 @@ func (d *DB) SSTables(opts ...SSTablesOption) ([][]SSTableInfo, error) {
 				destTables[j].Properties = p
 			}
 			destTables[j].Virtual = m.Virtual
-			destTables[j].BackingSSTNum = m.FileBacking.DiskFileNum.FileNum()
+			destTables[j].BackingSSTNum = m.FileBacking.DiskFileNum
 			objMeta, err := d.objProvider.Lookup(fileTypeTable, m.FileBacking.DiskFileNum)
 			if err != nil {
 				return nil, err
@@ -2060,25 +2234,15 @@ func (d *DB) SSTables(opts ...SSTablesOption) ([][]SSTableInfo, error) {
 			}
 
 			if opt.withApproximateSpanBytes {
-				var spanBytes uint64
 				if m.ContainedWithinSpan(d.opts.Comparer.Compare, opt.start, opt.end) {
-					spanBytes = m.Size
+					destTables[j].ApproximateSpanBytes = m.Size
 				} else {
-					size, err := d.tableCache.estimateSize(m, opt.start, opt.end)
+					size, err := d.fileCache.estimateSize(m, opt.start, opt.end)
 					if err != nil {
 						return nil, err
 					}
-					spanBytes = size
+					destTables[j].ApproximateSpanBytes = size
 				}
-				propertiesCopy := *destTables[j].Properties
-
-				// Deep copy user properties so approximate span bytes can be added.
-				propertiesCopy.UserProperties = make(map[string]string, len(destTables[j].Properties.UserProperties)+1)
-				for k, v := range destTables[j].Properties.UserProperties {
-					propertiesCopy.UserProperties[k] = v
-				}
-				propertiesCopy.UserProperties["approximate-span-bytes"] = strconv.FormatUint(spanBytes, 10)
-				destTables[j].Properties = &propertiesCopy
 			}
 			j++
 		}
@@ -2087,6 +2251,31 @@ func (d *DB) SSTables(opts ...SSTablesOption) ([][]SSTableInfo, error) {
 	}
 
 	return destLevels, nil
+}
+
+// makeFileSizeAnnotator returns an annotator that computes the total size of
+// files that meet some criteria defined by filter.
+func (d *DB) makeFileSizeAnnotator(filter func(f *fileMetadata) bool) *manifest.Annotator[uint64] {
+	return &manifest.Annotator[uint64]{
+		Aggregator: manifest.SumAggregator{
+			AccumulateFunc: func(f *fileMetadata) (uint64, bool) {
+				if filter(f) {
+					return f.Size, true
+				}
+				return 0, true
+			},
+			AccumulatePartialOverlapFunc: func(f *fileMetadata, bounds base.UserKeyBounds) uint64 {
+				if filter(f) {
+					size, err := d.fileCache.estimateSize(f, bounds.Start, bounds.End.Key)
+					if err != nil {
+						return 0
+					}
+					return size
+				}
+				return 0
+			},
+		},
+	}
 }
 
 // EstimateDiskUsage returns the estimated filesystem space used in bytes for
@@ -2115,7 +2304,9 @@ func (d *DB) EstimateDiskUsageByBackingType(
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
-	if d.opts.Comparer.Compare(start, end) > 0 {
+
+	bounds := base.UserKeyBoundsInclusive(start, end)
+	if !bounds.Valid(d.cmp) {
 		return 0, 0, 0, errors.New("invalid key-range specified (start > end)")
 	}
 
@@ -2125,70 +2316,10 @@ func (d *DB) EstimateDiskUsageByBackingType(
 	readState := d.loadReadState()
 	defer readState.unref()
 
-	for level, files := range readState.current.Levels {
-		iter := files.Iter()
-		if level > 0 {
-			// We can only use `Overlaps` to restrict `files` at L1+ since at L0 it
-			// expands the range iteratively until it has found a set of files that
-			// do not overlap any other L0 files outside that set.
-			overlaps := readState.current.Overlaps(level, d.opts.Comparer.Compare, start, end, false /* exclusiveEnd */)
-			iter = overlaps.Iter()
-		}
-		for file := iter.First(); file != nil; file = iter.Next() {
-			if d.opts.Comparer.Compare(start, file.Smallest.UserKey) <= 0 &&
-				d.opts.Comparer.Compare(file.Largest.UserKey, end) <= 0 {
-				// The range fully contains the file, so skip looking it up in
-				// table cache/looking at its indexes, and add the full file size.
-				meta, err := d.objProvider.Lookup(fileTypeTable, file.FileBacking.DiskFileNum)
-				if err != nil {
-					return 0, 0, 0, err
-				}
-				if meta.IsRemote() {
-					remoteSize += file.Size
-					if meta.Remote.CleanupMethod == objstorage.SharedNoCleanup {
-						externalSize += file.Size
-					}
-				}
-				totalSize += file.Size
-			} else if d.opts.Comparer.Compare(file.Smallest.UserKey, end) <= 0 &&
-				d.opts.Comparer.Compare(start, file.Largest.UserKey) <= 0 {
-				var size uint64
-				var err error
-				if file.Virtual {
-					err = d.tableCache.withVirtualReader(
-						file.VirtualMeta(),
-						func(r sstable.VirtualReader) (err error) {
-							size, err = r.EstimateDiskUsage(start, end)
-							return err
-						},
-					)
-				} else {
-					err = d.tableCache.withReader(
-						file.PhysicalMeta(),
-						func(r *sstable.Reader) (err error) {
-							size, err = r.EstimateDiskUsage(start, end)
-							return err
-						},
-					)
-				}
-				if err != nil {
-					return 0, 0, 0, err
-				}
-				meta, err := d.objProvider.Lookup(fileTypeTable, file.FileBacking.DiskFileNum)
-				if err != nil {
-					return 0, 0, 0, err
-				}
-				if meta.IsRemote() {
-					remoteSize += size
-					if meta.Remote.CleanupMethod == objstorage.SharedNoCleanup {
-						externalSize += size
-					}
-				}
-				totalSize += size
-			}
-		}
-	}
-	return totalSize, remoteSize, externalSize, nil
+	totalSize = *d.mu.annotators.totalSize.VersionRangeAnnotation(readState.current, bounds)
+	remoteSize = *d.mu.annotators.remoteSize.VersionRangeAnnotation(readState.current, bounds)
+	externalSize = *d.mu.annotators.externalSize.VersionRangeAnnotation(readState.current, bounds)
+	return
 }
 
 func (d *DB) walPreallocateSize() int {
@@ -2202,16 +2333,27 @@ func (d *DB) walPreallocateSize() int {
 	// RocksDB. Could a smaller preallocation block size be used?
 	size := d.opts.MemTableSize
 	size = (size / 10) + size
-	return size
+	return int(size)
 }
 
-func (d *DB) newMemTable(logNum FileNum, logSeqNum uint64) (*memTable, *flushableEntry) {
+func (d *DB) newMemTable(
+	logNum base.DiskFileNum, logSeqNum base.SeqNum, minSize uint64,
+) (*memTable, *flushableEntry) {
+	targetSize := minSize + uint64(memTableEmptySize)
+	// The targetSize should be less than MemTableSize, because any batch >=
+	// MemTableSize/2 should be treated as a large flushable batch.
+	if targetSize > d.opts.MemTableSize {
+		panic(errors.AssertionFailedf("attempting to allocate memtable larger than MemTableSize"))
+	}
+	// Double until the next memtable size is at least large enough to fit
+	// minSize.
+	for d.mu.mem.nextSize < targetSize {
+		d.mu.mem.nextSize = min(2*d.mu.mem.nextSize, d.opts.MemTableSize)
+	}
 	size := d.mu.mem.nextSize
+	// The next memtable should be double the size, up to Options.MemTableSize.
 	if d.mu.mem.nextSize < d.opts.MemTableSize {
-		d.mu.mem.nextSize *= 2
-		if d.mu.mem.nextSize > d.opts.MemTableSize {
-			d.mu.mem.nextSize = d.opts.MemTableSize
-		}
+		d.mu.mem.nextSize = min(2*d.mu.mem.nextSize, d.opts.MemTableSize)
 	}
 
 	memtblOpts := memTableOptions{
@@ -2229,7 +2371,7 @@ func (d *DB) newMemTable(logNum FileNum, logSeqNum uint64) (*memTable, *flushabl
 	// existing memory.
 	var mem *memTable
 	mem = d.memTableRecycle.Swap(nil)
-	if mem != nil && len(mem.arenaBuf) != size {
+	if mem != nil && uint64(mem.arenaBuf.Len()) != size {
 		d.freeMemTable(mem)
 		mem = nil
 	}
@@ -2239,8 +2381,8 @@ func (d *DB) newMemTable(logNum FileNum, logSeqNum uint64) (*memTable, *flushabl
 		memtblOpts.releaseAccountingReservation = mem.releaseAccountingReservation
 	} else {
 		mem = new(memTable)
-		memtblOpts.arenaBuf = manual.New(int(size))
-		memtblOpts.releaseAccountingReservation = d.opts.Cache.Reserve(size)
+		memtblOpts.arenaBuf = manual.New(manual.MemTable, uintptr(size))
+		memtblOpts.releaseAccountingReservation = d.opts.Cache.Reserve(int(size))
 		d.memTableCount.Add(1)
 		d.memTableReserved.Add(int64(size))
 
@@ -2272,11 +2414,13 @@ func (d *DB) newMemTable(logNum FileNum, logSeqNum uint64) (*memTable, *flushabl
 
 func (d *DB) freeMemTable(m *memTable) {
 	d.memTableCount.Add(-1)
-	d.memTableReserved.Add(-int64(len(m.arenaBuf)))
+	d.memTableReserved.Add(-int64(m.arenaBuf.Len()))
 	m.free()
 }
 
-func (d *DB) newFlushableEntry(f flushable, logNum FileNum, logSeqNum uint64) *flushableEntry {
+func (d *DB) newFlushableEntry(
+	f flushable, logNum base.DiskFileNum, logSeqNum base.SeqNum,
+) *flushableEntry {
 	fe := &flushableEntry{
 		flushable:      f,
 		flushed:        make(chan struct{}),
@@ -2289,59 +2433,56 @@ func (d *DB) newFlushableEntry(f flushable, logNum FileNum, logSeqNum uint64) *f
 	return fe
 }
 
-// makeRoomForWrite ensures that the memtable has room to hold the contents of
-// Batch. It reserves the space in the memtable and adds a reference to the
-// memtable. The caller must later ensure that the memtable is unreferenced. If
-// the memtable is full, or a nil Batch is provided, the current memtable is
-// rotated (marked as immutable) and a new mutable memtable is allocated. This
-// memtable rotation also causes a log rotation.
+// maybeInduceWriteStall is called before performing a memtable rotation in
+// makeRoomForWrite. In some conditions, we prefer to stall the user's write
+// workload rather than continuing to accept writes that may result in resource
+// exhaustion or prohibitively slow reads.
 //
-// Both DB.mu and commitPipeline.mu must be held by the caller. Note that DB.mu
-// may be released and reacquired.
-func (d *DB) makeRoomForWrite(b *Batch) error {
-	if b != nil && b.ingestedSSTBatch {
-		panic("pebble: invalid function call")
-	}
-
-	force := b == nil || b.flushable != nil
+// There are a couple reasons we might wait to rotate the memtable and
+// instead induce a write stall:
+//  1. If too many memtables have queued, we wait for a flush to finish before
+//     creating another memtable.
+//  2. If L0 read amplification has grown too high, we wait for compactions
+//     to reduce the read amplification before accepting more writes that will
+//     increase write pressure.
+//
+// maybeInduceWriteStall checks these stall conditions, and if present, waits
+// for them to abate.
+func (d *DB) maybeInduceWriteStall(b *Batch) {
 	stalled := false
+	// This function will call EventListener.WriteStallBegin at most once.  If
+	// it does call it, it will call EventListener.WriteStallEnd once before
+	// returning.
 	for {
-		if b != nil && b.flushable == nil {
-			err := d.mu.mem.mutable.prepare(b)
-			if err != arenaskl.ErrArenaFull {
-				if stalled {
-					d.opts.EventListener.WriteStallEnd()
-				}
-				return err
-			}
-		} else if !force {
-			if stalled {
-				d.opts.EventListener.WriteStallEnd()
-			}
-			return nil
+		var size uint64
+		for i := range d.mu.mem.queue {
+			size += d.mu.mem.queue[i].totalBytes()
 		}
-		// force || err == ErrArenaFull, so we need to rotate the current memtable.
-		{
-			var size uint64
-			for i := range d.mu.mem.queue {
-				size += d.mu.mem.queue[i].totalBytes()
+		// If ElevateWriteStallThresholdForFailover is true, we give an
+		// unlimited memory budget for memtables. This is simpler than trying to
+		// configure an explicit value, given that memory resources can vary.
+		// When using WAL failover in CockroachDB, an OOM risk is worth
+		// tolerating for workloads that have a strict latency SLO. Also, an
+		// unlimited budget here does not mean that the disk stall in the
+		// primary will go unnoticed until the OOM -- CockroachDB is monitoring
+		// disk stalls, and we expect it to fail the node after ~60s if the
+		// primary is stalled.
+		if size >= uint64(d.opts.MemTableStopWritesThreshold)*d.opts.MemTableSize &&
+			!d.mu.log.manager.ElevateWriteStallThresholdForFailover() {
+			// We have filled up the current memtable, but already queued memtables
+			// are still flushing, so we wait.
+			if !stalled {
+				stalled = true
+				d.opts.EventListener.WriteStallBegin(WriteStallBeginInfo{
+					Reason: "memtable count limit reached",
+				})
 			}
-			if size >= uint64(d.opts.MemTableStopWritesThreshold)*uint64(d.opts.MemTableSize) {
-				// We have filled up the current memtable, but already queued memtables
-				// are still flushing, so we wait.
-				if !stalled {
-					stalled = true
-					d.opts.EventListener.WriteStallBegin(WriteStallBeginInfo{
-						Reason: "memtable count limit reached",
-					})
-				}
-				now := time.Now()
-				d.mu.compact.cond.Wait()
-				if b != nil {
-					b.commitStats.MemTableWriteStallDuration += time.Since(now)
-				}
-				continue
+			beforeWait := crtime.NowMono()
+			d.mu.compact.cond.Wait()
+			if b != nil {
+				b.commitStats.MemTableWriteStallDuration += beforeWait.Elapsed()
 			}
+			continue
 		}
 		l0ReadAmp := d.mu.versions.currentVersion().L0Sublevels.ReadAmplification()
 		if l0ReadAmp >= d.opts.L0StopWritesThreshold {
@@ -2352,38 +2493,59 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 					Reason: "L0 file count limit exceeded",
 				})
 			}
-			now := time.Now()
+			beforeWait := crtime.NowMono()
 			d.mu.compact.cond.Wait()
 			if b != nil {
-				b.commitStats.L0ReadAmpWriteStallDuration += time.Since(now)
+				b.commitStats.L0ReadAmpWriteStallDuration += beforeWait.Elapsed()
 			}
 			continue
 		}
-
-		var newLogNum base.FileNum
-		var prevLogSize uint64
-		if !d.opts.DisableWAL {
-			now := time.Now()
-			newLogNum, prevLogSize = d.recycleWAL()
-			if b != nil {
-				b.commitStats.WALRotationDuration += time.Since(now)
-			}
+		// Not stalled.
+		if stalled {
+			d.opts.EventListener.WriteStallEnd()
 		}
+		return
+	}
+}
 
-		immMem := d.mu.mem.mutable
-		imm := d.mu.mem.queue[len(d.mu.mem.queue)-1]
-		imm.logSize = prevLogSize
-		imm.flushForced = imm.flushForced || (b == nil)
+// makeRoomForWrite rotates the current mutable memtable, ensuring that the
+// resulting mutable memtable has room to hold the contents of the provided
+// Batch. The current memtable is rotated (marked as immutable) and a new
+// mutable memtable is allocated. It reserves space in the new memtable and adds
+// a reference to the memtable. The caller must later ensure that the memtable
+// is unreferenced. This memtable rotation also causes a log rotation.
+//
+// If the current memtable is not full but the caller wishes to trigger a
+// rotation regardless, the caller may pass a nil Batch, and no space in the
+// resulting mutable memtable will be reserved.
+//
+// Both DB.mu and commitPipeline.mu must be held by the caller. Note that DB.mu
+// may be released and reacquired.
+func (d *DB) makeRoomForWrite(b *Batch) error {
+	if b != nil && b.ingestedSSTBatch {
+		panic("pebble: invalid function call")
+	}
+	d.maybeInduceWriteStall(b)
 
-		// If we are manually flushing and we used less than half of the bytes in
-		// the memtable, don't increase the size for the next memtable. This
-		// reduces memtable memory pressure when an application is frequently
-		// manually flushing.
-		if (b == nil) && uint64(immMem.availBytes()) > immMem.totalBytes()/2 {
-			d.mu.mem.nextSize = int(immMem.totalBytes())
+	var newLogNum base.DiskFileNum
+	var prevLogSize uint64
+	if !d.opts.DisableWAL {
+		beforeRotate := crtime.NowMono()
+		newLogNum, prevLogSize = d.rotateWAL()
+		if b != nil {
+			b.commitStats.WALRotationDuration += beforeRotate.Elapsed()
 		}
+	}
+	immMem := d.mu.mem.mutable
+	imm := d.mu.mem.queue[len(d.mu.mem.queue)-1]
+	imm.logSize = prevLogSize
 
-		if b != nil && b.flushable != nil {
+	var logSeqNum base.SeqNum
+	var minSize uint64
+	if b != nil {
+		logSeqNum = b.SeqNum()
+		if b.flushable != nil {
+			logSeqNum += base.SeqNum(b.Count())
 			// The batch is too large to fit in the memtable so add it directly to
 			// the immutable queue. The flushable batch is associated with the same
 			// log as the immutable memtable, but logically occurs after it in
@@ -2400,24 +2562,43 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 			// for it until it is flushed.
 			entry.releaseMemAccounting = d.opts.Cache.Reserve(int(b.flushable.totalBytes()))
 			d.mu.mem.queue = append(d.mu.mem.queue, entry)
-		}
-
-		var logSeqNum uint64
-		if b != nil {
-			logSeqNum = b.SeqNum()
-			if b.flushable != nil {
-				logSeqNum += uint64(b.Count())
-			}
 		} else {
-			logSeqNum = d.mu.versions.logSeqNum.Load()
+			minSize = b.memTableSize
 		}
-		d.rotateMemtable(newLogNum, logSeqNum, immMem)
-		force = false
+	} else {
+		// b == nil
+		//
+		// This is a manual forced flush.
+		logSeqNum = base.SeqNum(d.mu.versions.logSeqNum.Load())
+		imm.flushForced = true
+		// If we are manually flushing and we used less than half of the bytes in
+		// the memtable, don't increase the size for the next memtable. This
+		// reduces memtable memory pressure when an application is frequently
+		// manually flushing.
+		if uint64(immMem.availBytes()) > immMem.totalBytes()/2 {
+			d.mu.mem.nextSize = immMem.totalBytes()
+		}
 	}
+	d.rotateMemtable(newLogNum, logSeqNum, immMem, minSize)
+	if b != nil && b.flushable == nil {
+		err := d.mu.mem.mutable.prepare(b)
+		// Reserving enough space for the batch after rotation must never fail.
+		// We pass in a minSize that's equal to b.memtableSize to ensure that
+		// memtable rotation allocates a memtable sufficiently large. We also
+		// held d.commit.mu for the entirety of this function, ensuring that no
+		// other committers may have reserved memory in the new memtable yet.
+		if err == arenaskl.ErrArenaFull {
+			panic(errors.AssertionFailedf("memtable still full after rotation"))
+		}
+		return err
+	}
+	return nil
 }
 
 // Both DB.mu and commitPipeline.mu must be held by the caller.
-func (d *DB) rotateMemtable(newLogNum FileNum, logSeqNum uint64, prev *memTable) {
+func (d *DB) rotateMemtable(
+	newLogNum base.DiskFileNum, logSeqNum base.SeqNum, prev *memTable, minSize uint64,
+) {
 	// Create a new memtable, scheduling the previous one for flushing. We do
 	// this even if the previous memtable was empty because the DB.Flush
 	// mechanism is dependent on being able to wait for the empty memtable to
@@ -2434,145 +2615,70 @@ func (d *DB) rotateMemtable(newLogNum FileNum, logSeqNum uint64, prev *memTable)
 	//
 	// NB: prev should be the current mutable memtable.
 	var entry *flushableEntry
-	d.mu.mem.mutable, entry = d.newMemTable(newLogNum, logSeqNum)
+	d.mu.mem.mutable, entry = d.newMemTable(newLogNum, logSeqNum, minSize)
 	d.mu.mem.queue = append(d.mu.mem.queue, entry)
+	// d.logSize tracks the log size of the WAL file corresponding to the most
+	// recent flushable. The log size of the previous mutable memtable no longer
+	// applies to the current mutable memtable.
+	//
+	// It's tempting to perform this update in rotateWAL, but that would not be
+	// atomic with the enqueue of the new flushable. A call to DB.Metrics()
+	// could acquire DB.mu after the WAL has been rotated but before the new
+	// memtable has been appended; this would result in omitting the log size of
+	// the most recent flushable.
+	d.logSize.Store(0)
 	d.updateReadStateLocked(nil)
 	if prev.writerUnref() {
 		d.maybeScheduleFlush()
 	}
 }
 
+// rotateWAL creates a new write-ahead log, possibly recycling a previous WAL's
+// files. It returns the file number assigned to the new WAL, and the size of
+// the previous WAL file.
+//
 // Both DB.mu and commitPipeline.mu must be held by the caller. Note that DB.mu
 // may be released and reacquired.
-func (d *DB) recycleWAL() (newLogNum FileNum, prevLogSize uint64) {
+func (d *DB) rotateWAL() (newLogNum base.DiskFileNum, prevLogSize uint64) {
 	if d.opts.DisableWAL {
 		panic("pebble: invalid function call")
 	}
+	jobID := d.newJobIDLocked()
+	newLogNum = d.mu.versions.getNextDiskFileNum()
 
-	jobID := d.mu.nextJobID
-	d.mu.nextJobID++
-	newLogNum = d.mu.versions.getNextFileNum()
-
-	prevLogSize = uint64(d.mu.log.Size())
-
-	// The previous log may have grown past its original physical
-	// size. Update its file size in the queue so we have a proper
-	// accounting of its file size.
-	if d.mu.log.queue[len(d.mu.log.queue)-1].fileSize < prevLogSize {
-		d.mu.log.queue[len(d.mu.log.queue)-1].fileSize = prevLogSize
-	}
 	d.mu.Unlock()
-
-	var err error
 	// Close the previous log first. This writes an EOF trailer
 	// signifying the end of the file and syncs it to disk. We must
 	// close the previous log before linking the new log file,
 	// otherwise a crash could leave both logs with unclean tails, and
 	// Open will treat the previous log as corrupt.
-	err = d.mu.log.LogWriter.Close()
-	metrics := d.mu.log.LogWriter.Metrics()
-	d.mu.Lock()
-	if err := d.mu.log.metrics.Merge(metrics); err != nil {
-		d.opts.Logger.Infof("metrics error: %s", err)
-	}
-	d.mu.Unlock()
-
-	newLogName := base.MakeFilepath(d.opts.FS, d.walDirname, fileTypeLog, newLogNum.DiskFileNum())
-
-	// Try to use a recycled log file. Recycling log files is an important
-	// performance optimization as it is faster to sync a file that has
-	// already been written, than one which is being written for the first
-	// time. This is due to the need to sync file metadata when a file is
-	// being written for the first time. Note this is true even if file
-	// preallocation is performed (e.g. fallocate).
-	var recycleLog fileInfo
-	var recycleOK bool
-	var newLogFile vfs.File
-	if err == nil {
-		recycleLog, recycleOK = d.logRecycler.peek()
-		if recycleOK {
-			recycleLogName := base.MakeFilepath(d.opts.FS, d.walDirname, fileTypeLog, recycleLog.fileNum)
-			newLogFile, err = d.opts.FS.ReuseForWrite(recycleLogName, newLogName)
-			base.MustExist(d.opts.FS, newLogName, d.opts.Logger, err)
-		} else {
-			newLogFile, err = d.opts.FS.Create(newLogName)
-			base.MustExist(d.opts.FS, newLogName, d.opts.Logger, err)
-		}
-	}
-
-	var newLogSize uint64
-	if err == nil && recycleOK {
-		// Figure out the recycled WAL size. This Stat is necessary
-		// because ReuseForWrite's contract allows for removing the
-		// old file and creating a new one. We don't know whether the
-		// WAL was actually recycled.
-		// TODO(jackson): Adding a boolean to the ReuseForWrite return
-		// value indicating whether or not the file was actually
-		// reused would allow us to skip the stat and use
-		// recycleLog.fileSize.
-		var finfo os.FileInfo
-		finfo, err = newLogFile.Stat()
-		if err == nil {
-			newLogSize = uint64(finfo.Size())
-		}
-	}
-
-	if err == nil {
-		// TODO(peter): RocksDB delays sync of the parent directory until the
-		// first time the log is synced. Is that worthwhile?
-		err = d.walDir.Sync()
-	}
-
-	if err != nil && newLogFile != nil {
-		newLogFile.Close()
-	} else if err == nil {
-		newLogFile = vfs.NewSyncingFile(newLogFile, vfs.SyncingFileOptions{
-			NoSyncOnClose:   d.opts.NoSyncOnClose,
-			BytesPerSync:    d.opts.WALBytesPerSync,
-			PreallocateSize: d.walPreallocateSize(),
-		})
-	}
-
-	if recycleOK {
-		err = firstError(err, d.logRecycler.pop(recycleLog.fileNum.FileNum()))
-	}
-
-	d.opts.EventListener.WALCreated(WALCreateInfo{
-		JobID:           jobID,
-		Path:            newLogName,
-		FileNum:         newLogNum,
-		RecycledFileNum: recycleLog.fileNum.FileNum(),
-		Err:             err,
-	})
-
-	d.mu.Lock()
-
-	d.mu.versions.metrics.WAL.Files++
-
+	offset, err := d.mu.log.writer.Close()
 	if err != nil {
-		// TODO(peter): avoid chewing through file numbers in a tight loop if there
-		// is an error here.
-		//
 		// What to do here? Stumbling on doesn't seem worthwhile. If we failed to
 		// close the previous log it is possible we lost a write.
 		panic(err)
 	}
+	prevLogSize = uint64(offset)
+	metrics := d.mu.log.writer.Metrics()
 
-	d.mu.log.queue = append(d.mu.log.queue, fileInfo{fileNum: newLogNum.DiskFileNum(), fileSize: newLogSize})
-	d.mu.log.LogWriter = record.NewLogWriter(newLogFile, newLogNum, record.LogWriterConfig{
-		WALFsyncLatency:    d.mu.log.metrics.fsyncLatency,
-		WALMinSyncInterval: d.opts.WALMinSyncInterval,
-		QueueSemChan:       d.commit.logSyncQSem,
-	})
-	if d.mu.log.registerLogWriterForTesting != nil {
-		d.mu.log.registerLogWriterForTesting(d.mu.log.LogWriter)
+	d.mu.Lock()
+	if err := d.mu.log.metrics.LogWriterMetrics.Merge(&metrics); err != nil {
+		d.opts.Logger.Errorf("metrics error: %s", err)
 	}
 
-	return
+	d.mu.Unlock()
+	writer, err := d.mu.log.manager.Create(wal.NumWAL(newLogNum), int(jobID))
+	if err != nil {
+		panic(err)
+	}
+
+	d.mu.Lock()
+	d.mu.log.writer = writer
+	return newLogNum, prevLogSize
 }
 
-func (d *DB) getEarliestUnflushedSeqNumLocked() uint64 {
-	seqNum := InternalKeySeqNumMax
+func (d *DB) getEarliestUnflushedSeqNumLocked() base.SeqNum {
+	seqNum := base.SeqNumMax
 	for i := range d.mu.mem.queue {
 		logSeqNum := d.mu.mem.queue[i].logSeqNum
 		if seqNum > logSeqNum {
@@ -2652,14 +2758,40 @@ func (d *DB) SetCreatorID(creatorID uint64) error {
 
 // KeyStatistics keeps track of the number of keys that have been pinned by a
 // snapshot as well as counts of the different key kinds in the lsm.
+//
+// One way of using the accumulated stats, when we only have sets and dels,
+// and say the counts are represented as del_count, set_count,
+// del_latest_count, set_latest_count, snapshot_pinned_count.
+//
+//   - del_latest_count + set_latest_count is the set of unique user keys
+//     (unique).
+//
+//   - set_latest_count is the set of live unique user keys (live_unique).
+//
+//   - Garbage is del_count + set_count - live_unique.
+//
+//   - If everything were in the LSM, del_count+set_count-snapshot_pinned_count
+//     would also be the set of unique user keys (note that
+//     snapshot_pinned_count is counting something different -- see comment below).
+//     But snapshot_pinned_count only counts keys in the LSM so the excess here
+//     must be keys in memtables.
 type KeyStatistics struct {
-	// when a compaction determines a key is obsolete, but cannot elide the key
-	// because it's required by an open snapshot.
+	// TODO(sumeer): the SnapshotPinned* are incorrect in that these older
+	// versions can be in a different level. Either fix the accounting or
+	// rename these fields.
+
+	// SnapshotPinnedKeys represents obsolete keys that cannot be elided during
+	// a compaction, because they are required by an open snapshot.
 	SnapshotPinnedKeys int
-	// the total number of bytes of all snapshot pinned keys.
+	// SnapshotPinnedKeysBytes is the total number of bytes of all snapshot
+	// pinned keys.
 	SnapshotPinnedKeysBytes uint64
-	// Note: these fields are currently only populated for point keys (including range deletes).
+	// KindsCount is the count for each kind of key. It includes point keys,
+	// range deletes and range keys.
 	KindsCount [InternalKeyKindMax + 1]int
+	// LatestKindsCount is the count for each kind of key when it is the latest
+	// kind for a user key. It is only populated for point keys.
+	LatestKindsCount [InternalKeyKindMax + 1]int
 }
 
 // LSMKeyStatistics is used by DB.ScanStatistics.
@@ -2704,7 +2836,8 @@ func (d *DB) ScanStatistics(
 			// pinned by a snapshot.
 			size := uint64(key.Size())
 			kind := key.Kind()
-			if iterInfo.Kind == IteratorLevelLSM && d.equal(prevKey.UserKey, key.UserKey) {
+			sameKey := d.equal(prevKey.UserKey, key.UserKey)
+			if iterInfo.Kind == IteratorLevelLSM && sameKey {
 				stats.Levels[iterInfo.Level].SnapshotPinnedKeys++
 				stats.Levels[iterInfo.Level].SnapshotPinnedKeysBytes += size
 				stats.Accumulated.SnapshotPinnedKeys++
@@ -2713,13 +2846,19 @@ func (d *DB) ScanStatistics(
 			if iterInfo.Kind == IteratorLevelLSM {
 				stats.Levels[iterInfo.Level].KindsCount[kind]++
 			}
+			if !sameKey {
+				if iterInfo.Kind == IteratorLevelLSM {
+					stats.Levels[iterInfo.Level].LatestKindsCount[kind]++
+				}
+				stats.Accumulated.LatestKindsCount[kind]++
+			}
 
 			stats.Accumulated.KindsCount[kind]++
 			prevKey.CopyFrom(*key)
 			stats.BytesRead += uint64(key.Size() + value.Len())
 			return nil
 		},
-		visitRangeDel: func(start, end []byte, seqNum uint64) error {
+		visitRangeDel: func(start, end []byte, seqNum base.SeqNum) error {
 			stats.Accumulated.KindsCount[InternalKeyKindRangeDelete]++
 			stats.BytesRead += uint64(len(start) + len(end))
 			return nil
@@ -2740,10 +2879,13 @@ func (d *DB) ScanStatistics(
 		},
 		rateLimitFunc: rateLimitFunc,
 	}
-	iter := d.newInternalIter(nil /* snapshot */, scanInternalOpts)
+	iter, err := d.newInternalIter(ctx, snapshotIterOpts{}, scanInternalOpts)
+	if err != nil {
+		return LSMKeyStatistics{}, err
+	}
 	defer iter.close()
 
-	err := scanInternalImpl(ctx, lower, upper, iter, scanInternalOpts)
+	err = scanInternalImpl(ctx, lower, upper, iter, scanInternalOpts)
 
 	if err != nil {
 		return LSMKeyStatistics{}, err
@@ -2763,88 +2905,109 @@ func (d *DB) checkVirtualBounds(m *fileMetadata) {
 		return
 	}
 
+	objMeta, err := d.objProvider.Lookup(fileTypeTable, m.FileBacking.DiskFileNum)
+	if err != nil {
+		panic(err)
+	}
+	if objMeta.IsExternal() {
+		// Nothing to do; bounds are expected to be loose.
+		return
+	}
+
+	iters, err := d.newIters(context.TODO(), m, nil, internalIterOpts{}, iterPointKeys|iterRangeDeletions|iterRangeKeys)
+	if err != nil {
+		panic(errors.Wrap(err, "pebble: error creating iterators"))
+	}
+	defer iters.CloseAll()
+
 	if m.HasPointKeys {
-		pointIter, rangeDelIter, err := d.newIters(context.TODO(), m, nil, internalIterOpts{})
-		if err != nil {
-			panic(errors.Wrap(err, "pebble: error creating point iterator"))
-		}
-
-		defer pointIter.Close()
-		if rangeDelIter != nil {
-			defer rangeDelIter.Close()
-		}
-
-		pointKey, _ := pointIter.First()
-		var rangeDel *keyspan.Span
-		if rangeDelIter != nil {
-			rangeDel = rangeDelIter.First()
-		}
+		pointIter := iters.Point()
+		rangeDelIter := iters.RangeDeletion()
 
 		// Check that the lower bound is tight.
+		pointKV := pointIter.First()
+		rangeDel, err := rangeDelIter.First()
+		if err != nil {
+			panic(err)
+		}
 		if (rangeDel == nil || d.cmp(rangeDel.SmallestKey().UserKey, m.SmallestPointKey.UserKey) != 0) &&
-			(pointKey == nil || d.cmp(pointKey.UserKey, m.SmallestPointKey.UserKey) != 0) {
+			(pointKV == nil || d.cmp(pointKV.K.UserKey, m.SmallestPointKey.UserKey) != 0) {
 			panic(errors.Newf("pebble: virtual sstable %s lower point key bound is not tight", m.FileNum))
 		}
 
-		pointKey, _ = pointIter.Last()
-		rangeDel = nil
-		if rangeDelIter != nil {
-			rangeDel = rangeDelIter.Last()
-		}
-
 		// Check that the upper bound is tight.
+		pointKV = pointIter.Last()
+		rangeDel, err = rangeDelIter.Last()
+		if err != nil {
+			panic(err)
+		}
 		if (rangeDel == nil || d.cmp(rangeDel.LargestKey().UserKey, m.LargestPointKey.UserKey) != 0) &&
-			(pointKey == nil || d.cmp(pointKey.UserKey, m.LargestPointKey.UserKey) != 0) {
+			(pointKV == nil || d.cmp(pointKV.K.UserKey, m.LargestPointKey.UserKey) != 0) {
 			panic(errors.Newf("pebble: virtual sstable %s upper point key bound is not tight", m.FileNum))
 		}
 
 		// Check that iterator keys are within bounds.
-		for key, _ := pointIter.First(); key != nil; key, _ = pointIter.Next() {
-			if d.cmp(key.UserKey, m.SmallestPointKey.UserKey) < 0 || d.cmp(key.UserKey, m.LargestPointKey.UserKey) > 0 {
-				panic(errors.Newf("pebble: virtual sstable %s point key %s is not within bounds", m.FileNum, key.UserKey))
+		for kv := pointIter.First(); kv != nil; kv = pointIter.Next() {
+			if d.cmp(kv.K.UserKey, m.SmallestPointKey.UserKey) < 0 || d.cmp(kv.K.UserKey, m.LargestPointKey.UserKey) > 0 {
+				panic(errors.Newf("pebble: virtual sstable %s point key %s is not within bounds", m.FileNum, kv.K.UserKey))
 			}
 		}
-
-		if rangeDelIter != nil {
-			for key := rangeDelIter.First(); key != nil; key = rangeDelIter.Next() {
-				if d.cmp(key.SmallestKey().UserKey, m.SmallestPointKey.UserKey) < 0 {
-					panic(errors.Newf("pebble: virtual sstable %s point key %s is not within bounds", m.FileNum, key.SmallestKey().UserKey))
-				}
-
-				if d.cmp(key.LargestKey().UserKey, m.LargestPointKey.UserKey) > 0 {
-					panic(errors.Newf("pebble: virtual sstable %s point key %s is not within bounds", m.FileNum, key.LargestKey().UserKey))
-				}
+		s, err := rangeDelIter.First()
+		for ; s != nil; s, err = rangeDelIter.Next() {
+			if d.cmp(s.SmallestKey().UserKey, m.SmallestPointKey.UserKey) < 0 {
+				panic(errors.Newf("pebble: virtual sstable %s point key %s is not within bounds", m.FileNum, s.SmallestKey().UserKey))
 			}
+			if d.cmp(s.LargestKey().UserKey, m.LargestPointKey.UserKey) > 0 {
+				panic(errors.Newf("pebble: virtual sstable %s point key %s is not within bounds", m.FileNum, s.LargestKey().UserKey))
+			}
+		}
+		if err != nil {
+			panic(err)
 		}
 	}
 
 	if !m.HasRangeKeys {
 		return
 	}
-
-	rangeKeyIter, err := d.tableNewRangeKeyIter(m, keyspan.SpanIterOptions{})
-	defer rangeKeyIter.Close()
-
-	if err != nil {
-		panic(errors.Wrap(err, "pebble: error creating range key iterator"))
-	}
+	rangeKeyIter := iters.RangeKey()
 
 	// Check that the lower bound is tight.
-	if d.cmp(rangeKeyIter.First().SmallestKey().UserKey, m.SmallestRangeKey.UserKey) != 0 {
+	if s, err := rangeKeyIter.First(); err != nil {
+		panic(err)
+	} else if d.cmp(s.SmallestKey().UserKey, m.SmallestRangeKey.UserKey) != 0 {
 		panic(errors.Newf("pebble: virtual sstable %s lower range key bound is not tight", m.FileNum))
 	}
 
 	// Check that upper bound is tight.
-	if d.cmp(rangeKeyIter.Last().LargestKey().UserKey, m.LargestRangeKey.UserKey) != 0 {
+	if s, err := rangeKeyIter.Last(); err != nil {
+		panic(err)
+	} else if d.cmp(s.LargestKey().UserKey, m.LargestRangeKey.UserKey) != 0 {
 		panic(errors.Newf("pebble: virtual sstable %s upper range key bound is not tight", m.FileNum))
 	}
 
-	for key := rangeKeyIter.First(); key != nil; key = rangeKeyIter.Next() {
-		if d.cmp(key.SmallestKey().UserKey, m.SmallestRangeKey.UserKey) < 0 {
-			panic(errors.Newf("pebble: virtual sstable %s point key %s is not within bounds", m.FileNum, key.SmallestKey().UserKey))
+	s, err := rangeKeyIter.First()
+	for ; s != nil; s, err = rangeKeyIter.Next() {
+		if d.cmp(s.SmallestKey().UserKey, m.SmallestRangeKey.UserKey) < 0 {
+			panic(errors.Newf("pebble: virtual sstable %s point key %s is not within bounds", m.FileNum, s.SmallestKey().UserKey))
 		}
-		if d.cmp(key.LargestKey().UserKey, m.LargestRangeKey.UserKey) > 0 {
-			panic(errors.Newf("pebble: virtual sstable %s point key %s is not within bounds", m.FileNum, key.LargestKey().UserKey))
+		if d.cmp(s.LargestKey().UserKey, m.LargestRangeKey.UserKey) > 0 {
+			panic(errors.Newf("pebble: virtual sstable %s point key %s is not within bounds", m.FileNum, s.LargestKey().UserKey))
 		}
 	}
+	if err != nil {
+		panic(err)
+	}
+}
+
+// DebugString returns a debugging string describing the LSM.
+func (d *DB) DebugString() string {
+	return d.DebugCurrentVersion().DebugString()
+}
+
+// DebugCurrentVersion returns the current LSM tree metadata. Should only be
+// used for testing/debugging.
+func (d *DB) DebugCurrentVersion() *manifest.Version {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.mu.versions.currentVersion()
 }

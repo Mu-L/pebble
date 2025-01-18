@@ -16,9 +16,8 @@
 package randvar
 
 import (
+	"math/rand/v2"
 	"sync"
-
-	"golang.org/x/exp/rand"
 )
 
 // SkewedLatest is a random number generator that generates numbers in
@@ -53,7 +52,7 @@ func NewSkewedLatest(min, max uint64, theta float64) (*SkewedLatest, error) {
 }
 
 // IncMax increments max.
-func (z *SkewedLatest) IncMax(delta int) {
+func (z *SkewedLatest) IncMax(delta uint64) {
 	z.mu.Lock()
 	z.mu.zipf.IncMax(delta)
 	z.mu.max += uint64(delta)

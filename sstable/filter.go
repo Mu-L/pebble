@@ -28,32 +28,12 @@ type FilterMetricsTracker struct {
 	misses atomic.Int64
 }
 
-var _ ReaderOption = (*FilterMetricsTracker)(nil)
-
-func (m *FilterMetricsTracker) readerApply(r *Reader) {
-	if r.tableFilter != nil {
-		r.tableFilter.metrics = m
-	}
-}
-
 // Load returns the current values as FilterMetrics.
 func (m *FilterMetricsTracker) Load() FilterMetrics {
 	return FilterMetrics{
 		Hits:   m.hits.Load(),
 		Misses: m.misses.Load(),
 	}
-}
-
-// BlockHandle is the file offset and length of a block.
-type BlockHandle struct {
-	Offset, Length uint64
-}
-
-// BlockHandleWithProperties is used for data blocks and first/lower level
-// index blocks, since they can be annotated using BlockPropertyCollectors.
-type BlockHandleWithProperties struct {
-	BlockHandle
-	Props []byte
 }
 
 type filterWriter interface {
@@ -68,10 +48,10 @@ type tableFilterReader struct {
 	metrics *FilterMetricsTracker
 }
 
-func newTableFilterReader(policy FilterPolicy) *tableFilterReader {
+func newTableFilterReader(policy FilterPolicy, metrics *FilterMetricsTracker) *tableFilterReader {
 	return &tableFilterReader{
 		policy:  policy,
-		metrics: nil,
+		metrics: metrics,
 	}
 }
 

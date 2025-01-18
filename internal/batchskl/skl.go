@@ -58,19 +58,19 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"time"
+	"math/rand/v2"
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
-	"golang.org/x/exp/rand"
+	"github.com/cockroachdb/pebble/internal/constants"
 )
 
 const (
 	maxHeight    = 20
-	maxNodeSize  = int(unsafe.Sizeof(node{}))
-	linksSize    = int(unsafe.Sizeof(links{}))
-	maxNodesSize = math.MaxUint32
+	maxNodeSize  = uint64(unsafe.Sizeof(node{}))
+	linksSize    = uint64(unsafe.Sizeof(links{}))
+	maxNodesSize = constants.MaxUint32OrInt
 )
 
 var (
@@ -124,7 +124,7 @@ type Skiplist struct {
 	head           uint32
 	tail           uint32
 	height         uint32 // Current height: 1 <= height <= maxHeight
-	rand           rand.PCGSource
+	rand           rand.PCG
 }
 
 var (
@@ -172,7 +172,7 @@ func (s *Skiplist) Init(storage *[]byte, cmp base.Compare, abbreviatedKey base.A
 		nodes:          s.nodes[:0],
 		height:         1,
 	}
-	s.rand.Seed(uint64(time.Now().UnixNano()))
+	s.rand.Seed(0, rand.Uint64())
 
 	const initBufSize = 256
 	if cap(s.nodes) < initBufSize {
@@ -281,7 +281,7 @@ func (s *Skiplist) newNode(
 		panic("height cannot be less than one or greater than the max height")
 	}
 
-	unusedSize := (maxHeight - int(height)) * linksSize
+	unusedSize := uint64(maxHeight-int(height)) * linksSize
 	nodeOffset, err := s.alloc(uint32(maxNodeSize - unusedSize))
 	if err != nil {
 		return 0, err
@@ -296,13 +296,13 @@ func (s *Skiplist) newNode(
 }
 
 func (s *Skiplist) alloc(size uint32) (uint32, error) {
-	offset := len(s.nodes)
+	offset := uint64(len(s.nodes))
 
 	// We only have a need for memory up to offset + size, but we never want
 	// to allocate a node whose tail points into unallocated memory.
 	minAllocSize := offset + maxNodeSize
-	if cap(s.nodes) < minAllocSize {
-		allocSize := cap(s.nodes) * 2
+	if uint64(cap(s.nodes)) < minAllocSize {
+		allocSize := uint64(cap(s.nodes)) * 2
 		if allocSize < minAllocSize {
 			allocSize = minAllocSize
 		}
@@ -414,7 +414,7 @@ func (s *Skiplist) getKey(nd uint32) base.InternalKey {
 	n := s.node(nd)
 	kind := base.InternalKeyKind((*s.storage)[n.offset])
 	key := (*s.storage)[n.keyStart:n.keyEnd]
-	return base.MakeInternalKey(key, uint64(n.offset)|base.InternalKeySeqNumBatch, kind)
+	return base.MakeInternalKey(key, base.SeqNum(n.offset)|base.SeqNumBatchBit, kind)
 }
 
 func (s *Skiplist) getNext(nd, h uint32) uint32 {

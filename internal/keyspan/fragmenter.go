@@ -6,59 +6,10 @@ package keyspan
 
 import (
 	"fmt"
-	"sort"
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
 )
-
-type spansByStartKey struct {
-	cmp base.Compare
-	buf []Span
-}
-
-func (v *spansByStartKey) Len() int { return len(v.buf) }
-func (v *spansByStartKey) Less(i, j int) bool {
-	return v.cmp(v.buf[i].Start, v.buf[j].Start) < 0
-}
-func (v *spansByStartKey) Swap(i, j int) {
-	v.buf[i], v.buf[j] = v.buf[j], v.buf[i]
-}
-
-type spansByEndKey struct {
-	cmp base.Compare
-	buf []Span
-}
-
-func (v *spansByEndKey) Len() int { return len(v.buf) }
-func (v *spansByEndKey) Less(i, j int) bool {
-	return v.cmp(v.buf[i].End, v.buf[j].End) < 0
-}
-func (v *spansByEndKey) Swap(i, j int) {
-	v.buf[i], v.buf[j] = v.buf[j], v.buf[i]
-}
-
-// keysBySeqNumKind sorts spans by the start key's sequence number in
-// descending order. If two spans have equal sequence number, they're compared
-// by key kind in descending order. This ordering matches the ordering of
-// base.InternalCompare among keys with matching user keys.
-type keysBySeqNumKind []Key
-
-func (v *keysBySeqNumKind) Len() int           { return len(*v) }
-func (v *keysBySeqNumKind) Less(i, j int) bool { return (*v)[i].Trailer > (*v)[j].Trailer }
-func (v *keysBySeqNumKind) Swap(i, j int)      { (*v)[i], (*v)[j] = (*v)[j], (*v)[i] }
-
-// Sort the spans by start key. This is the ordering required by the
-// Fragmenter. Usually spans are naturally sorted by their start key,
-// but that isn't true for range deletion tombstones in the legacy
-// range-del-v1 block format.
-func Sort(cmp base.Compare, spans []Span) {
-	sorter := spansByStartKey{
-		cmp: cmp,
-		buf: spans,
-	}
-	sort.Sort(&sorter)
-}
 
 // Fragmenter fragments a set of spans such that overlapping spans are
 // split at their overlap points. The fragmented spans are output to the
@@ -80,10 +31,8 @@ type Fragmenter struct {
 	// specific key (e.g. TruncateAndFlushTo). It is cached in the Fragmenter to
 	// allow reuse.
 	doneBuf []Span
-	// sortBuf is used to sort fragments by end key when flushing.
-	sortBuf spansByEndKey
 	// flushBuf is used to sort keys by (seqnum,kind) before emitting.
-	flushBuf keysBySeqNumKind
+	flushBuf []Key
 	// flushedKey is the key that fragments have been flushed up to. Any
 	// additional spans added to the fragmenter must have a start key >=
 	// flushedKey. A nil value indicates flushedKey has not been set.
@@ -184,7 +133,7 @@ func (f *Fragmenter) checkInvariants(buf []Span) {
 // stability, typically callers only need to perform a shallow clone of the Span
 // before Add-ing it to the fragmenter.
 //
-// Add requires the provided span's keys are sorted in Trailer descending order.
+// Add requires the provided span's keys are sorted in InternalKeyTrailer descending order.
 func (f *Fragmenter) Add(s Span) {
 	if f.finished {
 		panic("pebble: span fragmenter already finished")
@@ -229,124 +178,9 @@ func (f *Fragmenter) Add(s Span) {
 	f.pending = append(f.pending, s)
 }
 
-// Cover is returned by Framenter.Covers and describes a span's relationship to
-// a key at a particular snapshot.
-type Cover int8
-
-const (
-	// NoCover indicates the tested key does not fall within the span's bounds,
-	// or the span contains no keys with sequence numbers higher than the key's.
-	NoCover Cover = iota
-	// CoversInvisibly indicates the tested key does fall within the span's
-	// bounds and the span contains at least one key with a higher sequence
-	// number, but none visible at the provided snapshot.
-	CoversInvisibly
-	// CoversVisibly indicates the tested key does fall within the span's
-	// bounds, and the span constains at least one key with a sequence number
-	// higher than the key's sequence number that is visible at the provided
-	// snapshot.
-	CoversVisibly
-)
-
-// Covers returns an enum indicating whether the specified key is covered by one
-// of the pending keys. The provided key must be consistent with the ordering of
-// the spans. That is, it is invalid to specify a key here that is out of order
-// with the span start keys passed to Add.
-func (f *Fragmenter) Covers(key base.InternalKey, snapshot uint64) Cover {
-	if f.finished {
-		panic("pebble: span fragmenter already finished")
-	}
-	if len(f.pending) == 0 {
-		return NoCover
-	}
-
-	if f.Cmp(f.pending[0].Start, key.UserKey) > 0 {
-		panic(fmt.Sprintf("pebble: keys must be in order: %s > %s",
-			f.Format(f.pending[0].Start), key.Pretty(f.Format)))
-	}
-
-	cover := NoCover
-	seqNum := key.SeqNum()
-	for _, s := range f.pending {
-		if f.Cmp(key.UserKey, s.End) < 0 {
-			// NB: A range deletion tombstone does not delete a point operation
-			// at the same sequence number, and broadly a span is not considered
-			// to cover a point operation at the same sequence number.
-
-			for i := range s.Keys {
-				if kseq := s.Keys[i].SeqNum(); kseq > seqNum {
-					// This key from the span has a higher sequence number than
-					// `key`. It covers `key`, although the span's key might not
-					// be visible if its snapshot is too high.
-					//
-					// Batch keys are always be visible.
-					if kseq < snapshot || kseq&base.InternalKeySeqNumBatch != 0 {
-						return CoversVisibly
-					}
-					// s.Keys[i] is not visible.
-					cover = CoversInvisibly
-				}
-			}
-		}
-	}
-	return cover
-}
-
 // Empty returns true if all fragments added so far have finished flushing.
 func (f *Fragmenter) Empty() bool {
 	return f.finished || len(f.pending) == 0
-}
-
-// TruncateAndFlushTo flushes all of the fragments with a start key <= key,
-// truncating spans to the specified end key. Used during compaction to force
-// emitting of spans which straddle an sstable boundary. Consider
-// the scenario:
-//
-//	a---------k#10
-//	     f#8
-//	     f#7
-//
-// Let's say the next user key after f is g. Calling TruncateAndFlushTo(g) will
-// flush this span:
-//
-//	a-------g#10
-//	     f#8
-//	     f#7
-//
-// And leave this one in f.pending:
-//
-//	g----k#10
-//
-// WARNING: The fragmenter could hold on to the specified end key. Ensure it's
-// a safe byte slice that could outlast the current sstable output, and one
-// that will never be modified.
-func (f *Fragmenter) TruncateAndFlushTo(key []byte) {
-	if f.finished {
-		panic("pebble: span fragmenter already finished")
-	}
-	if f.flushedKey != nil {
-		switch c := f.Cmp(key, f.flushedKey); {
-		case c < 0:
-			panic(fmt.Sprintf("pebble: start key (%s) < flushed key (%s)",
-				f.Format(key), f.Format(f.flushedKey)))
-		}
-	}
-	if invariants.RaceEnabled {
-		f.checkInvariants(f.pending)
-		defer func() { f.checkInvariants(f.pending) }()
-	}
-	if len(f.pending) > 0 {
-		// Since all of the pending spans have the same start key, we only need
-		// to compare against the first one.
-		switch c := f.Cmp(f.pending[0].Start, key); {
-		case c > 0:
-			panic(fmt.Sprintf("pebble: keys must be added in order: %s > %s",
-				f.Format(f.pending[0].Start), f.Format(key)))
-		case c == 0:
-			return
-		}
-	}
-	f.truncateAndFlush(key)
 }
 
 // Start returns the start key of the first span in the pending buffer, or nil
@@ -357,6 +191,14 @@ func (f *Fragmenter) Start() []byte {
 		return f.pending[0].Start
 	}
 	return nil
+}
+
+// Truncate truncates all pending spans up to key (exclusive), flushes them, and
+// retains any spans that continue onward for future flushes.
+func (f *Fragmenter) Truncate(key []byte) {
+	if len(f.pending) > 0 {
+		f.truncateAndFlush(key)
+	}
 }
 
 // Flushes all pending spans up to key (exclusive).
@@ -420,9 +262,7 @@ func (f *Fragmenter) flush(buf []Span, lastKey []byte) {
 
 	// Sort the spans by end key. This will allow us to walk over the spans and
 	// easily determine the next split point (the smallest end-key).
-	f.sortBuf.cmp = f.Cmp
-	f.sortBuf.buf = buf
-	sort.Sort(&f.sortBuf)
+	SortSpansByEndKey(f.Cmp, buf)
 
 	// Loop over the spans, splitting by end key.
 	for len(buf) > 0 {
@@ -439,7 +279,7 @@ func (f *Fragmenter) flush(buf []Span, lastKey []byte) {
 			f.flushBuf = append(f.flushBuf, buf[i].Keys...)
 		}
 
-		sort.Sort(&f.flushBuf)
+		SortKeysByTrailer(f.flushBuf)
 
 		f.Emit(Span{
 			Start: buf[0].Start,
@@ -451,7 +291,7 @@ func (f *Fragmenter) flush(buf []Span, lastKey []byte) {
 			// indefinitely.
 			//
 			// Eventually, we should be able to replace the fragmenter with the
-			// keyspan.MergingIter which will perform just-in-time
+			// keyspanimpl.MergingIter which will perform just-in-time
 			// fragmentation, and only guaranteeing the memory lifetime for the
 			// current span. The MergingIter fragments while only needing to
 			// access one Span per level. It only accesses the Span at the

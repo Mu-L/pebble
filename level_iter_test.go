@@ -8,21 +8,27 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/itertest"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/rangedel"
+	"github.com/cockroachdb/pebble/internal/rangekey"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 const (
@@ -30,38 +36,36 @@ const (
 )
 
 func TestLevelIter(t *testing.T) {
-	var iters []*fakeIter
+	var iterKVs [][]base.InternalKV
 	var files manifest.LevelSlice
 
 	newIters := func(
-		_ context.Context, file *manifest.FileMetadata, opts *IterOptions, _ internalIterOpts,
-	) (internalIterator, keyspan.FragmentIterator, error) {
-		f := *iters[file.FileNum]
-		f.lower = opts.GetLowerBound()
-		f.upper = opts.GetUpperBound()
-		return &f, nil, nil
+		_ context.Context, file *manifest.FileMetadata, opts *IterOptions, _ internalIterOpts, _ iterKinds,
+	) (iterSet, error) {
+		f := base.NewFakeIter(iterKVs[file.FileNum])
+		f.SetBounds(opts.GetLowerBound(), opts.GetUpperBound())
+		return iterSet{point: f}, nil
 	}
 
 	datadriven.RunTest(t, "testdata/level_iter", func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "define":
-			iters = nil
+			iterKVs = nil
 			var metas []*fileMetadata
 			for _, line := range strings.Split(d.Input, "\n") {
-				f := &fakeIter{}
+				var kvs []base.InternalKV
 				for _, key := range strings.Fields(line) {
 					j := strings.Index(key, ":")
-					f.keys = append(f.keys, base.ParseInternalKey(key[:j]))
-					f.vals = append(f.vals, []byte(key[j+1:]))
+					kvs = append(kvs, base.MakeInternalKV(base.ParseInternalKey(key[:j]), []byte(key[j+1:])))
 				}
-				iters = append(iters, f)
+				iterKVs = append(iterKVs, kvs)
 
 				meta := (&fileMetadata{
 					FileNum: FileNum(len(metas)),
 				}).ExtendPointKeyBounds(
 					DefaultComparer.Compare,
-					f.keys[0],
-					f.keys[len(f.keys)-1],
+					kvs[0].K,
+					kvs[len(kvs)-1].K,
 				)
 				meta.InitPhysicalBacking()
 				metas = append(metas, meta)
@@ -86,14 +90,16 @@ func TestLevelIter(t *testing.T) {
 				}
 			}
 
-			iter := newLevelIter(opts, DefaultComparer.Compare,
-				func(a []byte) int { return len(a) }, newIters, files.Iter(), manifest.Level(level),
-				internalIterOpts{})
+			iter := newLevelIter(context.Background(), opts, testkeys.Comparer, newIters, files.Iter(), manifest.Level(level), internalIterOpts{})
 			defer iter.Close()
 			// Fake up the range deletion initialization.
-			iter.initRangeDel(new(keyspan.FragmentIterator))
+			iter.initRangeDel(rangeDelIterSetterFunc(func(rangeDelIter keyspan.FragmentIterator) {
+				if rangeDelIter != nil {
+					rangeDelIter.Close()
+				}
+			}))
 			iter.disableInvariants = true
-			return runInternalIterCmd(t, d, iter, iterCmdVerboseKey)
+			return itertest.RunInternalIterCmd(t, d, iter, itertest.Verbose)
 
 		case "load":
 			// The "load" command allows testing the iterator options passed to load
@@ -123,15 +129,13 @@ func TestLevelIter(t *testing.T) {
 			var tableOpts *IterOptions
 			newIters2 := func(
 				ctx context.Context, file *manifest.FileMetadata, opts *IterOptions,
-				internalOpts internalIterOpts,
-			) (internalIterator, keyspan.FragmentIterator, error) {
+				internalOpts internalIterOpts, kinds iterKinds,
+			) (iterSet, error) {
 				tableOpts = opts
-				return newIters(ctx, file, opts, internalOpts)
+				return newIters(ctx, file, opts, internalOpts, kinds)
 			}
 
-			iter := newLevelIter(opts, DefaultComparer.Compare,
-				func(a []byte) int { return len(a) }, newIters2, files.Iter(),
-				manifest.Level(level), internalIterOpts{})
+			iter := newLevelIter(context.Background(), opts, testkeys.Comparer, newIters2, files.Iter(), manifest.Level(level), internalIterOpts{})
 			iter.SeekGE([]byte(key), base.SeekGEFlagsNone)
 			lower, upper := tableOpts.GetLowerBound(), tableOpts.GetUpperBound()
 			return fmt.Sprintf("[%s,%s]\n", lower, upper)
@@ -140,6 +144,15 @@ func TestLevelIter(t *testing.T) {
 			return fmt.Sprintf("unknown command: %s", d.Cmd)
 		}
 	})
+}
+
+type rangeDelIterSetterFunc func(rangeDelIter keyspan.FragmentIterator)
+
+// Assert that rangeDelIterSetterFunc implements the rangeDelIterSetter interface.
+var _ rangeDelIterSetter = rangeDelIterSetterFunc(nil)
+
+func (fn rangeDelIterSetterFunc) setRangeDelIter(rangeDelIter keyspan.FragmentIterator) {
+	fn(rangeDelIter)
 }
 
 type levelIterTest struct {
@@ -160,23 +173,35 @@ func newLevelIterTest() *levelIterTest {
 }
 
 func (lt *levelIterTest) newIters(
-	ctx context.Context, file *manifest.FileMetadata, opts *IterOptions, iio internalIterOpts,
-) (internalIterator, keyspan.FragmentIterator, error) {
+	ctx context.Context,
+	file *manifest.FileMetadata,
+	opts *IterOptions,
+	iio internalIterOpts,
+	kinds iterKinds,
+) (iterSet, error) {
 	lt.itersCreated++
-	iter, err := lt.readers[file.FileNum].NewIterWithBlockPropertyFiltersAndContextEtc(
-		ctx, opts.LowerBound, opts.UpperBound, nil, false, true, iio.stats,
-		sstable.TrivialReaderProvider{Reader: lt.readers[file.FileNum]})
-	if err != nil {
-		return nil, nil, err
+	transforms := file.IterTransforms()
+	var set iterSet
+	if kinds.Point() {
+		iter, err := lt.readers[file.FileNum].NewPointIter(
+			ctx, transforms,
+			opts.LowerBound, opts.UpperBound, nil, sstable.AlwaysUseFilterBlock, block.ReadEnv{Stats: iio.stats, IterStats: nil}, sstable.MakeTrivialReaderProvider(lt.readers[file.FileNum]))
+		if err != nil {
+			return iterSet{}, errors.CombineErrors(err, set.CloseAll())
+		}
+		set.point = iter
 	}
-	rangeDelIter, err := lt.readers[file.FileNum].NewRawRangeDelIter()
-	if err != nil {
-		return nil, nil, err
+	if kinds.RangeDeletion() {
+		rangeDelIter, err := lt.readers[file.FileNum].NewRawRangeDelIter(context.Background(), file.FragmentIterTransforms(), block.NoReadEnv)
+		if err != nil {
+			return iterSet{}, errors.CombineErrors(err, set.CloseAll())
+		}
+		set.rangeDeletion = rangeDelIter
 	}
-	return iter, rangeDelIter, nil
+	return set, nil
 }
 
-func (lt *levelIterTest) runClear(d *datadriven.TestData) string {
+func (lt *levelIterTest) runClear() string {
 	lt.mem = vfs.NewMem()
 	for _, r := range lt.readers {
 		r.Close()
@@ -190,24 +215,22 @@ func (lt *levelIterTest) runClear(d *datadriven.TestData) string {
 func (lt *levelIterTest) runBuild(d *datadriven.TestData) string {
 	fileNum := FileNum(len(lt.readers))
 	name := fmt.Sprint(fileNum)
-	f0, err := lt.mem.Create(name)
+	f0, err := lt.mem.Create(name, vfs.WriteCategoryUnspecified)
 	if err != nil {
 		return err.Error()
 	}
 
-	tableFormat := sstable.TableFormatRocksDBv2
+	tableFormat := sstable.TableFormatMinSupported
 	for _, arg := range d.CmdArgs {
 		if arg.Key == "format" {
 			switch arg.Vals[0] {
-			case "rocksdbv2":
-				tableFormat = sstable.TableFormatRocksDBv2
 			case "pebblev2":
 				tableFormat = sstable.TableFormatPebblev2
 			}
 		}
 	}
 	fp := bloom.FilterPolicy(10)
-	w := sstable.NewWriter(objstorageprovider.NewFileWritable(f0), sstable.WriterOptions{
+	w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f0), sstable.WriterOptions{
 		Comparer:     &lt.cmp,
 		FilterPolicy: fp,
 		TableFormat:  tableFormat,
@@ -228,18 +251,22 @@ func (lt *levelIterTest) runBuild(d *datadriven.TestData) string {
 		case InternalKeyKindRangeDelete:
 			f.Add(rangedel.Decode(ikey, value, nil))
 		case InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete:
-			if err := w.AddRangeKey(ikey, value); err != nil {
+			span, err := rangekey.Decode(ikey, value, nil)
+			if err != nil {
+				return err.Error()
+			}
+			if err := w.EncodeSpan(span); err != nil {
 				return err.Error()
 			}
 		default:
-			if err := w.Add(ikey, value); err != nil {
+			if err := w.AddWithForceObsolete(ikey, value, false /* forceObsolete */); err != nil {
 				return err.Error()
 			}
 		}
 	}
 	f.Finish()
 	for _, v := range tombstones {
-		if err := rangedel.Encode(&v, w.Add); err != nil {
+		if err := w.EncodeSpan(v); err != nil {
 			return err.Error()
 		}
 	}
@@ -259,7 +286,7 @@ func (lt *levelIterTest) runBuild(d *datadriven.TestData) string {
 	if err != nil {
 		return err.Error()
 	}
-	r, err := sstable.NewReader(readable, sstable.ReaderOptions{
+	r, err := sstable.NewReader(context.Background(), readable, sstable.ReaderOptions{
 		Filters: map[string]FilterPolicy{
 			fp.Name(): fp,
 		},
@@ -290,13 +317,13 @@ func (lt *levelIterTest) runBuild(d *datadriven.TestData) string {
 
 func TestLevelIterBoundaries(t *testing.T) {
 	lt := newLevelIterTest()
-	defer lt.runClear(nil)
+	defer lt.runClear()
 
 	var iter *levelIter
 	datadriven.RunTest(t, "testdata/level_iter_boundaries", func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "clear":
-			return lt.runClear(d)
+			return lt.runClear()
 
 		case "build":
 			return lt.runBuild(d)
@@ -324,11 +351,13 @@ func TestLevelIterBoundaries(t *testing.T) {
 			}
 			if iter == nil {
 				slice := manifest.NewLevelSliceKeySorted(lt.cmp.Compare, lt.metas)
-				iter = newLevelIter(IterOptions{}, DefaultComparer.Compare,
-					func(a []byte) int { return len(a) }, lt.newIters, slice.Iter(),
-					manifest.Level(level), internalIterOpts{})
+				iter = newLevelIter(context.Background(), IterOptions{}, testkeys.Comparer, lt.newIters, slice.Iter(), manifest.Level(level), internalIterOpts{})
 				// Fake up the range deletion initialization.
-				iter.initRangeDel(new(keyspan.FragmentIterator))
+				iter.initRangeDel(rangeDelIterSetterFunc(func(rangeDelIter keyspan.FragmentIterator) {
+					if rangeDelIter != nil {
+						rangeDelIter.Close()
+					}
+				}))
 			}
 			if !save {
 				defer func() {
@@ -336,7 +365,7 @@ func TestLevelIterBoundaries(t *testing.T) {
 					iter = nil
 				}()
 			}
-			return runInternalIterCmd(t, d, iter, iterCmdVerboseKey)
+			return itertest.RunInternalIterCmd(t, d, iter, itertest.Verbose)
 
 		case "file-pos":
 			// Returns the FileNum at which the iterator is positioned.
@@ -346,7 +375,10 @@ func TestLevelIterBoundaries(t *testing.T) {
 			if iter.iterFile == nil {
 				return "nil iterFile"
 			}
-			return fmt.Sprintf("file %d", iter.iterFile.FileNum)
+			if iter.iter != nil {
+				return fmt.Sprintf("file %s [loaded]", iter.iterFile.FileNum)
+			}
+			return fmt.Sprintf("file %s [not loaded]", iter.iterFile.FileNum)
 
 		default:
 			return fmt.Sprintf("unknown command: %s", d.Cmd)
@@ -359,67 +391,92 @@ func TestLevelIterBoundaries(t *testing.T) {
 type levelIterTestIter struct {
 	*levelIter
 	rangeDelIter keyspan.FragmentIterator
+	// rangeDel is only set on seeks: SeekGE, SeekLT, SeekPrefixGE.
+	// TODO(jackson): Clean this up when #2863 is resolved.
+	rangeDel *keyspan.Span
+}
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (i *levelIterTestIter) getRangeDel() *keyspan.Span {
+	return i.rangeDel
 }
 
 func (i *levelIterTestIter) rangeDelSeek(
-	key []byte, ikey *InternalKey, val base.LazyValue, dir int,
-) (*InternalKey, base.LazyValue) {
-	var tombstone keyspan.Span
+	key []byte, kv *base.InternalKV, dir int,
+) *base.InternalKV {
+	i.rangeDel = nil
 	if i.rangeDelIter != nil {
 		var t *keyspan.Span
+		var err error
 		if dir < 0 {
-			t = keyspan.SeekLE(i.levelIter.cmp, i.rangeDelIter, key)
+			t, err = keyspan.SeekLE(i.levelIter.cmp, i.rangeDelIter, key)
 		} else {
-			t = i.rangeDelIter.SeekGE(key)
+			t, err = i.rangeDelIter.SeekGE(key)
 		}
+		// TODO(jackson): Clean this up when the InternalIterator interface
+		// is refactored to return an error return value from all
+		// positioning methods.
+		must(err)
 		if t != nil {
-			tombstone = t.Visible(1000)
+			i.rangeDel = new(keyspan.Span)
+			*i.rangeDel = t.Visible(1000)
 		}
 	}
-	if ikey == nil {
-		return &InternalKey{
-			UserKey: []byte(fmt.Sprintf("./%s", tombstone)),
-		}, base.LazyValue{}
+	return kv
+}
+
+func (i *levelIterTestIter) Close() error {
+	if i.rangeDelIter != nil {
+		i.rangeDelIter.Close()
+		i.rangeDelIter = nil
 	}
-	return &InternalKey{
-		UserKey: []byte(fmt.Sprintf("%s/%s", ikey.UserKey, tombstone)),
-		Trailer: ikey.Trailer,
-	}, val
+	return i.levelIter.Close()
 }
 
 func (i *levelIterTestIter) String() string {
 	return "level-iter-test"
 }
 
-func (i *levelIterTestIter) SeekGE(
-	key []byte, flags base.SeekGEFlags,
-) (*InternalKey, base.LazyValue) {
-	ikey, val := i.levelIter.SeekGE(key, flags)
-	return i.rangeDelSeek(key, ikey, val, 1)
+func (i *levelIterTestIter) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV {
+	kv := i.levelIter.SeekGE(key, flags)
+	return i.rangeDelSeek(key, kv, 1)
 }
 
 func (i *levelIterTestIter) SeekPrefixGE(
 	prefix, key []byte, flags base.SeekGEFlags,
-) (*base.InternalKey, base.LazyValue) {
-	ikey, val := i.levelIter.SeekPrefixGE(prefix, key, flags)
-	return i.rangeDelSeek(key, ikey, val, 1)
+) *base.InternalKV {
+	kv := i.levelIter.SeekPrefixGE(prefix, key, flags)
+	return i.rangeDelSeek(key, kv, 1)
 }
 
-func (i *levelIterTestIter) SeekLT(
-	key []byte, flags base.SeekLTFlags,
-) (*InternalKey, base.LazyValue) {
-	ikey, val := i.levelIter.SeekLT(key, flags)
-	return i.rangeDelSeek(key, ikey, val, -1)
+func (i *levelIterTestIter) SeekLT(key []byte, flags base.SeekLTFlags) *base.InternalKV {
+	kv := i.levelIter.SeekLT(key, flags)
+	return i.rangeDelSeek(key, kv, -1)
+}
+
+func (i *levelIterTestIter) Next() *base.InternalKV {
+	i.rangeDel = nil
+	return i.levelIter.Next()
+}
+
+func (i *levelIterTestIter) Prev() *base.InternalKV {
+	i.rangeDel = nil
+	return i.levelIter.Prev()
 }
 
 func TestLevelIterSeek(t *testing.T) {
 	lt := newLevelIterTest()
-	defer lt.runClear(nil)
+	defer lt.runClear()
 
 	datadriven.RunTest(t, "testdata/level_iter_seek", func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "clear":
-			return lt.runClear(d)
+			return lt.runClear()
 
 		case "build":
 			return lt.runBuild(d)
@@ -428,12 +485,16 @@ func TestLevelIterSeek(t *testing.T) {
 			var stats base.InternalIteratorStats
 			slice := manifest.NewLevelSliceKeySorted(lt.cmp.Compare, lt.metas)
 			iter := &levelIterTestIter{levelIter: &levelIter{}}
-			iter.init(context.Background(), IterOptions{}, DefaultComparer.Compare,
-				func(a []byte) int { return len(a) }, lt.newIters, slice.Iter(),
+			iter.init(context.Background(), IterOptions{}, testkeys.Comparer, lt.newIters, slice.Iter(),
 				manifest.Level(level), internalIterOpts{stats: &stats})
 			defer iter.Close()
-			iter.initRangeDel(&iter.rangeDelIter)
-			return runInternalIterCmd(t, d, iter, iterCmdVerboseKey, iterCmdStats(&stats))
+			iter.initRangeDel(rangeDelIterSetterFunc(func(rangeDelIter keyspan.FragmentIterator) {
+				if iter.rangeDelIter != nil {
+					iter.rangeDelIter.Close()
+				}
+				iter.rangeDelIter = rangeDelIter
+			}))
+			return itertest.RunInternalIterCmd(t, d, iter, itertest.Verbose, itertest.WithSpan(iter.getRangeDel), itertest.WithStats(&stats))
 
 		case "iters-created":
 			return fmt.Sprintf("%d", lt.itersCreated)
@@ -449,16 +510,16 @@ func buildLevelIterTables(
 	mem := vfs.NewMem()
 	files := make([]vfs.File, count)
 	for i := range files {
-		f, err := mem.Create(fmt.Sprintf("bench%d", i))
+		f, err := mem.Create(fmt.Sprintf("bench%d", i), vfs.WriteCategoryUnspecified)
 		if err != nil {
 			b.Fatal(err)
 		}
 		files[i] = f
 	}
 
-	writers := make([]*sstable.Writer, len(files))
+	writers := make([]sstable.RawWriter, len(files))
 	for i := range files {
-		writers[i] = sstable.NewWriter(objstorageprovider.NewFileWritable(files[i]), sstable.WriterOptions{
+		writers[i] = sstable.NewRawWriter(objstorageprovider.NewFileWritable(files[i]), sstable.WriterOptions{
 			BlockRestartInterval: restartInterval,
 			BlockSize:            blockSize,
 			Compression:          NoCompression,
@@ -473,15 +534,16 @@ func buildLevelIterTables(
 			key := []byte(fmt.Sprintf("%08d", i))
 			keys = append(keys, key)
 			ikey := base.MakeInternalKey(key, 0, InternalKeyKindSet)
-			w.Add(ikey, nil)
+			require.NoError(b, w.AddWithForceObsolete(ikey, nil, false /* forceObsolete */))
 		}
 		if err := w.Close(); err != nil {
 			b.Fatal(err)
 		}
 	}
-
-	opts := sstable.ReaderOptions{Cache: NewCache(128 << 20), Comparer: DefaultComparer}
-	defer opts.Cache.Unref()
+	c := NewCache(128 << 20 /* 128MB */)
+	defer c.Unref()
+	opts := sstable.ReaderOptions{Comparer: DefaultComparer}
+	opts.CacheOpts = sstableinternal.CacheOptions{Cache: c}
 	readers := make([]*sstable.Reader, len(files))
 	for i := range files {
 		f, err := mem.Open(fmt.Sprintf("bench%d", i))
@@ -492,7 +554,7 @@ func buildLevelIterTables(
 		if err != nil {
 			b.Fatal(err)
 		}
-		readers[i], err = sstable.NewReader(readable, opts)
+		readers[i], err = sstable.NewReader(context.Background(), readable, opts)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -506,13 +568,13 @@ func buildLevelIterTables(
 
 	meta := make([]*fileMetadata, len(readers))
 	for i := range readers {
-		iter, err := readers[i].NewIter(nil /* lower */, nil /* upper */)
+		iter, err := readers[i].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
 		require.NoError(b, err)
-		smallest, _ := iter.First()
+		smallest := iter.First()
 		meta[i] = &fileMetadata{}
 		meta[i].FileNum = FileNum(i)
-		largest, _ := iter.Last()
-		meta[i].ExtendPointKeyBounds(opts.Comparer.Compare, (*smallest).Clone(), (*largest).Clone())
+		largest := iter.Last()
+		meta[i].ExtendPointKeyBounds(opts.Comparer.Compare, smallest.K.Clone(), largest.K.Clone())
 		meta[i].InitPhysicalBacking()
 	}
 	slice := manifest.NewLevelSliceKeySorted(base.DefaultComparer.Compare, meta)
@@ -531,17 +593,17 @@ func BenchmarkLevelIterSeekGE(b *testing.B) {
 							readers, metas, keys, cleanup := buildLevelIterTables(b, blockSize, restartInterval, count)
 							defer cleanup()
 							newIters := func(
-								_ context.Context, file *manifest.FileMetadata, _ *IterOptions, _ internalIterOpts,
-							) (internalIterator, keyspan.FragmentIterator, error) {
-								iter, err := readers[file.FileNum].NewIter(nil /* lower */, nil /* upper */)
-								return iter, nil, err
+								_ context.Context, file *manifest.FileMetadata, _ *IterOptions, _ internalIterOpts, _ iterKinds,
+							) (iterSet, error) {
+								iter, err := readers[file.FileNum].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
+								return iterSet{point: iter}, err
 							}
-							l := newLevelIter(IterOptions{}, DefaultComparer.Compare, nil, newIters, metas.Iter(), manifest.Level(level), internalIterOpts{})
-							rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+							l := newLevelIter(context.Background(), IterOptions{}, DefaultComparer, newIters, metas.Iter(), manifest.Level(level), internalIterOpts{})
+							rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 
 							b.ResetTimer()
 							for i := 0; i < b.N; i++ {
-								l.SeekGE(keys[rng.Intn(len(keys))], base.SeekGEFlagsNone)
+								l.SeekGE(keys[rng.IntN(len(keys))], base.SeekGEFlagsNone)
 							}
 							l.Close()
 						})
@@ -570,28 +632,33 @@ func BenchmarkLevelIterSeqSeekGEWithBounds(b *testing.B) {
 								buildLevelIterTables(b, blockSize, restartInterval, count)
 							defer cleanup()
 							// This newIters is cheaper than in practice since it does not do
-							// tableCacheShard.findNode.
+							// fileCacheShard.findNode.
 							newIters := func(
-								_ context.Context, file *manifest.FileMetadata, opts *IterOptions, _ internalIterOpts,
-							) (internalIterator, keyspan.FragmentIterator, error) {
+								_ context.Context, file *manifest.FileMetadata, opts *IterOptions, _ internalIterOpts, _ iterKinds,
+							) (iterSet, error) {
 								iter, err := readers[file.FileNum].NewIter(
+									sstable.NoTransforms,
 									opts.LowerBound, opts.UpperBound)
-								return iter, nil, err
+								return iterSet{point: iter}, err
 							}
-							l := newLevelIter(IterOptions{}, DefaultComparer.Compare, nil, newIters, metas.Iter(), manifest.Level(level), internalIterOpts{})
+							l := newLevelIter(context.Background(), IterOptions{}, DefaultComparer, newIters, metas.Iter(), manifest.Level(level), internalIterOpts{})
 							// Fake up the range deletion initialization, to resemble the usage
 							// in a mergingIter.
-							l.initRangeDel(new(keyspan.FragmentIterator))
+							l.initRangeDel(rangeDelIterSetterFunc(func(rangeDelIter keyspan.FragmentIterator) {
+								if rangeDelIter != nil {
+									rangeDelIter.Close()
+								}
+							}))
 							keyCount := len(keys)
 							b.ResetTimer()
 							for i := 0; i < b.N; i++ {
 								pos := i % (keyCount - 1)
 								l.SetBounds(keys[pos], keys[pos+1])
 								// SeekGE will return keys[pos].
-								k, _ := l.SeekGE(keys[pos], base.SeekGEFlagsNone)
+								kv := l.SeekGE(keys[pos], base.SeekGEFlagsNone)
 								// Next() will get called once and return nil.
-								for k != nil {
-									k, _ = l.Next()
+								for kv != nil {
+									kv = l.Next()
 								}
 							}
 							l.Close()
@@ -612,25 +679,28 @@ func BenchmarkLevelIterSeqSeekPrefixGE(b *testing.B) {
 		buildLevelIterTables(b, blockSize, restartInterval, 5)
 	defer cleanup()
 	// This newIters is cheaper than in practice since it does not do
-	// tableCacheShard.findNode.
+	// fileCacheShard.findNode.
 	newIters := func(
-		_ context.Context, file *manifest.FileMetadata, opts *IterOptions, _ internalIterOpts,
-	) (internalIterator, keyspan.FragmentIterator, error) {
+		_ context.Context, file *manifest.FileMetadata, opts *IterOptions, _ internalIterOpts, _ iterKinds,
+	) (iterSet, error) {
 		iter, err := readers[file.FileNum].NewIter(
+			sstable.NoTransforms,
 			opts.LowerBound, opts.UpperBound)
-		return iter, nil, err
+		return iterSet{point: iter}, err
 	}
 
 	for _, skip := range []int{1, 2, 4, 8, 16} {
 		for _, useNext := range []bool{false, true} {
 			b.Run(fmt.Sprintf("skip=%d/use-next=%t", skip, useNext),
 				func(b *testing.B) {
-					l := newLevelIter(IterOptions{}, DefaultComparer.Compare,
-						func(a []byte) int { return len(a) }, newIters, metas.Iter(),
-						manifest.Level(level), internalIterOpts{})
+					l := newLevelIter(context.Background(), IterOptions{}, testkeys.Comparer, newIters, metas.Iter(), manifest.Level(level), internalIterOpts{})
 					// Fake up the range deletion initialization, to resemble the usage
 					// in a mergingIter.
-					l.initRangeDel(new(keyspan.FragmentIterator))
+					l.initRangeDel(rangeDelIterSetterFunc(func(rangeDelIter keyspan.FragmentIterator) {
+						if rangeDelIter != nil {
+							rangeDelIter.Close()
+						}
+					}))
 					keyCount := len(keys)
 					pos := 0
 					l.SeekPrefixGE(keys[pos], keys[pos], base.SeekGEFlagsNone)
@@ -667,20 +737,20 @@ func BenchmarkLevelIterNext(b *testing.B) {
 							readers, metas, _, cleanup := buildLevelIterTables(b, blockSize, restartInterval, count)
 							defer cleanup()
 							newIters := func(
-								_ context.Context, file *manifest.FileMetadata, _ *IterOptions, _ internalIterOpts,
-							) (internalIterator, keyspan.FragmentIterator, error) {
-								iter, err := readers[file.FileNum].NewIter(nil /* lower */, nil /* upper */)
-								return iter, nil, err
+								_ context.Context, file *manifest.FileMetadata, _ *IterOptions, _ internalIterOpts, _ iterKinds,
+							) (iterSet, error) {
+								iter, err := readers[file.FileNum].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
+								return iterSet{point: iter}, err
 							}
-							l := newLevelIter(IterOptions{}, DefaultComparer.Compare, nil, newIters, metas.Iter(), manifest.Level(level), internalIterOpts{})
+							l := newLevelIter(context.Background(), IterOptions{}, testkeys.Comparer, newIters, metas.Iter(), manifest.Level(level), internalIterOpts{})
 
 							b.ResetTimer()
 							for i := 0; i < b.N; i++ {
-								key, _ := l.Next()
-								if key == nil {
-									key, _ = l.First()
+								kv := l.Next()
+								if kv == nil {
+									kv = l.First()
 								}
-								_ = key
+								_ = kv
 							}
 							l.Close()
 						})
@@ -701,20 +771,20 @@ func BenchmarkLevelIterPrev(b *testing.B) {
 							readers, metas, _, cleanup := buildLevelIterTables(b, blockSize, restartInterval, count)
 							defer cleanup()
 							newIters := func(
-								_ context.Context, file *manifest.FileMetadata, _ *IterOptions, _ internalIterOpts,
-							) (internalIterator, keyspan.FragmentIterator, error) {
-								iter, err := readers[file.FileNum].NewIter(nil /* lower */, nil /* upper */)
-								return iter, nil, err
+								_ context.Context, file *manifest.FileMetadata, _ *IterOptions, _ internalIterOpts, _ iterKinds,
+							) (iterSet, error) {
+								iter, err := readers[file.FileNum].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
+								return iterSet{point: iter}, err
 							}
-							l := newLevelIter(IterOptions{}, DefaultComparer.Compare, nil, newIters, metas.Iter(), manifest.Level(level), internalIterOpts{})
+							l := newLevelIter(context.Background(), IterOptions{}, DefaultComparer, newIters, metas.Iter(), manifest.Level(level), internalIterOpts{})
 
 							b.ResetTimer()
 							for i := 0; i < b.N; i++ {
-								key, _ := l.Prev()
-								if key == nil {
-									key, _ = l.Last()
+								kv := l.Prev()
+								if kv == nil {
+									kv = l.Last()
 								}
-								_ = key
+								_ = kv
 							}
 							l.Close()
 						})

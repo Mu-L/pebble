@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -53,7 +54,7 @@ func (m mockFile) Preallocate(int64, int64) error {
 	return nil
 }
 
-func (m mockFile) Stat() (os.FileInfo, error) {
+func (m mockFile) Stat() (FileInfo, error) {
 	panic("unimplemented")
 }
 
@@ -79,7 +80,7 @@ func (m mockFile) SyncTo(int64) (fullSync bool, err error) {
 var _ File = &mockFile{}
 
 type mockFS struct {
-	create        func(string) (File, error)
+	create        func(string, DiskWriteCategory) (File, error)
 	link          func(string, string) error
 	list          func(string) ([]string, error)
 	lock          func(string) (io.Closer, error)
@@ -92,16 +93,16 @@ type mockFS struct {
 	remove        func(string) error
 	removeAll     func(string) error
 	rename        func(string, string) error
-	reuseForWrite func(string, string) (File, error)
-	stat          func(string) (os.FileInfo, error)
+	reuseForWrite func(string, string, DiskWriteCategory) (File, error)
+	stat          func(string) (FileInfo, error)
 	getDiskUsage  func(string) (DiskUsage, error)
 }
 
-func (m mockFS) Create(name string) (File, error) {
+func (m mockFS) Create(name string, category DiskWriteCategory) (File, error) {
 	if m.create == nil {
 		panic("unimplemented")
 	}
-	return m.create(name)
+	return m.create(name, category)
 }
 
 func (m mockFS) Link(oldname, newname string) error {
@@ -118,7 +119,9 @@ func (m mockFS) Open(name string, opts ...OpenOption) (File, error) {
 	return m.open(name, opts...)
 }
 
-func (m mockFS) OpenReadWrite(name string, opts ...OpenOption) (File, error) {
+func (m mockFS) OpenReadWrite(
+	name string, category DiskWriteCategory, opts ...OpenOption,
+) (File, error) {
 	panic("unimplemented")
 }
 
@@ -150,11 +153,11 @@ func (m mockFS) Rename(oldname, newname string) error {
 	return m.rename(oldname, newname)
 }
 
-func (m mockFS) ReuseForWrite(oldname, newname string) (File, error) {
+func (m mockFS) ReuseForWrite(oldname, newname string, category DiskWriteCategory) (File, error) {
 	if m.reuseForWrite == nil {
 		panic("unimplemented")
 	}
-	return m.reuseForWrite(oldname, newname)
+	return m.reuseForWrite(oldname, newname, category)
 }
 
 func (m mockFS) MkdirAll(dir string, perm os.FileMode) error {
@@ -178,7 +181,7 @@ func (m mockFS) List(dir string) ([]string, error) {
 	return m.list(dir)
 }
 
-func (m mockFS) Stat(name string) (os.FileInfo, error) {
+func (m mockFS) Stat(name string) (FileInfo, error) {
 	if m.stat == nil {
 		panic("unimplemented")
 	}
@@ -213,7 +216,69 @@ func (m mockFS) GetDiskUsage(path string) (DiskUsage, error) {
 	return m.getDiskUsage(path)
 }
 
+func (m mockFS) Unwrap() FS { return nil }
+
 var _ FS = &mockFS{}
+
+func TestDiskHealthChecking_WriteStatsCollector(t *testing.T) {
+	writeBuffer := []byte("test")
+	writeSizeInBytes := uint64(len(writeBuffer))
+
+	testCases := []struct {
+		desc            string
+		writeCategories []DiskWriteCategory
+		numWrites       int
+		wantStats       []DiskWriteStatsAggregate
+	}{
+		{
+			desc:            "no write registered",
+			writeCategories: []DiskWriteCategory{},
+			numWrites:       0,
+			wantStats:       []DiskWriteStatsAggregate(nil),
+		},
+		{
+			desc:            "multiple writes to a single category",
+			writeCategories: []DiskWriteCategory{"test1"},
+			numWrites:       2,
+			wantStats: []DiskWriteStatsAggregate{
+				{Category: "test1", BytesWritten: 2 * writeSizeInBytes},
+			},
+		},
+		{
+			desc:            "writes to multiple categories",
+			writeCategories: []DiskWriteCategory{"test1", "test2"},
+			numWrites:       2,
+			wantStats: []DiskWriteStatsAggregate{
+				{Category: "test1", BytesWritten: 2 * writeSizeInBytes},
+				{Category: "test2", BytesWritten: 2 * writeSizeInBytes},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			statsCollector := NewDiskWriteStatsCollector()
+			mockFS := &mockFS{create: func(name string, category DiskWriteCategory) (File, error) {
+				return mockFile{syncAndWriteDuration: 0}, nil
+			}}
+			fs, closer := WithDiskHealthChecks(mockFS, time.Millisecond, statsCollector, func(info DiskSlowInfo) {})
+			defer closer.Close()
+
+			for _, category := range tc.writeCategories {
+				f, err := fs.Create("test", category)
+				require.NoError(t, err)
+				for i := 0; i < tc.numWrites; i++ {
+					n, err := f.Write(writeBuffer)
+					require.NoError(t, err)
+					require.Equal(t, writeSizeInBytes, uint64(n))
+				}
+				err = f.Close()
+				require.NoError(t, err)
+			}
+			expectedStats := statsCollector.GetStats()
+			require.Equal(t, tc.wantStats, expectedStats)
+		})
+	}
+}
 
 func TestDiskHealthChecking_File(t *testing.T) {
 	oldTickInterval := defaultTickInterval
@@ -252,15 +317,15 @@ func TestDiskHealthChecking_File(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.op.String(), func(t *testing.T) {
 			diskSlow := make(chan DiskSlowInfo, 3)
-			mockFS := &mockFS{create: func(name string) (File, error) {
+			mockFS := &mockFS{create: func(name string, category DiskWriteCategory) (File, error) {
 				return mockFile{syncAndWriteDuration: tc.writeDuration}, nil
 			}}
-			fs, closer := WithDiskHealthChecks(mockFS, slowThreshold,
+			fs, closer := WithDiskHealthChecks(mockFS, slowThreshold, nil,
 				func(info DiskSlowInfo) {
 					diskSlow <- info
 				})
 			defer closer.Close()
-			dhFile, _ := fs.Create("test")
+			dhFile, _ := fs.Create("test", WriteCategoryUnspecified)
 			defer dhFile.Close()
 
 			// Writing after file creation tests computation of delta between file
@@ -362,21 +427,22 @@ func TestDiskHealthChecking_File_PackingAndUnpacking(t *testing.T) {
 
 func TestDiskHealthChecking_File_Underflow(t *testing.T) {
 	f := &mockFile{}
-	hcFile := newDiskHealthCheckingFile(f, 1*time.Second, func(opType OpType, writeSizeInBytes int, duration time.Duration) {
-		// We expect to panic before sending the event.
-		t.Fatalf("unexpected slow disk event")
-	})
+	hcFile := newDiskHealthCheckingFile(f, 1*time.Second, "test-category", nil,
+		func(opType OpType, writeSizeInBytes int, duration time.Duration) {
+			// We expect to panic before sending the event.
+			t.Fatalf("unexpected slow disk event")
+		})
 	defer hcFile.Close()
 
 	t.Run("too large delta leads to panic", func(t *testing.T) {
 		// Given the packing scheme, 35 years of process uptime will lead to a delta
 		// that is too large to fit in the packed int64.
-		tCreate := time.Now().Add(-35 * time.Hour * 24 * 365)
+		tCreate := crtime.NowMono() - crtime.Mono(35*time.Hour*24*365)
 		hcFile.createTime = tCreate
 
 		// Assert that the time since tCreate (in milliseconds) is indeed greater
 		// than the max delta that can fit.
-		require.True(t, time.Since(tCreate).Milliseconds() > 1<<deltaBits-1)
+		require.True(t, tCreate.Elapsed().Milliseconds() > 1<<deltaBits-1)
 
 		// Attempting to start the clock for a new operation on the file should
 		// trigger a panic, as the calculated delta from the file creation time would
@@ -386,10 +452,10 @@ func TestDiskHealthChecking_File_Underflow(t *testing.T) {
 	t.Run("pretty large delta but not too large leads to no panic", func(t *testing.T) {
 		// Given the packing scheme, 34 years of process uptime will lead to a delta
 		// that is just small enough to fit in the packed int64.
-		tCreate := time.Now().Add(-34 * time.Hour * 24 * 365)
+		tCreate := crtime.NowMono() - crtime.Mono(34*time.Hour*24*365)
 		hcFile.createTime = tCreate
 
-		require.True(t, time.Since(tCreate).Milliseconds() < 1<<deltaBits-1)
+		require.True(t, tCreate.Elapsed().Milliseconds() < 1<<deltaBits-1)
 		require.NotPanics(t, func() { _, _ = hcFile.Write([]byte("should be fine")) })
 	})
 }
@@ -402,7 +468,7 @@ var (
 // the provided channel on filesystem operations.
 func filesystemOpsMockFS(ch chan struct{}) *mockFS {
 	return &mockFS{
-		create: func(name string) (File, error) {
+		create: func(name string, category DiskWriteCategory) (File, error) {
 			<-ch
 			return nil, errInjected
 		},
@@ -426,7 +492,7 @@ func filesystemOpsMockFS(ch chan struct{}) *mockFS {
 			<-ch
 			return errInjected
 		},
-		reuseForWrite: func(oldname, newname string) (File, error) {
+		reuseForWrite: func(oldname, newname string, category DiskWriteCategory) (File, error) {
 			<-ch
 			return nil, errInjected
 		},
@@ -437,7 +503,7 @@ func stallFilesystemOperations(fs FS) []filesystemOperation {
 	return []filesystemOperation{
 		{
 			"create", OpTypeCreate, func() {
-				f, _ := fs.Create("foo")
+				f, _ := fs.Create("foo", WriteCategoryUnspecified)
 				if f != nil {
 					f.Close()
 				}
@@ -459,7 +525,7 @@ func stallFilesystemOperations(fs FS) []filesystemOperation {
 			"rename", OpTypeRename, func() { _ = fs.Rename("foo", "bar") },
 		},
 		{
-			"reuseforwrite", OpTypeReuseForWrite, func() { _, _ = fs.ReuseForWrite("foo", "bar") },
+			"reuseforwrite", OpTypeReuseForWrite, func() { _, _ = fs.ReuseForWrite("foo", "bar", WriteCategoryUnspecified) },
 		},
 	}
 }
@@ -481,7 +547,7 @@ func TestDiskHealthChecking_Filesystem(t *testing.T) {
 	var stallCount atomic.Uint64
 	unstall := make(chan struct{})
 	var lastOpType OpType
-	fs, closer := WithDiskHealthChecks(filesystemOpsMockFS(unstall), stallThreshold,
+	fs, closer := WithDiskHealthChecks(filesystemOpsMockFS(unstall), stallThreshold, nil,
 		func(info DiskSlowInfo) {
 			require.Equal(t, 0, info.WriteSize)
 			stallCount.Add(1)
@@ -521,7 +587,7 @@ func TestDiskHealthChecking_Filesystem_Close(t *testing.T) {
 	const stallThreshold = 10 * time.Millisecond
 	stallChan := make(chan struct{}, 1)
 	mockFS := &mockFS{
-		create: func(name string) (File, error) {
+		create: func(name string, category DiskWriteCategory) (File, error) {
 			<-stallChan
 			return &mockFile{}, nil
 		},
@@ -530,7 +596,7 @@ func TestDiskHealthChecking_Filesystem_Close(t *testing.T) {
 	files := []string{"foo", "bar", "bax"}
 	var lastPath string
 	stalled := make(chan string)
-	fs, closer := WithDiskHealthChecks(mockFS, stallThreshold,
+	fs, closer := WithDiskHealthChecks(mockFS, stallThreshold, nil,
 		func(info DiskSlowInfo) {
 			if lastPath != info.Path {
 				lastPath = info.Path
@@ -547,7 +613,7 @@ func TestDiskHealthChecking_Filesystem_Close(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			f, _ := fs.Create(filename)
+			f, _ := fs.Create(filename, WriteCategoryUnspecified)
 			if f != nil {
 				f.Close()
 			}

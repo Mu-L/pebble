@@ -5,17 +5,22 @@
 package metamorphic
 
 import (
+	"context"
 	"fmt"
+	"io/fs"
+	"math/rand/v2"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/internal/testkeys"
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 func TestSetupInitialState(t *testing.T) {
@@ -28,7 +33,7 @@ func TestSetupInitialState(t *testing.T) {
 		const maxKeyLen = 2
 		ks := testkeys.Alpha(maxKeyLen)
 		var key [maxKeyLen]byte
-		for i := 0; i < ks.Count(); i++ {
+		for i := int64(0); i < ks.Count(); i++ {
 			n := testkeys.WriteKey(key[:], ks, i)
 			require.NoError(t, d.Set(key[:n], key[:n], pebble.NoSync))
 			if i%100 == 0 {
@@ -43,7 +48,7 @@ func TestSetupInitialState(t *testing.T) {
 	// setupInitialState with an initial state path set to the test's TempDir
 	// should populate opts.opts.FS with the directory's contents.
 	opts := &TestOptions{
-		Opts:             defaultOptions(),
+		Opts:             defaultOptions(TestkeysKeyFormat),
 		initialStatePath: initialStatePath,
 		initialStateDesc: "test",
 	}
@@ -54,21 +59,38 @@ func TestSetupInitialState(t *testing.T) {
 }
 
 func TestOptionsRoundtrip(t *testing.T) {
-	// Some fields mut be ignored to avoid spurious diffs.
+	// Some fields must be ignored to avoid spurious diffs.
 	ignorePrefixes := []string{
 		// Pointers
 		"Cache:",
 		"Cache.",
 		"FS:",
-		"TableCache:",
+		"KeySchemas[",
+		"FileCache:",
 		// Function pointers
+		"BlockPropertyCollectors:",
 		"EventListener:",
 		"MaxConcurrentCompactions:",
-		"Experimental.EnableValueBlocks:",
+		"MaxConcurrentDownloads:",
 		"Experimental.DisableIngestAsFlushable:",
+		"Experimental.EnableColumnarBlocks:",
+		"Experimental.EnableValueBlocks:",
+		"Experimental.IneffectualSingleDeleteCallback:",
+		"Experimental.IngestSplit:",
 		"Experimental.RemoteStorage:",
+		"Experimental.SingleDeleteInvariantViolationCallback:",
+		"Experimental.EnableDeleteOnlyCompactionExcises:",
+		"Levels[0].Compression:",
+		"Levels[1].Compression:",
+		"Levels[2].Compression:",
+		"Levels[3].Compression:",
+		"Levels[4].Compression:",
+		"Levels[5].Compression:",
+		"Levels[6].Compression:",
+		"WALFailover.FailoverOptions.UnhealthyOperationLatencyThreshold:",
 		// Floating points
 		"Experimental.PointTombstoneWeight:",
+		"Experimental.MultiLevelCompactionHeuristic.AddPropensity",
 	}
 
 	// Ensure that we unref any caches created, so invariants builds don't
@@ -81,11 +103,14 @@ func TestOptionsRoundtrip(t *testing.T) {
 
 	checkOptions := func(t *testing.T, o *TestOptions) {
 		s := optionsToString(o)
+		t.Logf("Serialized options:\n%s\n", s)
+
 		parsed := defaultTestOptions()
 		require.NoError(t, parseOptions(parsed, s, nil))
 		maybeUnref(parsed)
 		got := optionsToString(parsed)
 		require.Equal(t, s, got)
+		t.Logf("Re-serialized options:\n%s\n", got)
 
 		// In some options, the closure obscures the underlying value. Check
 		// that the return values are equal.
@@ -97,7 +122,12 @@ func TestOptionsRoundtrip(t *testing.T) {
 		if o.Opts.Experimental.DisableIngestAsFlushable != nil {
 			require.Equal(t, o.Opts.Experimental.DisableIngestAsFlushable(), parsed.Opts.Experimental.DisableIngestAsFlushable())
 		}
+		if o.Opts.Experimental.IngestSplit != nil && o.Opts.Experimental.IngestSplit() {
+			require.Equal(t, o.Opts.Experimental.IngestSplit(), parsed.Opts.Experimental.IngestSplit())
+		}
 		require.Equal(t, o.Opts.MaxConcurrentCompactions(), parsed.Opts.MaxConcurrentCompactions())
+		require.Equal(t, o.Opts.MaxConcurrentDownloads(), parsed.Opts.MaxConcurrentDownloads())
+		require.Equal(t, len(o.Opts.BlockPropertyCollectors), len(parsed.Opts.BlockPropertyCollectors))
 
 		diff := pretty.Diff(o.Opts, parsed.Opts)
 		cleaned := diff[:0]
@@ -119,18 +149,74 @@ func TestOptionsRoundtrip(t *testing.T) {
 	standard := standardOptions()
 	for i := range standard {
 		t.Run(fmt.Sprintf("standard-%03d", i), func(t *testing.T) {
+			defer maybeUnref(standard[i])
 			checkOptions(t, standard[i])
-			maybeUnref(standard[i])
 		})
 	}
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	for i := 0; i < 100; i++ {
 		t.Run(fmt.Sprintf("random-%03d", i), func(t *testing.T) {
-			o := randomOptions(rng, nil)
+			o := RandomOptions(rng, nil)
+			defer maybeUnref(o)
 			checkOptions(t, o)
-			maybeUnref(o)
 		})
 	}
+}
+
+// TestBlockPropertiesParse ensures that the testkeys block property collector
+// is in use by default. It runs a single OPTIONS run of the metamorphic tests
+// and scans the resulting data directory to ensure there's at least one sstable
+// with the property. It runs the test with the archive cleaner to avoid any
+// flakiness from small working sets of keys.
+func TestBlockPropertiesParse(t *testing.T) {
+	const fixedSeed = 1
+	const numOps = 10_000
+	metaDir := t.TempDir()
+
+	rng := rand.New(rand.NewPCG(0, fixedSeed))
+	km := newKeyManager(1 /* numInstances */)
+	g := newGenerator(rng, presetConfigs[0], km)
+	ops := g.generate(numOps)
+	opsPath := filepath.Join(metaDir, "ops")
+	formattedOps := formatOps(km.kf, ops)
+	require.NoError(t, os.WriteFile(opsPath, []byte(formattedOps), 0644))
+
+	runDir := filepath.Join(metaDir, "run")
+	require.NoError(t, os.MkdirAll(runDir, os.ModePerm))
+	optionsPath := filepath.Join(runDir, "OPTIONS")
+	opts := defaultTestOptions()
+	opts.Opts.EnsureDefaults()
+	opts.Opts.Cleaner = pebble.ArchiveCleaner{}
+	optionsStr := optionsToString(opts)
+	require.NoError(t, os.WriteFile(optionsPath, []byte(optionsStr), 0644))
+
+	RunOnce(t, runDir, fixedSeed, filepath.Join(runDir, "history"), KeepData{})
+	var foundTableBlockProperty bool
+	require.NoError(t, filepath.Walk(filepath.Join(runDir, "data"),
+		func(path string, info fs.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if filepath.Ext(path) != ".sst" {
+				return nil
+			}
+			f, err := vfs.Default.Open(path)
+			if err != nil {
+				return err
+			}
+			readable, err := sstable.NewSimpleReadable(f)
+			if err != nil {
+				return err
+			}
+			r, err := sstable.NewReader(context.Background(), readable, opts.Opts.MakeReaderOptions())
+			if err != nil {
+				return err
+			}
+			_, ok := r.Properties.UserProperties[opts.Opts.BlockPropertyCollectors[0]().Name()]
+			foundTableBlockProperty = foundTableBlockProperty || ok
+			return r.Close()
+		}))
+	require.True(t, foundTableBlockProperty)
 }
 
 func TestCustomOptionParser(t *testing.T) {

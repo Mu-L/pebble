@@ -6,9 +6,12 @@ package metamorphic
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"sort"
+	"strconv"
+	"strings"
 
-	"golang.org/x/exp/rand"
+	"github.com/cockroachdb/errors"
 )
 
 // objTag identifies the type for an object: DB, Batch, Iter, or Snapshot.
@@ -19,11 +22,21 @@ const (
 	batchTag
 	iterTag
 	snapTag
+	externalObjTag
+	numObjTags
 )
+
+var objTagPrefix = [numObjTags]string{
+	dbTag:          "db",
+	batchTag:       "batch",
+	iterTag:        "iter",
+	snapTag:        "snap",
+	externalObjTag: "external",
+}
 
 // objID identifies a particular object. The top 4-bits store the tag
 // identifying the type of object, while the bottom 28-bits store the slot used
-// to index with the test.{batches,iters,snapshots} slices.
+// to index with the test.{batches,iters,snapshots,externalObjs} slices.
 type objID uint32
 
 func makeObjID(t objTag, slot uint32) objID {
@@ -39,17 +52,25 @@ func (i objID) slot() uint32 {
 }
 
 func (i objID) String() string {
-	switch i.tag() {
-	case dbTag:
-		return "db"
-	case batchTag:
-		return fmt.Sprintf("batch%d", i.slot())
-	case iterTag:
-		return fmt.Sprintf("iter%d", i.slot())
-	case snapTag:
-		return fmt.Sprintf("snap%d", i.slot())
+	return fmt.Sprintf("%s%d", objTagPrefix[i.tag()], i.slot())
+}
+
+func parseObjID(str string) (objID, error) {
+	// To provide backward compatibility, treat "db" as "db1". Note that unlike
+	// the others, db slots are 1-indexed.
+	if str == "db" {
+		str = "db1"
 	}
-	return fmt.Sprintf("unknown%d", i.slot())
+	for tag := objTag(1); tag < numObjTags; tag++ {
+		if strings.HasPrefix(str, objTagPrefix[tag]) {
+			id, err := strconv.ParseInt(str[len(objTagPrefix[tag]):], 10, 32)
+			if err != nil {
+				return 0, err
+			}
+			return makeObjID(tag, uint32(id)), nil
+		}
+	}
+	return 0, errors.Newf("unknown object type: %q", str)
 }
 
 // objIDSlice is an unordered set of integers used when random selection of an
@@ -77,7 +98,7 @@ func (s *objIDSlice) remove(id objID) {
 }
 
 func (s *objIDSlice) rand(rng *rand.Rand) objID {
-	return (*s)[rng.Intn(len(*s))]
+	return (*s)[rng.IntN(len(*s))]
 }
 
 // objIDSet is an unordered set of object IDs.

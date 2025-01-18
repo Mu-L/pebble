@@ -5,11 +5,13 @@
 package tool
 
 import (
+	"cmp"
 	"fmt"
 	"io"
-	"sort"
+	"slices"
 	"time"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/humanize"
@@ -110,6 +112,9 @@ func (m *manifestT) printLevels(cmp base.Compare, stdout io.Writer, v *manifest.
 					fmt.Fprintf(stdout, "  %s:%d", f.FileNum, f.Size)
 					formatSeqNumRange(stdout, f.SmallestSeqNum, f.LargestSeqNum)
 					formatKeyRange(stdout, m.fmtKey, &f.Smallest, &f.Largest)
+					if f.Virtual {
+						fmt.Fprintf(stdout, "(virtual:backingNum=%s)", f.FileBacking.DiskFileNum)
+					}
 					fmt.Fprintf(stdout, "\n")
 				})
 			}
@@ -124,6 +129,9 @@ func (m *manifestT) printLevels(cmp base.Compare, stdout io.Writer, v *manifest.
 			fmt.Fprintf(stdout, "  %s:%d", f.FileNum, f.Size)
 			formatSeqNumRange(stdout, f.SmallestSeqNum, f.LargestSeqNum)
 			formatKeyRange(stdout, m.fmtKey, &f.Smallest, &f.Largest)
+			if f.Virtual {
+				fmt.Fprintf(stdout, "(virtual:backingNum=%s)", f.FileBacking.DiskFileNum)
+			}
 			fmt.Fprintf(stdout, "\n")
 		}
 	}
@@ -144,7 +152,7 @@ func (m *manifestT) runDump(cmd *cobra.Command, args []string) {
 
 			var bve manifest.BulkVersionEdit
 			bve.AddedByFileNum = make(map[base.FileNum]*manifest.FileMetadata)
-			var cmp *base.Comparer
+			var comparer *base.Comparer
 			var editIdx int
 			rr := record.NewReader(f, 0 /* logNum */)
 			for {
@@ -166,7 +174,7 @@ func (m *manifestT) runDump(cmd *cobra.Command, args []string) {
 					break
 				}
 
-				if cmp != nil && !anyOverlap(cmp.Compare, &ve, m.filterStart, m.filterEnd) {
+				if comparer != nil && !anyOverlap(comparer.Compare, &ve, m.filterStart, m.filterEnd) {
 					continue
 				}
 
@@ -175,8 +183,8 @@ func (m *manifestT) runDump(cmd *cobra.Command, args []string) {
 				if ve.ComparerName != "" {
 					empty = false
 					fmt.Fprintf(stdout, "  comparer:     %s", ve.ComparerName)
-					cmp = m.comparers[ve.ComparerName]
-					if cmp == nil {
+					comparer = m.comparers[ve.ComparerName]
+					if comparer == nil {
 						fmt.Fprintf(stdout, " (unknown)")
 					}
 					fmt.Fprintf(stdout, "\n")
@@ -203,11 +211,11 @@ func (m *manifestT) runDump(cmd *cobra.Command, args []string) {
 					empty = false
 					entries = append(entries, df)
 				}
-				sort.Slice(entries, func(i, j int) bool {
-					if entries[i].Level != entries[j].Level {
-						return entries[i].Level < entries[j].Level
+				slices.SortFunc(entries, func(a, b manifest.DeletedFileEntry) int {
+					if v := cmp.Compare(a.Level, b.Level); v != 0 {
+						return v
 					}
-					return entries[i].FileNum < entries[j].FileNum
+					return cmp.Compare(a.FileNum, b.FileNum)
 				})
 				for _, df := range entries {
 					fmt.Fprintf(stdout, "  deleted:       L%d %s\n", df.Level, df.FileNum)
@@ -233,17 +241,16 @@ func (m *manifestT) runDump(cmd *cobra.Command, args []string) {
 				editIdx++
 			}
 
-			if cmp != nil {
+			if comparer != nil {
 				v, err := bve.Apply(
-					nil /* version */, cmp.Compare, m.fmtKey.fn, 0,
+					nil /* version */, comparer, 0,
 					m.opts.Experimental.ReadCompactionRate,
-					nil, /* zombies */
 				)
 				if err != nil {
 					fmt.Fprintf(stdout, "%s\n", err)
 					return
 				}
-				m.printLevels(cmp.Compare, stdout, v)
+				m.printLevels(comparer.Compare, stdout, v)
 			}
 		}()
 	}
@@ -303,7 +310,12 @@ func (m *manifestT) runSummarizeOne(stdout io.Writer, arg string) error {
 	type summaryBucket struct {
 		bytesAdded      [manifest.NumLevels]uint64
 		bytesCompactOut [manifest.NumLevels]uint64
+		bytesCompactIn  [manifest.NumLevels]uint64
+		filesCompactIn  [manifest.NumLevels]uint64
+		fileLifetimeSec [manifest.NumLevels]*hdrhistogram.Histogram
 	}
+	// 365 days. Arbitrary.
+	const maxLifetimeSec = 365 * 24 * 60 * 60
 	var (
 		bve           manifest.BulkVersionEdit
 		newestOverall time.Time
@@ -313,6 +325,7 @@ func (m *manifestT) runSummarizeOne(stdout io.Writer, arg string) error {
 	)
 	bve.AddedByFileNum = make(map[base.FileNum]*manifest.FileMetadata)
 	rr := record.NewReader(f, 0 /* logNum */)
+	numHistErrors := 0
 	for i := 0; ; i++ {
 		r, err := rr.Next()
 		if err == io.EOF {
@@ -330,9 +343,27 @@ func (m *manifestT) runSummarizeOne(stdout io.Writer, arg string) error {
 			return err
 		}
 
-		veNewest, veOldest := newestOverall, newestOverall
+		// !isLikelyCompaction corresponds to flushes or ingests, that will be
+		// counted in bytesAdded. This is imperfect since ingests that excise can
+		// have deleted files without creating backing tables, and be counted as
+		// compactions. Also, copy compactions have no deleted files and create
+		// backing tables, so will be counted as flush/ingest.
+		//
+		// The bytesAdded metric overcounts since existing files virtualized by an
+		// ingest are also included.
+		//
+		// TODO(sumeer): this summarization needs a rewrite. We could do that
+		// after adding an enum to the VersionEdit to aid the summarization.
+		isLikelyCompaction := len(ve.NewFiles) > 0 && len(ve.DeletedFiles) > 0 && len(ve.CreatedBackingTables) == 0
+		isIntraL0Compaction := isLikelyCompaction && ve.NewFiles[0].Level == 0
+		veNewest := newestOverall
 		for _, nf := range ve.NewFiles {
 			_, seen := metadatas[nf.Meta.FileNum]
+			if seen && !isLikelyCompaction {
+				// Output error and continue processing as usual.
+				fmt.Fprintf(stdout, "error: flush/ingest has file that is already known %d size %s\n",
+					nf.Meta.FileNum, humanize.Bytes.Uint64(nf.Meta.Size))
+			}
 			metadatas[nf.Meta.FileNum] = nf.Meta
 			if nf.Meta.CreationTime == 0 {
 				continue
@@ -341,12 +372,6 @@ func (m *manifestT) runSummarizeOne(stdout io.Writer, arg string) error {
 			t := time.Unix(nf.Meta.CreationTime, 0).UTC()
 			if veNewest.Before(t) {
 				veNewest = t
-			}
-			// Only update the oldest if we haven't already seen this
-			// file; it might've been moved in which case the sstable's
-			// creation time is from when it was originally created.
-			if veOldest.After(t) && !seen {
-				veOldest = t
 			}
 		}
 		// Ratchet up the most recent timestamp we've seen.
@@ -371,25 +396,35 @@ func (m *manifestT) runSummarizeOne(stdout io.Writer, arg string) error {
 			buckets[bucketKey] = b
 		}
 
-		// Increase `bytesAdded` for any version edits that only add files.
-		// These are either flushes or ingests.
-		if len(ve.NewFiles) > 0 && len(ve.DeletedFiles) == 0 {
-			for _, nf := range ve.NewFiles {
+		for _, nf := range ve.NewFiles {
+			if !isLikelyCompaction {
 				b.bytesAdded[nf.Level] += nf.Meta.Size
+			} else if !isIntraL0Compaction {
+				b.bytesCompactIn[nf.Level] += nf.Meta.Size
+				b.filesCompactIn[nf.Level]++
 			}
-			continue
 		}
 
-		// Increase `bytesCompactOut` for the input level of any compactions
-		// that remove bytes from a level (excluding intra-L0 compactions).
-		// compactions.
-		destLevel := -1
-		if len(ve.NewFiles) > 0 {
-			destLevel = ve.NewFiles[0].Level
-		}
 		for dfe := range ve.DeletedFiles {
-			if dfe.Level != destLevel {
+			// Increase `bytesCompactOut` for the input level of any compactions
+			// that remove bytes from a level (excluding intra-L0 compactions).
+			if isLikelyCompaction && !isIntraL0Compaction && dfe.Level != manifest.NumLevels-1 {
 				b.bytesCompactOut[dfe.Level] += metadatas[dfe.FileNum].Size
+			}
+			meta, ok := metadatas[dfe.FileNum]
+			if m.verbose && ok && meta.CreationTime > 0 {
+				hist := b.fileLifetimeSec[dfe.Level]
+				if hist == nil {
+					hist = hdrhistogram.New(0, maxLifetimeSec, 1)
+					b.fileLifetimeSec[dfe.Level] = hist
+				}
+				lifetimeSec := int64((newestOverall.Sub(time.Unix(meta.CreationTime, 0).UTC())) / time.Second)
+				if lifetimeSec > maxLifetimeSec {
+					lifetimeSec = maxLifetimeSec
+				}
+				if err := hist.RecordValue(lifetimeSec); err != nil {
+					numHistErrors++
+				}
 			}
 		}
 	}
@@ -400,7 +435,7 @@ func (m *manifestT) runSummarizeOne(stdout io.Writer, arg string) error {
 		}
 		return humanize.Bytes.Uint64(v).String()
 	}
-	formatRate := func(v uint64, dur time.Duration) string {
+	formatByteRate := func(v uint64, dur time.Duration) string {
 		if v == 0 {
 			return "."
 		}
@@ -409,6 +444,16 @@ func (m *manifestT) runSummarizeOne(stdout io.Writer, arg string) error {
 			secs = 1
 		}
 		return humanize.Bytes.Uint64(uint64(float64(v)/secs)).String() + "/s"
+	}
+	formatRate := func(v uint64, dur time.Duration) string {
+		if v == 0 {
+			return "."
+		}
+		secs := dur.Seconds()
+		if secs == 0 {
+			secs = 1
+		}
+		return fmt.Sprintf("%.1f/s", float64(v)/secs)
 	}
 
 	if newestOverall.IsZero() {
@@ -426,7 +471,7 @@ func (m *manifestT) runSummarizeOne(stdout io.Writer, arg string) error {
 			}
 
 			if bi%10 == 0 {
-				fmt.Fprintf(stdout, "                     ")
+				fmt.Fprintf(stdout, "                        ")
 				fmt.Fprintf(stdout, "_______L0_______L1_______L2_______L3_______L4_______L5_______L6_____TOTAL\n")
 			}
 			fmt.Fprintf(stdout, "%s\n", bt.Format(time.RFC3339))
@@ -444,17 +489,19 @@ func (m *manifestT) runSummarizeOne(stdout io.Writer, arg string) error {
 				format func(uint64, time.Duration) string
 				vals   [manifest.NumLevels]uint64
 			}{
-				{"Ingest+Flush", formatUint64, bucket.bytesAdded},
-				{"Ingest+Flush", formatRate, bucket.bytesAdded},
-				{"Compact (out)", formatUint64, bucket.bytesCompactOut},
-				{"Compact (out)", formatRate, bucket.bytesCompactOut},
+				{"Ingest+Flush Bytes", formatUint64, bucket.bytesAdded},
+				{"Ingest+Flush Bytes/s", formatByteRate, bucket.bytesAdded},
+				{"Compact Out Bytes", formatUint64, bucket.bytesCompactOut},
+				{"Compact Out Bytes/s", formatByteRate, bucket.bytesCompactOut},
+				{"Compact In Bytes/s", formatByteRate, bucket.bytesCompactIn},
+				{"Compact In Files/s", formatRate, bucket.filesCompactIn},
 			}
 			for _, stat := range stats {
 				var sum uint64
 				for _, v := range stat.vals {
 					sum += v
 				}
-				fmt.Fprintf(stdout, "%20s   %8s %8s %8s %8s %8s %8s %8s %8s\n",
+				fmt.Fprintf(stdout, "%23s   %8s %8s %8s %8s %8s %8s %8s %8s\n",
 					stat.label,
 					stat.format(stat.vals[0], dur),
 					stat.format(stat.vals[1], dur),
@@ -467,6 +514,36 @@ func (m *manifestT) runSummarizeOne(stdout io.Writer, arg string) error {
 			}
 		}
 		fmt.Fprintf(stdout, "%s\n", newestOverall.Format(time.RFC3339))
+
+		formatSec := func(sec int64) string {
+			return (time.Second * time.Duration(sec)).String()
+		}
+		if m.verbose {
+			fmt.Fprintf(stdout, "\nLifetime histograms\n")
+			for bi, bt := 0, oldestOverall; !bt.After(newestOverall); bi, bt = bi+1, bt.Truncate(m.summarizeDur).Add(m.summarizeDur) {
+				// Truncate the start time to calculate the bucket key, and
+				// retrieve the appropriate bucket.
+				bk := bt.Truncate(m.summarizeDur)
+				var bucket summaryBucket
+				if buckets[bk] != nil {
+					bucket = *buckets[bk]
+				}
+				fmt.Fprintf(stdout, "%s\n", bt.Format(time.RFC3339))
+				formatHist := func(level int, hist *hdrhistogram.Histogram) {
+					if hist == nil {
+						return
+					}
+					fmt.Fprintf(stdout, "  L%d: mean: %s p25: %s p50: %s p75: %s p90: %s\n", level,
+						formatSec(int64(hist.Mean())), formatSec(hist.ValueAtPercentile(25)),
+						formatSec(hist.ValueAtPercentile(50)), formatSec(hist.ValueAtPercentile(75)),
+						formatSec(hist.ValueAtPercentile(90)))
+				}
+				for i := range bucket.fileLifetimeSec {
+					formatHist(i, bucket.fileLifetimeSec[i])
+				}
+			}
+			fmt.Fprintf(stdout, "%s\n", newestOverall.Format(time.RFC3339))
+		}
 	}
 
 	dur := newestOverall.Sub(oldestOverall)
@@ -474,6 +551,9 @@ func (m *manifestT) runSummarizeOne(stdout io.Writer, arg string) error {
 	fmt.Fprintf(stdout, "Estimated start time: %s\n", oldestOverall.Format(time.RFC3339))
 	fmt.Fprintf(stdout, "Estimated end time:   %s\n", newestOverall.Format(time.RFC3339))
 	fmt.Fprintf(stdout, "Estimated duration:   %s\n", dur.String())
+	if numHistErrors > 0 {
+		fmt.Fprintf(stdout, "Errors in lifetime histograms: %d\n", numHistErrors)
+	}
 
 	return nil
 }
@@ -545,7 +625,7 @@ func (m *manifestT) runCheck(cmd *cobra.Command, args []string) {
 				}
 				// TODO(sbhola): add option to Apply that reports all errors instead of
 				// one error.
-				newv, err := bve.Apply(v, cmp.Compare, m.fmtKey.fn, 0, m.opts.Experimental.ReadCompactionRate, nil /* zombies */)
+				newv, err := bve.Apply(v, cmp, 0, m.opts.Experimental.ReadCompactionRate)
 				if err != nil {
 					fmt.Fprintf(stdout, "%s: offset: %d err: %s\n",
 						arg, offset, err)

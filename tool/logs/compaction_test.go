@@ -21,10 +21,13 @@ import (
 
 const (
 	compactionStartLine23_1 = `I211215 14:26:56.012382 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1845 ⋮ [n5,pebble,s6] 1216510  [JOB 284925] compacting(default) L2 [442555] (4.2 M) + L3 [445853] (8.4 M)`
-	compactionStartLine     = `I211215 14:26:56.012382 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1845 ⋮ [n5,pebble,s6] 1216510  [JOB 284925] compacting(default) L2 [442555] (4.2MB) + L3 [445853] (8.4MB)`
+	compactionStartLine     = `I211215 14:26:56.012382 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1845 ⋮ [n5,pebble,s6] 1216510  [JOB 284925] compacting(default) L2 [442555] (4.2MB) Score=1.01 + L3 [445853] (8.4MB) Score=0.99;  OverlappingRatio: Single 8.03, Multi 25.05;`
 
 	compactionEndLine23_1 = `I211215 14:26:56.318543 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1886 ⋮ [n5,pebble,s6] 1216554  [JOB 284925] compacted(default) L2 [442555] (4.2 M) + L3 [445853] (8.4 M) -> L3 [445883 445887] (13 M), in 0.3s, output rate 42 M/s`
-	compactionEndLine     = `I211215 14:26:56.318543 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1886 ⋮ [n5,pebble,s6] 1216554  [JOB 284925] compacted(default) L2 [442555] (4.2MB) + L3 [445853] (8.4MB) -> L3 [445883 445887] (13MB), in 0.3s, output rate 42MB/s`
+	compactionEndLine     = `I211215 14:26:56.318543 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1886 ⋮ [n5,pebble,s6] 1216554  [JOB 284925] compacted(default) L2 [442555] (4.2MB) Score=1.01 + L3 [445853] (8.4MB) Score=1.01 -> L3 [445883 445887] (13MB), in 0.3s, output rate 42MB/s`
+
+	compactionMultiLevelStartLine = `I211215 14:26:56.318543 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1886 ⋮ [n5,pebble,s6] 1216554 [JOB 11] compacting(default) [multilevel] L2 [250858] (2.1MB) Score=1.09 + L3 [247985 247989 247848] (17MB) Score=0.99 + L4 [250817 250834 238396] (28MB) Score=1.00; OverlappingRatio: Single 3.77, Multi 1.46;`
+	compactionMultiLevelEndline   = `I211215 14:26:56.318543 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1886 ⋮ [n5,pebble,s6] 1216554 [JOB 11] compacted(default) [multilevel] L2 [250858] (2.1MB) Score=1.09 + L3 [247985 247989 247848] (17MB) Score=0.99 + L4 [250817 250834 238396] (28MB) Score=1.00 -> L4 [250859 250860 250861 250862 250863] (46MB), in 0.2s (0.2s total), output rate 185MB/s`
 
 	flushStartLine = `I211213 16:23:48.903751 21136 3@vendor/github.com/cockroachdb/pebble/event.go:599 ⋮ [n9,pebble,s8] 24 [JOB 10] flushing 2 memtables to L0`
 
@@ -37,6 +40,9 @@ const (
 	compactionStartNoNodeStoreLine23_1 = `I211215 14:26:56.012382 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1845 ⋮ [n?,pebble,s?] 1216510  [JOB 284925] compacting(default) L2 [442555] (4.2 M) + L3 [445853] (8.4 M)`
 	compactionStartNoNodeStoreLine     = `I211215 14:26:56.012382 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1845 ⋮ [n?,pebble,s?] 1216510  [JOB 284925] compacting(default) L2 [442555] (4.2 M) + L3 [445853] (8.4MB)`
 	flushStartNoNodeStoreLine          = `I211213 16:23:48.903751 21136 3@vendor/github.com/cockroachdb/pebble/event.go:599 ⋮ [n?,pebble,s?] 24 [JOB 10] flushing 2 memtables to L0`
+
+	flushableIngestionLine23_1 = `I230831 04:13:28.824280 3780 3@pebble/event.go:685 ⋮ [n10,s10,pebble] 365  [JOB 226] flushed 6 ingested flushables L0:024334 (1.5 K) + L0:024339 (1.0 K) + L0:024335 (1.9 K) + L0:024336 (1.1 K) + L0:024337 (1.1 K) + L0:024338 (12 K) in 0.0s (0.0s total), output rate 67 M/s`
+	flushableIngestionLine     = `I230831 04:13:28.824280 3780 3@pebble/event.go:685 ⋮ [n10,s10,pebble] 365  [JOB 226] flushed 6 ingested flushables L0:024334 (1.5KB) + L0:024339 (1.0KB) + L0:024335 (1.9KB) + L0:024336 (1.1KB) + L0:024337 (1.1KB) + L0:024338 (12KB) in 0.0s (0.0s total), output rate 67MB/s`
 )
 
 func TestCompactionLogs_Regex(t *testing.T) {
@@ -132,7 +138,20 @@ func TestCompactionLogs_Regex(t *testing.T) {
 				compactionPatternTypeIdx:   "default",
 				compactionPatternFromIdx:   "2",
 				compactionPatternToIdx:     "3",
-				compactionPatternLevels:    "L2 [442555] (4.2MB) + L3 [445853] (8.4MB)",
+				compactionPatternLevels:    "L2 [442555] (4.2MB) Score=1.01 + L3 [445853] (8.4MB) Score=0.99",
+			},
+		},
+		{
+			name: "compaction start multilevel",
+			re:   compactionPattern,
+			line: compactionMultiLevelStartLine,
+			matches: map[int]string{
+				compactionPatternJobIdx:    "11",
+				compactionPatternSuffixIdx: "ing",
+				compactionPatternTypeIdx:   "default",
+				compactionPatternFromIdx:   "2",
+				compactionPatternToIdx:     "4",
+				compactionPatternLevels:    "L2 [250858] (2.1MB) Score=1.09 + L3 [247985 247989 247848] (17MB) Score=0.99 + L4 [250817 250834 238396] (28MB) Score=1.00",
 			},
 		},
 		{
@@ -158,6 +177,19 @@ func TestCompactionLogs_Regex(t *testing.T) {
 				compactionPatternFromIdx:   "2",
 				compactionPatternToIdx:     "3",
 				compactionPatternBytesIdx:  "13MB",
+			},
+		},
+		{
+			name: "compaction end",
+			re:   compactionPattern,
+			line: compactionMultiLevelEndline,
+			matches: map[int]string{
+				compactionPatternJobIdx:    "11",
+				compactionPatternSuffixIdx: "ed",
+				compactionPatternTypeIdx:   "default",
+				compactionPatternFromIdx:   "2",
+				compactionPatternToIdx:     "4",
+				compactionPatternBytesIdx:  "46MB",
 			},
 		},
 		{
@@ -206,6 +238,44 @@ func TestCompactionLogs_Regex(t *testing.T) {
 				readAmpPatternValueIdx: "5",
 			},
 		},
+		{
+			name: "ingestion during flush job 23.1",
+			re:   flushableIngestedPattern,
+			line: flushableIngestionLine23_1,
+			matches: map[int]string{
+				flushableIngestedPatternJobIdx: "226",
+			},
+		},
+		{
+			name: "ingestion during flush 23.1",
+			re:   ingestedFilePattern,
+			line: flushableIngestionLine23_1,
+			matches: map[int]string{
+				// Just looking at the first match for these.
+				ingestedFilePatternLevelIdx: "0",
+				ingestedFilePatternFileIdx:  "024334",
+				ingestedFilePatternBytesIdx: "1.5 K",
+			},
+		},
+		{
+			name: "ingestion during flush job",
+			re:   flushableIngestedPattern,
+			line: flushableIngestionLine,
+			matches: map[int]string{
+				flushableIngestedPatternJobIdx: "226",
+			},
+		},
+		{
+			name: "ingestion during flush",
+			re:   ingestedFilePattern,
+			line: flushableIngestionLine,
+			matches: map[int]string{
+				// Just looking at the first match for these.
+				ingestedFilePatternLevelIdx: "0",
+				ingestedFilePatternFileIdx:  "024334",
+				ingestedFilePatternBytesIdx: "1.5KB",
+			},
+		},
 	}
 
 	for _, tc := range tcs {
@@ -215,6 +285,57 @@ func TestCompactionLogs_Regex(t *testing.T) {
 			for idx, want := range tc.matches {
 				require.Equal(t, want, matches[idx])
 			}
+		})
+	}
+}
+
+func TestParseLogContext(t *testing.T) {
+	testCases := []struct {
+		line      string
+		timestamp string
+		node      int
+		store     int
+	}{
+		{
+			line:      `I211215 14:26:56.012382 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1845 ⋮ [n5,pebble,s6] foo`,
+			timestamp: "211215 14:26:56.012382",
+			node:      5,
+			store:     6,
+		},
+		{
+			line:      `I211215 14:26:56.012382 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1845 ⋮ [T?,n5,pebble,s6] foo`,
+			timestamp: "211215 14:26:56.012382",
+			node:      5,
+			store:     6,
+		},
+		{
+			line:      `I211215 14:26:56.012382 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1845 ⋮ [T15,n5,pebble,s6] foo`,
+			timestamp: "211215 14:26:56.012382",
+			node:      5,
+			store:     6,
+		},
+		{
+			line:      `I211215 14:26:56.012382 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1845 ⋮ [T1,n?,pebble,s6] foo`,
+			timestamp: "211215 14:26:56.012382",
+			node:      -1,
+			store:     6,
+		},
+		{
+			line:      `I211215 14:26:56.012382 51831533 3@vendor/github.com/cockroachdb/pebble/compaction.go:1845 ⋮ [n5,pebble,s?] foo`,
+			timestamp: "211215 14:26:56.012382",
+			node:      5,
+			store:     -1,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run("", func(t *testing.T) {
+			var b logEventCollector
+			require.NoError(t, parseLogContext(tc.line, &b))
+			expT, err := time.Parse(timeFmt, tc.timestamp)
+			require.NoError(t, err)
+			require.Equal(t, expT, b.ctx.timestamp)
+			require.Equal(t, tc.node, b.ctx.node)
+			require.Equal(t, tc.store, b.ctx.store)
 		})
 	}
 }

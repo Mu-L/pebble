@@ -4,7 +4,7 @@
 
 package randvar
 
-import "golang.org/x/exp/rand"
+import "math/rand/v2"
 
 // Static models a random variable that pulls from a distribution with static
 // bounds
@@ -18,7 +18,7 @@ type Dynamic interface {
 	Static
 
 	// Increment the max value the variable will return.
-	IncMax(delta int)
+	IncMax(delta uint64)
 
 	// Read the current max value the variable will return.
 	Max() uint64

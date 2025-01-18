@@ -30,7 +30,7 @@ func TestInternalKey(t *testing.T) {
 	if got, want := k.Kind(), InternalKeyKind(1); got != want {
 		t.Errorf("kind = %d want %d", got, want)
 	}
-	if got, want := k.SeqNum(), uint64(0x08070605040302); got != want {
+	if got, want := k.SeqNum(), SeqNum(0x08070605040302); got != want {
 		t.Errorf("seqNum = %d want %d", got, want)
 	}
 }
@@ -41,7 +41,7 @@ func TestInvalidInternalKey(t *testing.T) {
 		"\x01\x02\x03\x04\x05\x06\x07",
 		"foo",
 		"foo\x08\x07\x06\x05\x04\x03\x02",
-		"foo\x18\x07\x06\x05\x04\x03\x02\x01",
+		"foo\x19\x07\x06\x05\x04\x03\x02\x01",
 	}
 	for _, tc := range testCases {
 		k := DecodeInternalKey([]byte(tc))
@@ -172,7 +172,7 @@ func TestIsExclusiveSentinel(t *testing.T) {
 	}{
 		{
 			name: "rangedel; max seqnum",
-			key:  MakeInternalKey(userKey, InternalKeySeqNumMax, InternalKeyKindRangeKeyDelete),
+			key:  MakeInternalKey(userKey, SeqNumMax, InternalKeyKindRangeKeyDelete),
 			want: true,
 		},
 		{
@@ -182,7 +182,7 @@ func TestIsExclusiveSentinel(t *testing.T) {
 		},
 		{
 			name: "rangekeyset; max seqnum",
-			key:  MakeInternalKey(userKey, InternalKeySeqNumMax, InternalKeyKindRangeKeySet),
+			key:  MakeInternalKey(userKey, SeqNumMax, InternalKeyKindRangeKeySet),
 			want: true,
 		},
 		{
@@ -192,7 +192,7 @@ func TestIsExclusiveSentinel(t *testing.T) {
 		},
 		{
 			name: "rangekeyunset; max seqnum",
-			key:  MakeInternalKey(userKey, InternalKeySeqNumMax, InternalKeyKindRangeKeyUnset),
+			key:  MakeInternalKey(userKey, SeqNumMax, InternalKeyKindRangeKeyUnset),
 			want: true,
 		},
 		{
@@ -202,7 +202,7 @@ func TestIsExclusiveSentinel(t *testing.T) {
 		},
 		{
 			name: "rangekeydel; max seqnum",
-			key:  MakeInternalKey(userKey, InternalKeySeqNumMax, InternalKeyKindRangeKeyDelete),
+			key:  MakeInternalKey(userKey, SeqNumMax, InternalKeyKindRangeKeyDelete),
 			want: true,
 		},
 		{
@@ -212,7 +212,7 @@ func TestIsExclusiveSentinel(t *testing.T) {
 		},
 		{
 			name: "neither rangedel nor rangekey",
-			key:  MakeInternalKey(userKey, InternalKeySeqNumMax, InternalKeyKindSet),
+			key:  MakeInternalKey(userKey, SeqNumMax, InternalKeyKindSet),
 			want: false,
 		},
 	}

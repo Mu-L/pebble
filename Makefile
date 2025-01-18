@@ -4,7 +4,6 @@ GOFLAGS :=
 STRESSFLAGS :=
 TAGS := invariants
 TESTS := .
-LATEST_RELEASE := $(shell git fetch origin && git branch -r --list '*/crl-release-*' | grep -o 'crl-release-.*$$' | sort | tail -1)
 COVER_PROFILE := coverprofile.out
 
 .PHONY: all
@@ -18,6 +17,7 @@ all:
 	@echo "  make crossversion-meta"
 	@echo "  make testcoverage"
 	@echo "  make mod-update"
+	@echo "  make gen-bazel"
 	@echo "  make generate"
 	@echo "  make generate-test-data"
 	@echo "  make clean"
@@ -63,6 +63,7 @@ stressmeta: stress
 
 .PHONY: crossversion-meta
 crossversion-meta:
+	$(eval LATEST_RELEASE := $(shell git fetch origin && git branch -r --list '*/crl-release-*' | grep -o 'crl-release-.*$$' | sort | tail -1))
 	git checkout ${LATEST_RELEASE}; \
 		${GO} test -c ./internal/metamorphic -o './internal/metamorphic/crossversion/${LATEST_RELEASE}.test'; \
 		git checkout -; \
@@ -71,7 +72,20 @@ crossversion-meta:
 
 .PHONY: stress-crossversion
 stress-crossversion:
-	STRESS=1 ./scripts/run-crossversion-meta.sh crl-release-21.2 crl-release-22.1 crl-release-22.2 crl-release-23.1 master
+	STRESS=1 ./scripts/run-crossversion-meta.sh crl-release-23.1 crl-release-23.2 crl-release-24.1 crl-release-24.2 master
+
+.PHONY: gen-bazel
+gen-bazel:
+	@echo "Generating WORKSPACE"
+	@echo 'workspace(name = "com_github_cockroachdb_pebble")' > WORKSPACE
+	@echo 'Running gazelle...'
+	${GO} run github.com/bazelbuild/bazel-gazelle/cmd/gazelle@v0.37.0 update --go_prefix=github.com/cockroachdb/pebble --repo_root=.
+	@echo 'You should now be able to build Cockroach using:'
+	@echo '  ./dev build short -- --override_repository=com_github_cockroachdb_pebble=${CURDIR}'
+
+.PHONY: clean-bazel
+clean-bazel:
+	git clean -dxf WORKSPACE BUILD.bazel '**/BUILD.bazel'
 
 .PHONY: generate
 generate:
@@ -88,6 +102,7 @@ generate-test-data:
 	${GO} run -tags make_test_sstables ./tool/make_test_sstables.go
 	${GO} run -tags make_test_remotecat ./tool/make_test_remotecat.go
 
+.PHONY: mod-update
 mod-update:
 	${GO} get -u
 	${GO} mod tidy
@@ -115,11 +130,9 @@ endif
 	@${GO} mod tidy
 	$(MAKE) git-clean-check
 
-# TODO(radu): switch back to @latest once bogus doc changes are
-# addressed; see https://github.com/cockroachdb/crlfmt/pull/44
 .PHONY: format
 format:
-	go install github.com/cockroachdb/crlfmt@44a36ec7 && crlfmt -w -tab 2 .
+	go install -C internal/devtools github.com/cockroachdb/crlfmt && crlfmt -w -tab 2 .
 
 .PHONY: format-check
 format-check:

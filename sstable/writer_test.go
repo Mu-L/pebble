@@ -6,126 +6,159 @@ package sstable
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
-	"math/rand"
+	"io"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"unsafe"
 
+	"github.com/cockroachdb/crlib/testutils/leaktest"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/humanize"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/rowblk"
+	"github.com/cockroachdb/pebble/sstable/valblk"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
 
+type tableFormatFile struct {
+	TableFormat TableFormat
+	File        string
+}
+
 func testWriterParallelism(t *testing.T, parallelism bool) {
-	for _, format := range []TableFormat{TableFormatPebblev2, TableFormatPebblev3} {
-		tdFile := "testdata/writer"
-		if format == TableFormatPebblev3 {
-			tdFile = "testdata/writer_v3"
-		}
-		t.Run(format.String(), func(t *testing.T) { runDataDriven(t, tdFile, format, parallelism) })
+	formatFiles := []tableFormatFile{
+		{TableFormat: TableFormatPebblev2, File: "testdata/writer"},
+		{TableFormat: TableFormatPebblev3, File: "testdata/writer_v3"},
+		{TableFormat: TableFormatPebblev5, File: "testdata/writer_v5"},
+	}
+	for _, tff := range formatFiles {
+		t.Run(tff.TableFormat.String(), func(t *testing.T) {
+			runDataDriven(t, tff.File, tff.TableFormat, parallelism)
+		})
 	}
 }
 func TestWriter(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testWriterParallelism(t, false)
 }
 
 func testRewriterParallelism(t *testing.T, parallelism bool) {
-	for _, format := range []TableFormat{TableFormatPebblev2, TableFormatPebblev3} {
-		tdFile := "testdata/rewriter"
-		if format == TableFormatPebblev3 {
-			tdFile = "testdata/rewriter_v3"
-		}
-		t.Run(format.String(), func(t *testing.T) { runDataDriven(t, tdFile, format, parallelism) })
+	formatFiles := []tableFormatFile{
+		{TableFormat: TableFormatPebblev2, File: "testdata/rewriter"},
+		{TableFormat: TableFormatPebblev3, File: "testdata/rewriter_v3"},
+		{TableFormat: TableFormatPebblev5, File: "testdata/rewriter_v5"},
+	}
+	for _, tff := range formatFiles {
+		t.Run(tff.TableFormat.String(), func(t *testing.T) {
+			runDataDriven(t, tff.File, tff.TableFormat, parallelism)
+		})
 	}
 }
 
 func TestRewriter(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testRewriterParallelism(t, false)
 }
 
 func TestWriterParallel(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testWriterParallelism(t, true)
 }
 
 func TestRewriterParallel(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testRewriterParallelism(t, true)
+}
+
+func formatWriterMetadata(td *datadriven.TestData, m *WriterMetadata) string {
+	var requestedProps []string
+	for _, cmdArg := range td.CmdArgs {
+		switch cmdArg.Key {
+		case "props":
+			requestedProps = cmdArg.Vals
+		}
+	}
+
+	var b bytes.Buffer
+	if m.HasPointKeys {
+		fmt.Fprintf(&b, "point:    [%s-%s]\n", m.SmallestPoint, m.LargestPoint)
+	}
+	if m.HasRangeDelKeys {
+		fmt.Fprintf(&b, "rangedel: [%s-%s]\n", m.SmallestRangeDel, m.LargestRangeDel)
+	}
+	if m.HasRangeKeys {
+		fmt.Fprintf(&b, "rangekey: [%s-%s]\n", m.SmallestRangeKey, m.LargestRangeKey)
+	}
+	fmt.Fprintf(&b, "seqnums:  [%d-%d]\n", m.SmallestSeqNum, m.LargestSeqNum)
+
+	if len(requestedProps) > 0 {
+		props := strings.Split(m.Properties.String(), "\n")
+		for _, requestedProp := range requestedProps {
+			fmt.Fprintf(&b, "props %q:\n", requestedProp)
+			for _, prop := range props {
+				if strings.Contains(prop, requestedProp) {
+					fmt.Fprintf(&b, "  %s\n", prop)
+				}
+			}
+		}
+	}
+	return b.String()
 }
 
 func runDataDriven(t *testing.T, file string, tableFormat TableFormat, parallelism bool) {
 	var r *Reader
-	defer func() {
+	var w RawWriter
+	var obj *objstorage.MemObj
+	closeReaderAndWriter := func() {
 		if r != nil {
 			require.NoError(t, r.Close())
 		}
-	}()
-
-	format := func(td *datadriven.TestData, m *WriterMetadata) string {
-		var requestedProps []string
-		for _, cmdArg := range td.CmdArgs {
-			switch cmdArg.Key {
-			case "props":
-				requestedProps = cmdArg.Vals
-			}
+		if w != nil {
+			require.NoError(t, w.Close())
 		}
-
-		var b bytes.Buffer
-		if m.HasPointKeys {
-			fmt.Fprintf(&b, "point:    [%s-%s]\n", m.SmallestPoint, m.LargestPoint)
-		}
-		if m.HasRangeDelKeys {
-			fmt.Fprintf(&b, "rangedel: [%s-%s]\n", m.SmallestRangeDel, m.LargestRangeDel)
-		}
-		if m.HasRangeKeys {
-			fmt.Fprintf(&b, "rangekey: [%s-%s]\n", m.SmallestRangeKey, m.LargestRangeKey)
-		}
-		fmt.Fprintf(&b, "seqnums:  [%d-%d]\n", m.SmallestSeqNum, m.LargestSeqNum)
-
-		if len(requestedProps) > 0 {
-			props := strings.Split(r.Properties.String(), "\n")
-			for _, requestedProp := range requestedProps {
-				fmt.Fprintf(&b, "props %q:\n", requestedProp)
-				for _, prop := range props {
-					if strings.Contains(prop, requestedProp) {
-						fmt.Fprintf(&b, "  %s\n", prop)
-					}
-				}
-			}
-		}
-
-		return b.String()
+		r = nil
+		w = nil
 	}
+	defer closeReaderAndWriter()
 
 	datadriven.RunTest(t, file, func(t *testing.T, td *datadriven.TestData) string {
 		switch td.Cmd {
 		case "build":
-			if r != nil {
-				_ = r.Close()
-				r = nil
-			}
+			closeReaderAndWriter()
 			var meta *WriterMetadata
 			var err error
-			meta, r, err = runBuildCmd(td, &WriterOptions{
+			wopts := &WriterOptions{
+				Comparer:    testkeys.Comparer,
 				TableFormat: tableFormat,
 				Parallelism: parallelism,
-			}, 0)
+			}
+			meta, obj, err = runBuildMemObjCmd(td, wopts)
 			if err != nil {
 				return err.Error()
 			}
-			return format(td, meta)
+			r, err = openReader(obj, wopts, 0)
+			if err != nil {
+				return err.Error()
+			}
+			return formatWriterMetadata(td, meta)
 
 		case "build-raw":
+			closeReaderAndWriter()
 			if r != nil {
 				_ = r.Close()
 				r = nil
@@ -133,24 +166,63 @@ func runDataDriven(t *testing.T, file string, tableFormat TableFormat, paralleli
 			var meta *WriterMetadata
 			var err error
 			meta, r, err = runBuildRawCmd(td, &WriterOptions{
+				Comparer:    testkeys.Comparer,
 				TableFormat: tableFormat,
 			})
 			if err != nil {
 				return err.Error()
 			}
-			return format(td, meta)
+			return formatWriterMetadata(td, meta)
 
-		case "scan":
-			origIter, err := r.NewIter(nil /* lower */, nil /* upper */)
+		case "open-writer":
+			if r != nil {
+				_ = r.Close()
+				r = nil
+			}
+			wopts := &WriterOptions{
+				Comparer:           testkeys.Comparer,
+				DisableValueBlocks: td.HasArg("disable-value-blocks"),
+				TableFormat:        tableFormat,
+				Parallelism:        parallelism,
+			}
+			obj := &objstorage.MemObj{}
+			if err := optsFromArgs(td, wopts); err != nil {
+				return err.Error()
+			}
+			w = NewRawWriter(obj, *wopts)
+			return ""
+
+		case "write-kvs":
+			if err := writeKVs(w, td.Input); err != nil {
+				return err.Error()
+			}
+			return fmt.Sprintf("EstimatedSize()=%d", w.EstimatedSize())
+
+		case "close":
+			if err := w.Close(); err != nil {
+				return err.Error()
+			}
+			meta, err := w.Metadata()
 			if err != nil {
 				return err.Error()
 			}
-			iter := newIterAdapter(origIter)
+			w = nil
+			return formatWriterMetadata(td, meta)
+
+		case "scan":
+			iter, err := r.NewIter(NoTransforms, nil /* lower */, nil /* upper */)
+			if err != nil {
+				return err.Error()
+			}
 			defer iter.Close()
 
 			var buf bytes.Buffer
-			for valid := iter.First(); valid; valid = iter.Next() {
-				fmt.Fprintf(&buf, "%s:%s\n", iter.Key(), iter.Value())
+			for kv := iter.First(); kv != nil; kv = iter.Next() {
+				v, _, err := kv.Value(nil)
+				if err != nil {
+					return err.Error()
+				}
+				fmt.Fprintf(&buf, "%s:%s\n", kv.K, v)
 			}
 			return buf.String()
 
@@ -167,7 +239,7 @@ func runDataDriven(t *testing.T, file string, tableFormat TableFormat, paralleli
 			return buf.String()
 
 		case "scan-range-del":
-			iter, err := r.NewRawRangeDelIter()
+			iter, err := r.NewRawRangeDelIter(context.Background(), NoFragmentTransforms, block.NoReadEnv)
 			if err != nil {
 				return err.Error()
 			}
@@ -177,13 +249,17 @@ func runDataDriven(t *testing.T, file string, tableFormat TableFormat, paralleli
 			defer iter.Close()
 
 			var buf bytes.Buffer
-			for s := iter.First(); s != nil; s = iter.Next() {
+			s, err := iter.First()
+			for ; s != nil; s, err = iter.Next() {
 				fmt.Fprintf(&buf, "%s\n", s)
+			}
+			if err != nil {
+				return err.Error()
 			}
 			return buf.String()
 
 		case "scan-range-key":
-			iter, err := r.NewRawRangeKeyIter()
+			iter, err := r.NewRawRangeKeyIter(context.Background(), NoFragmentTransforms, block.NoReadEnv)
 			if err != nil {
 				return err.Error()
 			}
@@ -193,8 +269,12 @@ func runDataDriven(t *testing.T, file string, tableFormat TableFormat, paralleli
 			defer iter.Close()
 
 			var buf bytes.Buffer
-			for s := iter.First(); s != nil; s = iter.Next() {
+			s, err := iter.First()
+			for ; s != nil; s, err = iter.Next() {
 				fmt.Fprintf(&buf, "%s\n", s)
+			}
+			if err != nil {
+				return err.Error()
 			}
 			return buf.String()
 
@@ -211,23 +291,37 @@ func runDataDriven(t *testing.T, file string, tableFormat TableFormat, paralleli
 					return "unknown arg"
 				}
 			}
-			var buf bytes.Buffer
-			l.Describe(&buf, verbose, r, nil)
-			return buf.String()
+			return l.Describe(verbose, r, nil)
+
+		case "decode-layout":
+			l, err := decodeLayout(testkeys.Comparer, obj.Data())
+			if err != nil {
+				return err.Error()
+			}
+			verbose := false
+			if len(td.CmdArgs) > 0 {
+				if td.CmdArgs[0].Key == "verbose" {
+					verbose = true
+				} else {
+					return "unknown arg"
+				}
+			}
+			return l.Describe(verbose, r, nil)
 
 		case "rewrite":
 			var meta *WriterMetadata
 			var err error
-			meta, r, err = runRewriteCmd(td, r, WriterOptions{
+			sst := r.blockReader.Readable().(*memReader).b
+			meta, r, err = runRewriteCmd(td, r, sst, WriterOptions{
 				TableFormat: tableFormat,
 			})
 			if err != nil {
 				return err.Error()
 			}
-			if err != nil {
-				return err.Error()
-			}
-			return format(td, meta)
+			return formatWriterMetadata(td, meta)
+
+		case "props":
+			return r.Properties.String()
 
 		default:
 			return fmt.Sprintf("unknown command: %s", td.Cmd)
@@ -236,13 +330,13 @@ func runDataDriven(t *testing.T, file string, tableFormat TableFormat, paralleli
 }
 
 func TestWriterWithValueBlocks(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	var r *Reader
 	defer func() {
 		if r != nil {
 			require.NoError(t, r.Close())
 		}
 	}()
-	formatVersion := TableFormatMax
 	formatMeta := func(m *WriterMetadata) string {
 		return fmt.Sprintf("value-blocks: num-values %d, num-blocks: %d, size: %d",
 			m.Properties.NumValuesInValueBlocks, m.Properties.NumValueBlocks,
@@ -250,7 +344,7 @@ func TestWriterWithValueBlocks(t *testing.T) {
 	}
 
 	parallelism := false
-	if rand.Intn(2) == 0 {
+	if rand.IntN(2) == 0 {
 		parallelism = true
 	}
 	t.Logf("writer parallelism %t", parallelism)
@@ -269,11 +363,22 @@ func TestWriterWithValueBlocks(t *testing.T) {
 				_ = r.Close()
 				r = nil
 			}
+			formatVersion := TableFormatMax
 			var meta *WriterMetadata
 			var err error
 			var blockSize int
 			if td.HasArg("block-size") {
 				td.ScanArgs(t, "block-size", &blockSize)
+			}
+			if arg, ok := td.Arg("table-format"); ok {
+				// The datadriven cmd parser will parse the TableFormat string
+				// because its string representation looks like the datadriven
+				// format for multiple arguments (<arg1>,<arg2>).
+				name, v := arg.TwoVals(t)
+				formatVersion, err = ParseTableFormatString(fmt.Sprintf("(%s,%s)", name, v))
+				if err != nil {
+					return err.Error()
+				}
 			}
 			var inPlaceValueBound UserKeyPrefixBound
 			if td.HasArg("in-place-bound") {
@@ -282,6 +387,10 @@ func TestWriterWithValueBlocks(t *testing.T) {
 				inPlaceValueBound.Lower = []byte(l)
 				inPlaceValueBound.Upper = []byte(u)
 			}
+			var disableValueBlocks bool
+			if td.HasArg("disable-value-blocks") {
+				td.ScanArgs(t, "disable-value-blocks", &disableValueBlocks)
+			}
 			meta, r, err = runBuildCmd(td, &WriterOptions{
 				BlockSize:                 blockSize,
 				Comparer:                  testkeys.Comparer,
@@ -289,6 +398,7 @@ func TestWriterWithValueBlocks(t *testing.T) {
 				Parallelism:               parallelism,
 				RequiredInPlaceValueBound: inPlaceValueBound,
 				ShortAttributeExtractor:   attributeExtractor,
+				DisableValueBlocks:        disableValueBlocks,
 			}, 0)
 			if err != nil {
 				return err.Error()
@@ -300,67 +410,70 @@ func TestWriterWithValueBlocks(t *testing.T) {
 			if err != nil {
 				return err.Error()
 			}
-			var buf bytes.Buffer
-			l.Describe(&buf, true, r, func(key *base.InternalKey, value []byte) {
-				fmt.Fprintf(&buf, "  %s:%s\n", key.String(), string(value))
+			return l.Describe(true, r, func(key *base.InternalKey, value []byte) string {
+				return fmt.Sprintf("%s:%s", key.String(), string(value))
 			})
-			return buf.String()
 
 		case "scan-raw":
 			// Raw scan does not fetch from value blocks.
-			origIter, err := r.NewIter(nil /* lower */, nil /* upper */)
+			iter, err := r.NewIter(NoTransforms, nil /* lower */, nil /* upper */)
 			if err != nil {
 				return err.Error()
 			}
-			forceIgnoreValueBlocks := func(i *singleLevelIterator) {
-				i.vbReader = nil
-				i.data.lazyValueHandling.vbr = nil
-				i.data.lazyValueHandling.hasValuePrefix = false
+			forceRowIterIgnoreValueBlocks := func(i *singleLevelIteratorRowBlocks) {
+				i.vbReader = valblk.Reader{}
+				i.data.SetGetLazyValuer(nil)
+				i.data.SetHasValuePrefix(false)
 			}
-			switch i := origIter.(type) {
-			case *twoLevelIterator:
-				forceIgnoreValueBlocks(&i.singleLevelIterator)
-			case *singleLevelIterator:
-				forceIgnoreValueBlocks(i)
+			switch i := iter.(type) {
+			case *twoLevelIteratorRowBlocks:
+				forceRowIterIgnoreValueBlocks(&i.secondLevel)
+			case *singleLevelIteratorRowBlocks:
+				forceRowIterIgnoreValueBlocks(i)
+			case *twoLevelIteratorColumnBlocks, *singleLevelIteratorColumnBlocks:
+				return "column iterator does not support raw scan"
+			default:
+				return fmt.Sprintf("unknown iterator type: %T", i)
 			}
-			iter := newIterAdapter(origIter)
 			defer iter.Close()
 
 			var buf bytes.Buffer
-			for valid := iter.First(); valid; valid = iter.Next() {
-				v := iter.Value()
-				if iter.Key().Kind() == InternalKeyKindSet {
-					prefix := valuePrefix(v[0])
-					setWithSamePrefix := setHasSamePrefix(prefix)
-					if isValueHandle(prefix) {
-						attribute := getShortAttribute(prefix)
-						vh := decodeValueHandle(v[1:])
+			for kv := iter.First(); kv != nil; kv = iter.Next() {
+				if kv.K.Kind() == InternalKeyKindSet {
+					prefix := block.ValuePrefix(kv.V.ValueOrHandle[0])
+					setWithSamePrefix := prefix.SetHasSamePrefix()
+					if prefix.IsValueHandle() {
+						attribute := prefix.ShortAttribute()
+						vh := valblk.DecodeHandle(kv.V.ValueOrHandle[1:])
 						fmt.Fprintf(&buf, "%s:value-handle len %d block %d offset %d, att %d, same-pre %t\n",
-							iter.Key(), vh.valueLen, vh.blockNum, vh.offsetInBlock, attribute, setWithSamePrefix)
+							kv.K, vh.ValueLen, vh.BlockNum, vh.OffsetInBlock, attribute, setWithSamePrefix)
 					} else {
-						fmt.Fprintf(&buf, "%s:in-place %s, same-pre %t\n", iter.Key(), v[1:], setWithSamePrefix)
+						fmt.Fprintf(&buf, "%s:in-place %s, same-pre %t\n", kv.K, kv.V.ValueOrHandle[1:], setWithSamePrefix)
 					}
 				} else {
-					fmt.Fprintf(&buf, "%s:%s\n", iter.Key(), v)
+					fmt.Fprintf(&buf, "%s:%s\n", kv.K, kv.V.ValueOrHandle)
 				}
 			}
 			return buf.String()
 
 		case "scan":
-			origIter, err := r.NewIter(nil /* lower */, nil /* upper */)
+			iter, err := r.NewIter(NoTransforms, nil /* lower */, nil /* upper */)
 			if err != nil {
 				return err.Error()
 			}
-			iter := newIterAdapter(origIter)
 			defer iter.Close()
 			var buf bytes.Buffer
-			for valid := iter.First(); valid; valid = iter.Next() {
-				fmt.Fprintf(&buf, "%s:%s\n", iter.Key(), iter.Value())
+			for kv := iter.First(); kv != nil; kv = iter.Next() {
+				v, _, err := kv.Value(nil)
+				if err != nil {
+					return err.Error()
+				}
+				fmt.Fprintf(&buf, "%s:%s\n", kv.K, v)
 			}
 			return buf.String()
 
 		case "scan-cloned-lazy-values":
-			iter, err := r.NewIter(nil /* lower */, nil /* upper */)
+			iter, err := r.NewIter(NoTransforms, nil /* lower */, nil /* upper */)
 			if err != nil {
 				return err.Error()
 			}
@@ -368,11 +481,11 @@ func TestWriterWithValueBlocks(t *testing.T) {
 			var values []base.LazyValue
 			n := 0
 			var b []byte
-			for k, lv := iter.First(); k != nil; k, lv = iter.Next() {
+			for kv := iter.First(); kv != nil; kv = iter.Next() {
 				var lvClone base.LazyValue
-				lvClone, b = lv.Clone(b, &fetchers[n])
-				if lv.Fetcher != nil {
-					_, callerOwned, err := lv.Value(nil)
+				lvClone, b = kv.V.Clone(b, &fetchers[n])
+				if kv.V.Fetcher != nil {
+					_, callerOwned, err := kv.V.Value(nil)
 					require.False(t, callerOwned)
 					require.NoError(t, err)
 				}
@@ -397,7 +510,11 @@ func TestWriterWithValueBlocks(t *testing.T) {
 
 				} else {
 					require.False(t, callerOwned)
-					fmt.Fprintf(&buf, "(in-place: len %d): %s\n", values[i].Len(), string(v))
+					if values[i].Len() > 0 {
+						fmt.Fprintf(&buf, "(in-place: len %d): %s\n", values[i].Len(), string(v))
+					} else {
+						fmt.Fprintf(&buf, "(in-place: len %d):\n", values[i].Len())
+					}
 				}
 			}
 			return buf.String()
@@ -413,40 +530,46 @@ func testBlockBufClear(t *testing.T, b1, b2 *blockBuf) {
 }
 
 func TestBlockBufClear(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	b1 := &blockBuf{}
 	b1.tmp[0] = 1
-	b1.compressedBuf = make([]byte, 1)
+	b1.dataBuf = make([]byte, 1)
 	b1.clear()
 	testBlockBufClear(t, b1, &blockBuf{})
 }
 
 func TestClearDataBlockBuf(t *testing.T) {
-	d := newDataBlockBuf(1, ChecksumTypeCRC32c)
-	d.blockBuf.compressedBuf = make([]byte, 1)
-	d.dataBlock.add(ikey("apple"), nil)
-	d.dataBlock.add(ikey("banana"), nil)
+	defer leaktest.AfterTest(t)()
+	d := newDataBlockBuf(1, block.ChecksumTypeCRC32c)
+	d.blockBuf.dataBuf = make([]byte, 1)
+	d.dataBlock.Add(ikey("apple"), nil)
+	d.dataBlock.Add(ikey("banana"), nil)
 
 	d.clear()
-	testBlockCleared(t, &d.dataBlock, &blockWriter{})
 	testBlockBufClear(t, &d.blockBuf, &blockBuf{})
 
 	dataBlockBufPool.Put(d)
 }
 
 func TestClearIndexBlockBuf(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	i := newIndexBlockBuf(false)
-	i.block.add(ikey("apple"), nil)
-	i.block.add(ikey("banana"), nil)
+	i.block.Add(ikey("apple"), nil)
+	i.block.Add(ikey("banana"), nil)
 	i.clear()
 
-	testBlockCleared(t, &i.block, &blockWriter{})
 	require.Equal(
-		t, i.size.estimate, sizeEstimate{emptySize: emptyBlockSize},
+		t, i.size.estimate, sizeEstimate{emptySize: rowblk.EmptySize},
 	)
 	indexBlockBufPool.Put(i)
 }
 
+func ikey(s string) base.InternalKey {
+	return base.InternalKey{UserKey: []byte(s)}
+}
+
 func TestClearWriteTask(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	w := writeTaskPool.Get().(*writeTask)
 	ch := make(chan bool, 1)
 	w.compressionDone = ch
@@ -474,25 +597,32 @@ func TestClearWriteTask(t *testing.T) {
 }
 
 func TestDoubleClose(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
 	// There is code in Cockroach land which relies on Writer.Close being
 	// idempotent. We should test this in Pebble, so that we don't cause
 	// Cockroach test failures.
-	f := &discardFile{}
-	w := NewWriter(f, WriterOptions{
-		BlockSize:   1,
-		TableFormat: TableFormatPebblev1,
-	})
-	w.Set(ikey("a").UserKey, nil)
-	w.Set(ikey("b").UserKey, nil)
-	err := w.Close()
-	require.NoError(t, err)
-	err = w.Close()
-	require.Equal(t, err, errWriterClosed)
+	for format := TableFormatMinSupported; format <= TableFormatMax; format++ {
+		t.Run(format.String(), func(t *testing.T) {
+			f := &discardFile{}
+			w := NewWriter(f, WriterOptions{
+				BlockSize:   1,
+				TableFormat: format,
+			})
+			w.Set(ikey("a").UserKey, nil)
+			w.Set(ikey("b").UserKey, nil)
+			err := w.Close()
+			require.NoError(t, err)
+			err = w.Close()
+			require.Equal(t, err, errWriterClosed)
+		})
+	}
 }
 
 func TestParallelWriterErrorProp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	fs := vfs.NewMem()
-	f, err := fs.Create("test")
+	f, err := fs.Create("test", vfs.WriteCategoryUnspecified)
 	require.NoError(t, err)
 	opts := WriterOptions{
 		TableFormat: TableFormatPebblev1, BlockSize: 1, Parallelism: true,
@@ -501,7 +631,7 @@ func TestParallelWriterErrorProp(t *testing.T) {
 	w := NewWriter(objstorageprovider.NewFileWritable(f), opts)
 	// Directly testing this, because it's difficult to get the Writer to
 	// encounter an error, precisely when the writeQueue is doing block writes.
-	w.coordination.writeQueue.err = errors.New("write queue write error")
+	w.rw.(*RawRowWriter).coordination.writeQueue.err = errors.New("write queue write error")
 	w.Set(ikey("a").UserKey, nil)
 	w.Set(ikey("b").UserKey, nil)
 	err = w.Close()
@@ -509,6 +639,7 @@ func TestParallelWriterErrorProp(t *testing.T) {
 }
 
 func TestSizeEstimate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	var sizeEstimate sizeEstimate
 	datadriven.RunTest(t, "testdata/size_estimate",
 		func(t *testing.T, td *datadriven.TestData) string {
@@ -565,32 +696,41 @@ func TestSizeEstimate(t *testing.T) {
 }
 
 func TestWriterClearCache(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	// Verify that Writer clears the cache of blocks that it writes.
 	mem := vfs.NewMem()
-	opts := ReaderOptions{
-		Cache:    cache.New(64 << 20),
-		Comparer: testkeys.Comparer,
+
+	cacheOpts := sstableinternal.CacheOptions{
+		Cache:   cache.New(64 << 20),
+		CacheID: 1,
+		FileNum: 1,
 	}
-	defer opts.Cache.Unref()
+	defer cacheOpts.Cache.Unref()
+
+	readerOpts := ReaderOptions{
+		ReaderOptions: block.ReaderOptions{CacheOpts: cacheOpts},
+		Comparer:      testkeys.Comparer,
+	}
 
 	writerOpts := WriterOptions{
-		Cache:       opts.Cache,
 		Comparer:    testkeys.Comparer,
 		TableFormat: TableFormatPebblev3,
+		internal: sstableinternal.WriterOptions{
+			CacheOpts: cacheOpts,
+		},
 	}
-	cacheOpts := &cacheOpts{cacheID: 1, fileNum: base.FileNum(1).DiskFileNum()}
 	invalidData := func() *cache.Value {
 		invalid := []byte("invalid data")
 		v := cache.Alloc(len(invalid))
-		copy(v.Buf(), invalid)
+		copy(v.RawBuffer(), invalid)
 		return v
 	}
 
 	build := func(name string) {
-		f, err := mem.Create(name)
+		f, err := mem.Create(name, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 
-		w := NewWriter(objstorageprovider.NewFileWritable(f), writerOpts, cacheOpts)
+		w := NewWriter(objstorageprovider.NewFileWritable(f), writerOpts)
 		require.NoError(t, w.Set([]byte("hello"), []byte("world")))
 		require.NoError(t, w.Set([]byte("hello@42"), []byte("world@42")))
 		require.NoError(t, w.Set([]byte("hello@5"), []byte("world@5")))
@@ -604,21 +744,23 @@ func TestWriterClearCache(t *testing.T) {
 	f, err := mem.Open("test")
 	require.NoError(t, err)
 
-	r, err := newReader(f, opts)
+	r, err := newReader(f, readerOpts)
 	require.NoError(t, err)
 
 	layout, err := r.Layout()
 	require.NoError(t, err)
 
-	foreachBH := func(layout *Layout, f func(bh BlockHandle)) {
+	foreachBH := func(layout *Layout, f func(bh block.Handle)) {
 		for _, bh := range layout.Data {
-			f(bh.BlockHandle)
+			f(bh.Handle)
 		}
 		for _, bh := range layout.Index {
 			f(bh)
 		}
 		f(layout.TopIndex)
-		f(layout.Filter)
+		for _, nbh := range layout.Filter {
+			f(nbh.Handle)
+		}
 		f(layout.RangeDel)
 		for _, bh := range layout.ValueBlock {
 			f(bh)
@@ -631,8 +773,10 @@ func TestWriterClearCache(t *testing.T) {
 	}
 
 	// Poison the cache for each of the blocks.
-	poison := func(bh BlockHandle) {
-		opts.Cache.Set(cacheOpts.cacheID, cacheOpts.fileNum, bh.Offset, invalidData()).Release()
+	poison := func(bh block.Handle) {
+		v := invalidData()
+		cacheOpts.Cache.Set(cacheOpts.CacheID, cacheOpts.FileNum, bh.Offset, v)
+		v.Release()
 	}
 	foreachBH(layout, poison)
 
@@ -641,10 +785,10 @@ func TestWriterClearCache(t *testing.T) {
 	build("test")
 
 	// Verify that the written blocks have been cleared from the cache.
-	check := func(bh BlockHandle) {
-		h := opts.Cache.Get(cacheOpts.cacheID, cacheOpts.fileNum, bh.Offset)
-		if h.Get() != nil {
-			t.Fatalf("%d: expected cache to be cleared, but found %q", bh.Offset, h.Get())
+	check := func(bh block.Handle) {
+		cv := cacheOpts.Cache.Get(cacheOpts.CacheID, cacheOpts.FileNum, bh.Offset)
+		if cv != nil {
+			t.Fatalf("%d: expected cache to be cleared, but found %#v", bh.Offset, cv)
 		}
 	}
 	foreachBH(layout, check)
@@ -684,9 +828,18 @@ type testBlockPropCollector struct {
 	err     error
 }
 
+var _ BlockPropertyCollector = (*testBlockPropCollector)(nil)
+
 func (c *testBlockPropCollector) Name() string { return "testBlockPropCollector" }
 
-func (c *testBlockPropCollector) Add(_ InternalKey, _ []byte) error {
+func (c *testBlockPropCollector) AddPointKey(_ InternalKey, _ []byte) error {
+	if c.errSite == errSiteAdd {
+		return c.err
+	}
+	return nil
+}
+
+func (c *testBlockPropCollector) AddRangeKeys(_ Span) error {
 	if c.errSite == errSiteAdd {
 		return c.err
 	}
@@ -716,7 +869,18 @@ func (c *testBlockPropCollector) FinishTable(_ []byte) ([]byte, error) {
 	return nil, nil
 }
 
+func (c *testBlockPropCollector) AddCollectedWithSuffixReplacement(
+	oldProp []byte, oldSuffix, newSuffix []byte,
+) error {
+	return errors.Errorf("not implemented")
+}
+
+func (c *testBlockPropCollector) SupportsSuffixReplacement() bool {
+	return false
+}
+
 func TestWriterBlockPropertiesErrors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	blockPropErr := errors.Newf("block property collector failed")
 	testCases := []blockPropErrSite{
 		errSiteAdd,
@@ -738,10 +902,10 @@ func TestWriterBlockPropertiesErrors(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run("", func(t *testing.T) {
 			fs := vfs.NewMem()
-			f, err := fs.Create("test")
+			f, err := fs.Create("test", vfs.WriteCategoryUnspecified)
 			require.NoError(t, err)
 
-			w := NewWriter(objstorageprovider.NewFileWritable(f), WriterOptions{
+			w := NewRawWriter(objstorageprovider.NewFileWritable(f), WriterOptions{
 				BlockSize: 1,
 				BlockPropertyCollectors: []func() BlockPropertyCollector{
 					func() BlockPropertyCollector {
@@ -753,8 +917,13 @@ func TestWriterBlockPropertiesErrors(t *testing.T) {
 				},
 				TableFormat: TableFormatPebblev1,
 			})
+			defer func() {
+				if w != nil {
+					_ = w.Close()
+				}
+			}()
 
-			err = w.Add(k1, v1)
+			err = w.AddWithForceObsolete(k1, v1, false /* forceObsolete */)
 			switch tc {
 			case errSiteAdd:
 				require.Error(t, err)
@@ -763,24 +932,25 @@ func TestWriterBlockPropertiesErrors(t *testing.T) {
 			case errSiteFinishBlock:
 				require.NoError(t, err)
 				// Addition of a second key completes the first block.
-				err = w.Add(k2, v2)
+				err = w.AddWithForceObsolete(k2, v2, false /* forceObsolete */)
 				require.Error(t, err)
 				require.Equal(t, blockPropErr, err)
 				return
 			case errSiteFinishIndex:
 				require.NoError(t, err)
 				// Addition of a second key completes the first block.
-				err = w.Add(k2, v2)
+				err = w.AddWithForceObsolete(k2, v2, false /* forceObsolete */)
 				require.NoError(t, err)
 				// The index entry for the first block is added after the completion of
 				// the second block, which is triggered by adding a third key.
-				err = w.Add(k3, v3)
+				err = w.AddWithForceObsolete(k3, v3, false /* forceObsolete */)
 				require.Error(t, err)
 				require.Equal(t, blockPropErr, err)
 				return
 			}
 
 			err = w.Close()
+			w = nil
 			if tc == errSiteFinishTable {
 				require.Error(t, err)
 				require.Equal(t, blockPropErr, err)
@@ -792,6 +962,7 @@ func TestWriterBlockPropertiesErrors(t *testing.T) {
 }
 
 func TestWriter_TableFormatCompatibility(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		name        string
 		minFormat   TableFormat
@@ -805,7 +976,7 @@ func TestWriter_TableFormatCompatibility(t *testing.T) {
 				opts.BlockPropertyCollectors = []func() BlockPropertyCollector{
 					func() BlockPropertyCollector {
 						return NewBlockIntervalCollector(
-							"collector", &valueCharBlockIntervalCollector{charIdx: 0}, nil,
+							"collector", &valueCharIntervalMapper{charIdx: 0}, nil,
 						)
 					},
 				}
@@ -825,7 +996,7 @@ func TestWriter_TableFormatCompatibility(t *testing.T) {
 			for tf := TableFormatLevelDB; tf <= TableFormatMax; tf++ {
 				t.Run(tf.String(), func(t *testing.T) {
 					fs := vfs.NewMem()
-					f, err := fs.Create("sst")
+					f, err := fs.Create("sst", vfs.WriteCategoryUnspecified)
 					require.NoError(t, err)
 
 					opts := WriterOptions{TableFormat: tf}
@@ -854,11 +1025,12 @@ func TestWriter_TableFormatCompatibility(t *testing.T) {
 // Tests for races, such as https://github.com/cockroachdb/cockroach/issues/77194,
 // in the Writer.
 func TestWriterRace(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	ks := testkeys.Alpha(5)
 	ks = ks.EveryN(ks.Count() / 1_000)
 	keys := make([][]byte, ks.Count())
 	for ki := 0; ki < len(keys); ki++ {
-		keys[ki] = testkeys.Key(ks, ki)
+		keys[ki] = testkeys.Key(ks, int64(ki))
 	}
 	readerOpts := ReaderOptions{
 		Comparer: testkeys.Comparer,
@@ -869,22 +1041,20 @@ func TestWriterRace(t *testing.T) {
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
 		go func() {
-			val := make([]byte, rand.Intn(1000))
+			val := make([]byte, rand.IntN(1000))
 			opts := WriterOptions{
 				Comparer:    testkeys.Comparer,
-				BlockSize:   rand.Intn(1 << 10),
-				Compression: NoCompression,
+				BlockSize:   rand.IntN(1 << 10),
+				Compression: block.NoCompression,
 			}
 			defer wg.Done()
-			f := &memFile{}
-			w := NewWriter(f, opts)
+			f := &objstorage.MemObj{}
+			w := newRowWriter(f, opts)
 			for ki := 0; ki < len(keys); ki++ {
-				require.NoError(
-					t,
-					w.Add(base.MakeInternalKey(keys[ki], uint64(ki), InternalKeyKindSet), val),
-				)
+				require.NoError(t, w.AddWithForceObsolete(
+					base.MakeInternalKey(keys[ki], base.SeqNum(ki), InternalKeyKindSet), val, false /* forceObsolete */))
 				require.Equal(
-					t, w.dataBlockBuf.dataBlock.getCurKey().UserKey, keys[ki],
+					t, w.dataBlockBuf.dataBlock.CurKey().UserKey, keys[ki],
 				)
 			}
 			require.NoError(t, w.Close())
@@ -892,13 +1062,13 @@ func TestWriterRace(t *testing.T) {
 			r, err := NewMemReader(f.Data(), readerOpts)
 			require.NoError(t, err)
 			defer r.Close()
-			it, err := r.NewIter(nil, nil)
+			it, err := r.NewIter(NoTransforms, nil, nil)
 			require.NoError(t, err)
 			defer it.Close()
 			ki := 0
-			for k, v := it.First(); k != nil; k, v = it.Next() {
-				require.Equal(t, k.UserKey, keys[ki])
-				vBytes, _, err := v.Value(nil)
+			for kv := it.First(); kv != nil; kv = it.Next() {
+				require.Equal(t, kv.K.UserKey, keys[ki])
+				vBytes, _, err := kv.Value(nil)
 				require.NoError(t, err)
 				require.Equal(t, vBytes, val)
 				ki++
@@ -909,6 +1079,7 @@ func TestWriterRace(t *testing.T) {
 }
 
 func TestObsoleteBlockPropertyCollectorFilter(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	var c obsoleteKeyBlockPropertyCollector
 	var f obsoleteKeyBlockPropertyFilter
 	require.Equal(t, c.Name(), f.Name())
@@ -983,7 +1154,7 @@ func BenchmarkWriter(b *testing.B) {
 		binary.BigEndian.PutUint64(key[16:], uint64(i))
 		keys[i] = key
 	}
-	for _, format := range []TableFormat{TableFormatPebblev2, TableFormatPebblev3} {
+	for _, format := range []TableFormat{TableFormatPebblev2, TableFormatPebblev3, TableFormatPebblev5} {
 		b.Run(fmt.Sprintf("format=%s", format.String()), func(b *testing.B) {
 			runWriterBench(b, keys, nil, format)
 		})
@@ -991,31 +1162,30 @@ func BenchmarkWriter(b *testing.B) {
 }
 
 func BenchmarkWriterWithVersions(b *testing.B) {
-	keys := make([][]byte, 1e6)
-	const keyLen = 26
-	keySlab := make([]byte, keyLen*len(keys))
-	for i := range keys {
-		key := keySlab[i*keyLen : i*keyLen+keyLen]
-		binary.BigEndian.PutUint64(key[:8], 123) // 16-byte shared prefix
-		binary.BigEndian.PutUint64(key[8:16], 456)
-		// @ is ascii value 64. Placing any byte with value 64 in these 8 bytes
-		// will confuse testkeys.Comparer, when we pass it a key after splitting
-		// of the suffix, since Comparer thinks this prefix is also a key with a
-		// suffix. Hence, we print as a base 10 string.
-		require.Equal(b, 8, copy(key[16:], fmt.Sprintf("%8d", i/2)))
-		key[24] = '@'
-		// Ascii representation of single digit integer 2-(i%2).
-		key[25] = byte(48 + 2 - (i % 2))
-		keys[i] = key
-	}
-	// TableFormatPebblev3 can sometimes be ~50% slower than
-	// TableFormatPebblev2, since testkeys.Compare is expensive (mainly due to
-	// split) and with v3 we have to call it twice for 50% of the Set calls,
-	// since they have the same prefix as the preceding key.
-	for _, format := range []TableFormat{TableFormatPebblev2, TableFormatPebblev3} {
-		b.Run(fmt.Sprintf("format=%s", format.String()), func(b *testing.B) {
-			runWriterBench(b, keys, testkeys.Comparer, format)
-		})
+	for _, valsPerKey := range []int{1, 10, 10000} {
+		keys := make([][]byte, 1e6)
+		const slabSize = 1e6
+		var keySlab []byte
+		for i := range keys {
+			// Use a 16-byte common prefix.
+			keyStr := fmt.Sprintf("0123456789abcd-%08d@%d", i/valsPerKey, valsPerKey+1-i%valsPerKey)
+			if len(keySlab) < len(keyStr) {
+				keySlab = make([]byte, slabSize)
+			}
+			key := keySlab[:len(keyStr)]
+			keySlab = keySlab[len(keyStr):]
+			copy(key, keyStr)
+			keys[i] = key
+		}
+		// TableFormatPebblev3 can sometimes be ~50% slower than
+		// TableFormatPebblev2, since testkeys.Compare is expensive (mainly due to
+		// split) and with v3 we have to call it twice for 50% of the Set calls,
+		// since they have the same prefix as the preceding key.
+		for _, format := range []TableFormat{TableFormatPebblev2, TableFormatPebblev3, TableFormatPebblev5} {
+			b.Run(fmt.Sprintf("vals-per-key=%d/format=%s", valsPerKey, format.String()), func(b *testing.B) {
+				runWriterBench(b, keys, testkeys.Comparer, format)
+			})
+		}
 	}
 }
 
@@ -1024,7 +1194,7 @@ func runWriterBench(b *testing.B, keys [][]byte, comparer *base.Comparer, format
 		b.Run(fmt.Sprintf("block=%s", humanize.Bytes.Int64(int64(bs))), func(b *testing.B) {
 			for _, filter := range []bool{true, false} {
 				b.Run(fmt.Sprintf("filter=%t", filter), func(b *testing.B) {
-					for _, comp := range []Compression{NoCompression, SnappyCompression, ZstdCompression} {
+					for _, comp := range []block.Compression{block.NoCompression, block.SnappyCompression, block.ZstdCompression} {
 						b.Run(fmt.Sprintf("compression=%s", comp), func(b *testing.B) {
 							opts := WriterOptions{
 								BlockRestartInterval: 16,
@@ -1042,11 +1212,17 @@ func runWriterBench(b *testing.B, keys [][]byte, comparer *base.Comparer, format
 								f.wrote = 0
 								w := NewWriter(f, opts)
 
+								var sum uint64
 								for j := range keys {
+									// In a compaction, we also call EstimatedSize before writing
+									// each key (to decide when to split output tables). Do it
+									// here as well.
+									sum += w.rw.EstimatedSize()
 									if err := w.Set(keys[j], keys[j]); err != nil {
 										b.Fatal(err)
 									}
 								}
+								fmt.Fprint(io.Discard, sum)
 								if err := w.Close(); err != nil {
 									b.Fatal(err)
 								}
@@ -1058,18 +1234,4 @@ func runWriterBench(b *testing.B, keys [][]byte, comparer *base.Comparer, format
 			}
 		})
 	}
-}
-
-var test4bSuffixComparer = &base.Comparer{
-	Compare:   base.DefaultComparer.Compare,
-	Equal:     base.DefaultComparer.Equal,
-	Separator: base.DefaultComparer.Separator,
-	Successor: base.DefaultComparer.Successor,
-	Split: func(key []byte) int {
-		if len(key) > 4 {
-			return len(key) - 4
-		}
-		return len(key)
-	},
-	Name: "comparer-split-4b-suffix",
 }

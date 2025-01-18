@@ -5,23 +5,30 @@
 package pebble
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"math/rand/v2"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/itertest"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
-	"github.com/cockroachdb/pebble/internal/rangedel"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
+	"github.com/cockroachdb/pebble/internal/testkeys"
+	"github.com/cockroachdb/pebble/internal/testutils/indenttree"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 func TestMergingIter(t *testing.T) {
@@ -34,9 +41,9 @@ func TestMergingIter(t *testing.T) {
 		// Shuffle testKeyValuePairs into one or more splits. Each individual
 		// split is in increasing order, but different splits may overlap in
 		// range. Some of the splits may be empty.
-		splits := make([][]string, 1+r.Intn(2+len(testKeyValuePairs)))
+		splits := make([][]string, 1+r.IntN(2+len(testKeyValuePairs)))
 		for _, kv := range testKeyValuePairs {
-			j := r.Intn(len(splits))
+			j := r.IntN(len(splits))
 			splits[j] = append(splits[j], kv)
 		}
 		return splits
@@ -54,20 +61,19 @@ func TestMergingIterSeek(t *testing.T) {
 		case "iter":
 			var iters []internalIterator
 			for _, line := range strings.Split(def, "\n") {
-				f := &fakeIter{}
+				var kvs []base.InternalKV
 				for _, key := range strings.Fields(line) {
 					j := strings.Index(key, ":")
-					f.keys = append(f.keys, base.ParseInternalKey(key[:j]))
-					f.vals = append(f.vals, []byte(key[j+1:]))
+					kvs = append(kvs, base.MakeInternalKV(base.ParseInternalKey(key[:j]), []byte(key[j+1:])))
 				}
-				iters = append(iters, f)
+				iters = append(iters, base.NewFakeIter(kvs))
 			}
 
 			var stats base.InternalIteratorStats
 			iter := newMergingIter(nil /* logger */, &stats, DefaultComparer.Compare,
 				func(a []byte) int { return len(a) }, iters...)
 			defer iter.Close()
-			return runInternalIterCmd(t, d, iter)
+			return itertest.RunInternalIterCmd(t, d, iter)
 
 		default:
 			return fmt.Sprintf("unknown command: %s", d.Cmd)
@@ -113,20 +119,19 @@ func TestMergingIterNextPrev(t *testing.T) {
 				case "iter":
 					iters := make([]internalIterator, len(c))
 					for i := range c {
-						f := &fakeIter{}
-						iters[i] = f
+						var kvs []base.InternalKV
 						for _, key := range strings.Fields(c[i]) {
 							j := strings.Index(key, ":")
-							f.keys = append(f.keys, base.ParseInternalKey(key[:j]))
-							f.vals = append(f.vals, []byte(key[j+1:]))
+							kvs = append(kvs, base.MakeInternalKV(base.ParseInternalKey(key[:j]), []byte(key[j+1:])))
 						}
+						iters[i] = base.NewFakeIter(kvs)
 					}
 
 					var stats base.InternalIteratorStats
 					iter := newMergingIter(nil /* logger */, &stats, DefaultComparer.Compare,
 						func(a []byte) int { return len(a) }, iters...)
 					defer iter.Close()
-					return runInternalIterCmd(t, d, iter)
+					return itertest.RunInternalIterCmd(t, d, iter)
 
 				default:
 					return fmt.Sprintf("unknown command: %s", d.Cmd)
@@ -136,122 +141,154 @@ func TestMergingIterNextPrev(t *testing.T) {
 	}
 }
 
-func TestMergingIterCornerCases(t *testing.T) {
+func TestMergingIterDataDriven(t *testing.T) {
 	memFS := vfs.NewMem()
 	cmp := DefaultComparer.Compare
 	fmtKey := DefaultComparer.FormatKey
 	opts := (*Options)(nil).EnsureDefaults()
 	var v *version
+	var buf bytes.Buffer
 
-	// Indexed by fileNum.
-	var readers []*sstable.Reader
+	// Indexed by FileNum.
+	readers := make(map[base.FileNum]*sstable.Reader)
 	defer func() {
 		for _, r := range readers {
 			r.Close()
 		}
 	}()
+	parser := itertest.NewParser()
 
-	var fileNum base.FileNum
+	var (
+		pointProbes    map[base.FileNum][]itertest.Probe
+		rangeDelProbes map[base.FileNum][]keyspanProbe
+		fileNum        base.FileNum
+	)
 	newIters :=
-		func(_ context.Context, file *manifest.FileMetadata, opts *IterOptions, iio internalIterOpts,
-		) (internalIterator, keyspan.FragmentIterator, error) {
+		func(_ context.Context, file *manifest.FileMetadata, opts *IterOptions, iio internalIterOpts, kinds iterKinds,
+		) (iterSet, error) {
+			var set iterSet
+			var err error
 			r := readers[file.FileNum]
-			rangeDelIter, err := r.NewRawRangeDelIter()
-			if err != nil {
-				return nil, nil, err
+			if kinds.RangeDeletion() {
+				set.rangeDeletion, err = r.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, block.ReadEnv{Stats: iio.stats})
+				if err != nil {
+					return iterSet{}, errors.CombineErrors(err, set.CloseAll())
+				}
 			}
-			iter, err := r.NewIterWithBlockPropertyFilters(
-				opts.GetLowerBound(), opts.GetUpperBound(), nil, true /* useFilterBlock */, iio.stats,
-				sstable.TrivialReaderProvider{Reader: r})
-			if err != nil {
-				return nil, nil, err
+			if kinds.Point() {
+				set.point, err = r.NewPointIter(
+					context.Background(),
+					sstable.NoTransforms,
+					opts.GetLowerBound(), opts.GetUpperBound(), nil, sstable.AlwaysUseFilterBlock, block.ReadEnv{Stats: iio.stats, IterStats: nil}, sstable.MakeTrivialReaderProvider(r))
+				if err != nil {
+					return iterSet{}, errors.CombineErrors(err, set.CloseAll())
+				}
 			}
-			return iter, rangeDelIter, nil
+			set.point = itertest.Attach(set.point, itertest.ProbeState{Log: &buf}, pointProbes[file.FileNum]...)
+			set.rangeDeletion = attachKeyspanProbes(set.rangeDeletion, keyspanProbeContext{log: &buf}, rangeDelProbes[file.FileNum]...)
+			return set, nil
 		}
 
 	datadriven.RunTest(t, "testdata/merging_iter", func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "define":
-			lines := strings.Split(d.Input, "\n")
-
+			levels, err := indenttree.Parse(d.Input)
+			if err != nil {
+				d.Fatalf(t, "%v", err)
+			}
 			var files [numLevels][]*fileMetadata
-			var level int
-			for i := 0; i < len(lines); i++ {
-				line := lines[i]
-				line = strings.TrimSpace(line)
-				if line == "L" || line == "L0" {
-					// start next level
-					level++
-					continue
+			for l := range levels {
+				if levels[l].Value() != "L" {
+					d.Fatalf(t, "top-level strings should be L")
 				}
-				keys := strings.Fields(line)
-				smallestKey := base.ParseInternalKey(keys[0])
-				largestKey := base.ParseInternalKey(keys[1])
-				m := (&fileMetadata{
-					FileNum: fileNum,
-				}).ExtendPointKeyBounds(cmp, smallestKey, largestKey)
-				m.InitPhysicalBacking()
-				files[level] = append(files[level], m)
+				for _, file := range levels[l].Children() {
+					m, err := manifest.ParseFileMetadataDebug(file.Value())
+					if err != nil {
+						d.Fatalf(t, "file metadata: %s", err)
+					}
+					files[l+1] = append(files[l+1], m)
 
-				i++
-				line = lines[i]
-				line = strings.TrimSpace(line)
-				name := fmt.Sprint(fileNum)
-				fileNum++
-				f, err := memFS.Create(name)
-				if err != nil {
-					return err.Error()
-				}
-				w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{})
-				var tombstones []keyspan.Span
-				frag := keyspan.Fragmenter{
-					Cmp:    cmp,
-					Format: fmtKey,
-					Emit: func(fragmented keyspan.Span) {
-						tombstones = append(tombstones, fragmented)
-					},
-				}
-				keyvalues := strings.Fields(line)
-				for _, kv := range keyvalues {
-					j := strings.Index(kv, ":")
-					ikey := base.ParseInternalKey(kv[:j])
-					value := []byte(kv[j+1:])
-					switch ikey.Kind() {
-					case InternalKeyKindRangeDelete:
-						frag.Add(keyspan.Span{Start: ikey.UserKey, End: value, Keys: []keyspan.Key{{Trailer: ikey.Trailer}}})
-					default:
-						if err := w.Add(ikey, value); err != nil {
+					name := fmt.Sprint(fileNum)
+					fileNum++
+					f, err := memFS.Create(name, vfs.WriteCategoryUnspecified)
+					if err != nil {
+						return err.Error()
+					}
+					w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{})
+					var tombstones []keyspan.Span
+					frag := keyspan.Fragmenter{
+						Cmp:    cmp,
+						Format: fmtKey,
+						Emit: func(fragmented keyspan.Span) {
+							tombstones = append(tombstones, fragmented)
+						},
+					}
+
+					for _, kvRow := range file.Children() {
+						for _, kv := range strings.Fields(kvRow.Value()) {
+							j := strings.Index(kv, ":")
+							ikey := base.ParseInternalKey(kv[:j])
+							value := []byte(kv[j+1:])
+							switch ikey.Kind() {
+							case InternalKeyKindRangeDelete:
+								frag.Add(keyspan.Span{Start: ikey.UserKey, End: value, Keys: []keyspan.Key{{Trailer: ikey.Trailer}}})
+							default:
+								if err := w.AddWithForceObsolete(ikey, value, false /* forceObsolete */); err != nil {
+									return err.Error()
+								}
+							}
+						}
+					}
+					frag.Finish()
+					for _, v := range tombstones {
+						if err := w.EncodeSpan(v); err != nil {
 							return err.Error()
 						}
 					}
-				}
-				frag.Finish()
-				for _, v := range tombstones {
-					if err := rangedel.Encode(&v, w.Add); err != nil {
+					if err := w.Close(); err != nil {
 						return err.Error()
 					}
+					f, err = memFS.Open(name)
+					if err != nil {
+						return err.Error()
+					}
+					readable, err := sstable.NewSimpleReadable(f)
+					if err != nil {
+						return err.Error()
+					}
+					r, err := sstable.NewReader(context.Background(), readable, opts.MakeReaderOptions())
+					if err != nil {
+						return err.Error()
+					}
+					readers[m.FileNum] = r
 				}
-				if err := w.Close(); err != nil {
-					return err.Error()
-				}
-				f, err = memFS.Open(name)
-				if err != nil {
-					return err.Error()
-				}
-				readable, err := sstable.NewSimpleReadable(f)
-				if err != nil {
-					return err.Error()
-				}
-				r, err := sstable.NewReader(readable, sstable.ReaderOptions{})
-				if err != nil {
-					return err.Error()
-				}
-				readers = append(readers, r)
 			}
-
 			v = newVersion(opts, files)
 			return v.String()
 		case "iter":
+			buf.Reset()
+			pointProbes = make(map[base.FileNum][]itertest.Probe, len(v.Levels))
+			rangeDelProbes = make(map[base.FileNum][]keyspanProbe, len(v.Levels))
+			for _, cmdArg := range d.CmdArgs {
+				switch key := cmdArg.Key; key {
+				case "probe-points":
+					i, err := strconv.Atoi(cmdArg.Vals[0][1:])
+					if err != nil {
+						require.NoError(t, err)
+					}
+					pointProbes[base.FileNum(i)] = itertest.MustParseProbes(parser, cmdArg.Vals[1:]...)
+				case "probe-rangedels":
+					i, err := strconv.Atoi(cmdArg.Vals[0][1:])
+					if err != nil {
+						require.NoError(t, err)
+					}
+					rangeDelProbes[base.FileNum(i)] = parseKeyspanProbes(cmdArg.Vals[1:]...)
+				default:
+					// Might be a command understood by the RunInternalIterCmd
+					// command, so don't error.
+				}
+			}
+
 			levelIters := make([]mergingIterLevel, 0, len(v.Levels))
 			var stats base.InternalIteratorStats
 			for i, l := range v.Levels {
@@ -260,18 +297,24 @@ func TestMergingIterCornerCases(t *testing.T) {
 					continue
 				}
 				li := &levelIter{}
-				li.init(context.Background(), IterOptions{}, cmp, func(a []byte) int { return len(a) },
+				li.init(context.Background(), IterOptions{}, testkeys.Comparer,
 					newIters, slice.Iter(), manifest.Level(i), internalIterOpts{stats: &stats})
+
 				i := len(levelIters)
 				levelIters = append(levelIters, mergingIterLevel{iter: li})
-				li.initRangeDel(&levelIters[i].rangeDelIter)
-				li.initBoundaryContext(&levelIters[i].levelIterBoundaryContext)
+				li.initRangeDel(&levelIters[i])
 			}
 			miter := &mergingIter{}
 			miter.init(nil /* opts */, &stats, cmp, func(a []byte) int { return len(a) }, levelIters...)
 			defer miter.Close()
 			miter.forceEnableSeekOpt = true
-			return runInternalIterCmd(t, d, miter, iterCmdVerboseKey, iterCmdStats(&stats))
+			// Exercise SetContext for fun
+			// (https://github.com/cockroachdb/pebble/pull/3037 caused a SIGSEGV due
+			// to a nil pointer dereference).
+			miter.SetContext(context.Background())
+			itertest.RunInternalIterCmdWriter(t, &buf, d, miter,
+				itertest.Verbose, itertest.WithStats(&stats))
+			return buf.String()
 		default:
 			return fmt.Sprintf("unknown command: %s", d.Cmd)
 		}
@@ -284,16 +327,16 @@ func buildMergingIterTables(
 	mem := vfs.NewMem()
 	files := make([]vfs.File, count)
 	for i := range files {
-		f, err := mem.Create(fmt.Sprintf("bench%d", i))
+		f, err := mem.Create(fmt.Sprintf("bench%d", i), vfs.WriteCategoryUnspecified)
 		if err != nil {
 			b.Fatal(err)
 		}
 		files[i] = f
 	}
 
-	writers := make([]*sstable.Writer, len(files))
+	writers := make([]sstable.RawWriter, len(files))
 	for i := range files {
-		writers[i] = sstable.NewWriter(objstorageprovider.NewFileWritable(files[i]), sstable.WriterOptions{
+		writers[i] = sstable.NewRawWriter(objstorageprovider.NewFileWritable(files[i]), sstable.WriterOptions{
 			BlockRestartInterval: restartInterval,
 			BlockSize:            blockSize,
 			Compression:          NoCompression,
@@ -315,9 +358,9 @@ func buildMergingIterTables(
 		key := []byte(fmt.Sprintf("%08d", i))
 		keys = append(keys, key)
 		ikey.UserKey = key
-		j := rand.Intn(len(writers))
+		j := rand.IntN(len(writers))
 		w := writers[j]
-		w.Add(ikey, nil)
+		w.AddWithForceObsolete(ikey, nil, false /* forceObsolete */)
 	}
 
 	for _, w := range writers {
@@ -325,9 +368,11 @@ func buildMergingIterTables(
 			b.Fatal(err)
 		}
 	}
+	c := NewCache(128 << 20 /* 128MB */)
+	defer c.Unref()
 
-	opts := sstable.ReaderOptions{Cache: NewCache(128 << 20)}
-	defer opts.Cache.Unref()
+	var opts sstable.ReaderOptions
+	opts.CacheOpts = sstableinternal.CacheOptions{Cache: c}
 
 	readers := make([]*sstable.Reader, len(files))
 	for i := range files {
@@ -339,7 +384,7 @@ func buildMergingIterTables(
 		if err != nil {
 			b.Fatal(err)
 		}
-		readers[i], err = sstable.NewReader(readable, opts)
+		readers[i], err = sstable.NewReader(context.Background(), readable, opts)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -365,17 +410,17 @@ func BenchmarkMergingIterSeekGE(b *testing.B) {
 							iters := make([]internalIterator, len(readers))
 							for i := range readers {
 								var err error
-								iters[i], err = readers[i].NewIter(nil /* lower */, nil /* upper */)
+								iters[i], err = readers[i].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
 								require.NoError(b, err)
 							}
 							var stats base.InternalIteratorStats
 							m := newMergingIter(nil /* logger */, &stats, DefaultComparer.Compare,
 								func(a []byte) int { return len(a) }, iters...)
-							rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+							rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 
 							b.ResetTimer()
 							for i := 0; i < b.N; i++ {
-								m.SeekGE(keys[rng.Intn(len(keys))], base.SeekGEFlagsNone)
+								m.SeekGE(keys[rng.IntN(len(keys))], base.SeekGEFlagsNone)
 							}
 							m.Close()
 						})
@@ -398,7 +443,7 @@ func BenchmarkMergingIterNext(b *testing.B) {
 							iters := make([]internalIterator, len(readers))
 							for i := range readers {
 								var err error
-								iters[i], err = readers[i].NewIter(nil /* lower */, nil /* upper */)
+								iters[i], err = readers[i].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
 								require.NoError(b, err)
 							}
 							var stats base.InternalIteratorStats
@@ -407,11 +452,11 @@ func BenchmarkMergingIterNext(b *testing.B) {
 
 							b.ResetTimer()
 							for i := 0; i < b.N; i++ {
-								key, _ := m.Next()
-								if key == nil {
-									key, _ = m.First()
+								kv := m.Next()
+								if kv == nil {
+									kv = m.First()
 								}
-								_ = key
+								_ = kv
 							}
 							m.Close()
 						})
@@ -434,7 +479,7 @@ func BenchmarkMergingIterPrev(b *testing.B) {
 							iters := make([]internalIterator, len(readers))
 							for i := range readers {
 								var err error
-								iters[i], err = readers[i].NewIter(nil /* lower */, nil /* upper */)
+								iters[i], err = readers[i].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
 								require.NoError(b, err)
 							}
 							var stats base.InternalIteratorStats
@@ -443,11 +488,11 @@ func BenchmarkMergingIterPrev(b *testing.B) {
 
 							b.ResetTimer()
 							for i := 0; i < b.N; i++ {
-								key, _ := m.Prev()
-								if key == nil {
-									key, _ = m.Last()
+								kv := m.Prev()
+								if kv == nil {
+									kv = m.Last()
 								}
-								_ = key
+								_ = kv
 							}
 							m.Close()
 						})
@@ -481,7 +526,7 @@ func buildLevelsForMergingIterSeqSeek(
 	files := make([][]vfs.File, levelCount)
 	for i := range files {
 		for j := 0; j < 2; j++ {
-			f, err := mem.Create(fmt.Sprintf("bench%d_%d", i, j))
+			f, err := mem.Create(fmt.Sprintf("bench%d_%d", i, j), vfs.WriteCategoryUnspecified)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -490,7 +535,7 @@ func buildLevelsForMergingIterSeqSeek(
 	}
 
 	const targetL6FirstFileSize = 2 << 20
-	writers := make([][]*sstable.Writer, levelCount)
+	writers := make([][]sstable.RawWriter, levelCount)
 	// A policy unlikely to have false positives.
 	filterPolicy := bloom.FilterPolicy(100)
 	for i := range files {
@@ -520,7 +565,7 @@ func buildLevelsForMergingIterSeqSeek(
 					writerOptions.IndexBlockSize = 1
 				}
 			}
-			writers[i] = append(writers[i], sstable.NewWriter(objstorageprovider.NewFileWritable(files[i][j]), writerOptions))
+			writers[i] = append(writers[i], sstable.NewRawWriter(objstorageprovider.NewFileWritable(files[i][j]), writerOptions))
 		}
 	}
 
@@ -530,23 +575,28 @@ func buildLevelsForMergingIterSeqSeek(
 		key := []byte(fmt.Sprintf("%08d", i))
 		keys = append(keys, key)
 		ikey := base.MakeInternalKey(key, 0, InternalKeyKindSet)
-		w.Add(ikey, nil)
+		require.NoError(b, w.AddWithForceObsolete(ikey, nil, false /* forceObsolete */))
 	}
 	if writeRangeTombstoneToLowestLevel {
-		tombstoneKey := base.MakeInternalKey(keys[0], 1, InternalKeyKindRangeDelete)
-		w.Add(tombstoneKey, []byte(fmt.Sprintf("%08d", i)))
+		require.NoError(b, w.EncodeSpan(keyspan.Span{
+			Start: keys[0],
+			End:   []byte(fmt.Sprintf("%08d", i)),
+			Keys: []keyspan.Key{{
+				Trailer: base.MakeTrailer(1, InternalKeyKindRangeDelete),
+			}},
+		}))
 	}
 	for j := 1; j < len(files); j++ {
 		for _, k := range []int{0, len(keys) - 1} {
-			ikey := base.MakeInternalKey(keys[k], uint64(j), InternalKeyKindSet)
-			writers[j][0].Add(ikey, nil)
+			ikey := base.MakeInternalKey(keys[k], base.SeqNum(j), InternalKeyKindSet)
+			require.NoError(b, writers[j][0].AddWithForceObsolete(ikey, nil, false /* forceObsolete */))
 		}
 	}
 	lastKey := []byte(fmt.Sprintf("%08d", i))
 	keys = append(keys, lastKey)
 	for j := 0; j < len(files); j++ {
-		lastIKey := base.MakeInternalKey(lastKey, uint64(j), InternalKeyKindSet)
-		writers[j][1].Add(lastIKey, nil)
+		lastIKey := base.MakeInternalKey(lastKey, base.SeqNum(j), InternalKeyKindSet)
+		require.NoError(b, writers[j][1].AddWithForceObsolete(lastIKey, nil, false /* forceObsolete */))
 	}
 	for _, levelWriters := range writers {
 		for j, w := range levelWriters {
@@ -561,12 +611,16 @@ func buildLevelsForMergingIterSeqSeek(
 		}
 	}
 
-	opts := sstable.ReaderOptions{Cache: NewCache(128 << 20), Comparer: DefaultComparer}
+	c := NewCache(128 << 20 /* 128MB */)
+	defer c.Unref()
+
+	opts := sstable.ReaderOptions{Comparer: DefaultComparer}
+	opts.CacheOpts = sstableinternal.CacheOptions{Cache: c}
+
 	if writeBloomFilters {
 		opts.Filters = make(map[string]FilterPolicy)
 		opts.Filters[filterPolicy.Name()] = filterPolicy
 	}
-	defer opts.Cache.Unref()
 
 	readers = make([][]*sstable.Reader, levelCount)
 	for i := range files {
@@ -579,7 +633,7 @@ func buildLevelsForMergingIterSeqSeek(
 			if err != nil {
 				b.Fatal(err)
 			}
-			r, err := sstable.NewReader(readable, opts)
+			r, err := sstable.NewReader(context.Background(), readable, opts)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -590,16 +644,16 @@ func buildLevelsForMergingIterSeqSeek(
 	for i := range readers {
 		meta := make([]*fileMetadata, len(readers[i]))
 		for j := range readers[i] {
-			iter, err := readers[i][j].NewIter(nil /* lower */, nil /* upper */)
+			iter, err := readers[i][j].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
 			require.NoError(b, err)
-			smallest, _ := iter.First()
+			smallest := iter.First()
 			meta[j] = &fileMetadata{}
 			// The same FileNum is being reused across different levels, which
 			// is harmless for the benchmark since each level has its own iterator
 			// creation func.
 			meta[j].FileNum = FileNum(j)
-			largest, _ := iter.Last()
-			meta[j].ExtendPointKeyBounds(opts.Comparer.Compare, smallest.Clone(), largest.Clone())
+			largest := iter.Last()
+			meta[j].ExtendPointKeyBounds(opts.Comparer.Compare, smallest.K.Clone(), largest.K.Clone())
 			meta[j].InitPhysicalBacking()
 		}
 		levelSlices[i] = manifest.NewLevelSliceSpecificOrder(meta)
@@ -613,30 +667,29 @@ func buildMergingIter(readers [][]*sstable.Reader, levelSlices []manifest.LevelS
 		levelIndex := i
 		level := len(readers) - 1 - i
 		newIters := func(
-			_ context.Context, file *manifest.FileMetadata, opts *IterOptions, _ internalIterOpts,
-		) (internalIterator, keyspan.FragmentIterator, error) {
+			_ context.Context, file *manifest.FileMetadata, opts *IterOptions, iio internalIterOpts, _ iterKinds,
+		) (iterSet, error) {
 			iter, err := readers[levelIndex][file.FileNum].NewIter(
-				opts.LowerBound, opts.UpperBound)
+				sstable.NoTransforms, opts.LowerBound, opts.UpperBound)
 			if err != nil {
-				return nil, nil, err
+				return iterSet{}, err
 			}
-			rdIter, err := readers[levelIndex][file.FileNum].NewRawRangeDelIter()
+			rdIter, err := readers[levelIndex][file.FileNum].NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, block.ReadEnv{Stats: iio.stats})
 			if err != nil {
 				iter.Close()
-				return nil, nil, err
+				return iterSet{}, err
 			}
-			return iter, rdIter, err
+			return iterSet{point: iter, rangeDeletion: rdIter}, err
 		}
-		l := newLevelIter(IterOptions{}, DefaultComparer.Compare,
-			func(a []byte) int { return len(a) }, newIters, levelSlices[i].Iter(),
+		l := newLevelIter(
+			context.Background(), IterOptions{}, testkeys.Comparer, newIters, levelSlices[i].Iter(),
 			manifest.Level(level), internalIterOpts{})
-		l.initRangeDel(&mils[level].rangeDelIter)
-		l.initBoundaryContext(&mils[level].levelIterBoundaryContext)
+		l.initRangeDel(&mils[level])
 		mils[level].iter = l
 	}
 	var stats base.InternalIteratorStats
 	m := &mergingIter{}
-	m.init(nil /* logger */, &stats, DefaultComparer.Compare,
+	m.init(nil /* logger */, &stats, testkeys.Comparer.Compare,
 		func(a []byte) int { return len(a) }, mils...)
 	return m
 }
@@ -664,9 +717,9 @@ func BenchmarkMergingIterSeqSeekGEWithBounds(b *testing.B) {
 					pos := i % (keyCount - 1)
 					m.SetBounds(keys[pos], keys[pos+1])
 					// SeekGE will return keys[pos].
-					k, _ := m.SeekGE(keys[pos], base.SeekGEFlagsNone)
+					k := m.SeekGE(keys[pos], base.SeekGEFlagsNone)
 					for k != nil {
-						k, _ = m.Next()
+						k = m.Next()
 					}
 				}
 				m.Close()

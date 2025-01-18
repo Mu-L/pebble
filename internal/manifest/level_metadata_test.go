@@ -47,6 +47,7 @@ func TestLevelIterator(t *testing.T) {
 						)
 						m.SmallestSeqNum = m.Smallest.SeqNum()
 						m.LargestSeqNum = m.Largest.SeqNum()
+						m.LargestSeqNumAbsolute = m.LargestSeqNum
 						m.InitPhysicalBacking()
 						files = append(files, m)
 					}
@@ -130,6 +131,8 @@ func runIterCmd(t *testing.T, d *datadriven.TestData, iter LevelIterator, verbos
 		default:
 			return fmt.Sprintf("unknown command %q", parts[0])
 		}
+		buf.WriteString(line)
+		buf.WriteString(": ")
 		if m == nil {
 			fmt.Fprintln(&buf, ".")
 		} else {

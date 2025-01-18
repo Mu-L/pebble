@@ -45,13 +45,13 @@ package arenaskl // import "github.com/cockroachdb/pebble/internal/arenaskl"
 
 import (
 	"math"
+	"math/rand/v2"
 	"runtime"
 	"sync/atomic"
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
-	"github.com/cockroachdb/pebble/internal/fastrand"
 )
 
 const (
@@ -307,10 +307,9 @@ func (s *Skiplist) NewIter(lower, upper []byte) *Iterator {
 // NewFlushIter returns a new flushIterator, which is similar to an Iterator
 // but also sets the current number of the bytes that have been iterated
 // through.
-func (s *Skiplist) NewFlushIter(bytesFlushed *uint64) base.InternalIterator {
+func (s *Skiplist) NewFlushIter() base.InternalIterator {
 	return &flushIterator{
-		Iterator:      Iterator{list: s, nd: s.head},
-		bytesIterated: bytesFlushed,
+		Iterator: Iterator{list: s, nd: s.head},
 	}
 }
 
@@ -338,7 +337,7 @@ func (s *Skiplist) newNode(
 }
 
 func (s *Skiplist) randomHeight() uint32 {
-	rnd := fastrand.Uint32()
+	rnd := rand.Uint32()
 
 	h := uint32(1)
 	for h < maxHeight && rnd <= probabilities[h] {

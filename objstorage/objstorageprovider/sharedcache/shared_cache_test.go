@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"strconv"
 	"sync"
 	"testing"
@@ -17,7 +18,6 @@ import (
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/sharedcache"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 func TestSharedCache(t *testing.T) {
@@ -62,7 +62,7 @@ func TestSharedCache(t *testing.T) {
 			case "write":
 				size := mustParseBytesArg(t, d, "size")
 
-				writable, _, err := provider.Create(ctx, base.FileTypeTable, base.FileNum(1).DiskFileNum(), objstorage.CreateOptions{})
+				writable, _, err := provider.Create(ctx, base.FileTypeTable, base.DiskFileNum(1), objstorage.CreateOptions{})
 				require.NoError(t, err)
 				defer writable.Finish()
 
@@ -80,11 +80,11 @@ func TestSharedCache(t *testing.T) {
 
 				return ""
 			case "read", "read-for-compaction":
-				missesBefore := cache.Misses()
+				missesBefore := cache.Metrics().ReadsWithPartialHit + cache.Metrics().ReadsWithNoHit
 				offset := mustParseBytesArg(t, d, "offset")
 				size := mustParseBytesArg(t, d, "size")
 
-				readable, err := provider.OpenForReading(ctx, base.FileTypeTable, base.FileNum(1).DiskFileNum(), objstorage.OpenOptions{})
+				readable, err := provider.OpenForReading(ctx, base.FileTypeTable, base.DiskFileNum(1), objstorage.OpenOptions{})
 				require.NoError(t, err)
 				defer readable.Close()
 
@@ -92,7 +92,7 @@ func TestSharedCache(t *testing.T) {
 				flags := sharedcache.ReadFlags{
 					ReadOnly: d.Cmd == "read-for-compaction",
 				}
-				err = cache.ReadAt(ctx, base.FileNum(1).DiskFileNum(), got, int64(offset), readable, readable.Size(), flags)
+				err = cache.ReadAt(ctx, base.DiskFileNum(1), got, int64(offset), readable, readable.Size(), flags)
 				// We always expect cache.ReadAt to succeed.
 				require.NoError(t, err)
 				// It is easier to assert this condition programmatically, rather than returning
@@ -105,7 +105,7 @@ func TestSharedCache(t *testing.T) {
 
 				// TODO(josh): Not tracing out filesystem activity here, since logging_fs.go
 				// doesn't trace calls to ReadAt or WriteAt. We should consider changing this.
-				missesAfter := cache.Misses()
+				missesAfter := cache.Metrics().ReadsWithPartialHit + cache.Metrics().ReadsWithNoHit
 				return fmt.Sprintf("misses=%d", missesAfter-missesBefore)
 			default:
 				d.Fatalf(t, "unknown command %s", d.Cmd)
@@ -128,7 +128,7 @@ func TestSharedCacheRandomized(t *testing.T) {
 
 	seed := uint64(time.Now().UnixNano())
 	fmt.Printf("seed: %v\n", seed)
-	rand.Seed(seed)
+	rng := rand.New(rand.NewPCG(0, seed))
 
 	helper := func(
 		blockSize int,
@@ -136,22 +136,23 @@ func TestSharedCacheRandomized(t *testing.T) {
 		return func(t *testing.T) {
 			for _, concurrentReads := range []bool{false, true} {
 				t.Run(fmt.Sprintf("concurrentReads=%v", concurrentReads), func(t *testing.T) {
-					maxShards := 64
+					maxShards := 32
 					if invariants.RaceEnabled {
 						maxShards = 8
 					}
-					numShards := rand.Intn(maxShards) + 1
+					numShards := rng.IntN(maxShards) + 1
 					cacheSize := shardingBlockSize * int64(numShards) // minimum allowed cache size
 
 					cache, err := sharedcache.Open(fs, base.DefaultLogger, "", blockSize, shardingBlockSize, cacheSize, numShards)
 					require.NoError(t, err)
 					defer cache.Close()
 
-					writable, _, err := provider.Create(ctx, base.FileTypeTable, base.FileNum(1).DiskFileNum(), objstorage.CreateOptions{})
+					writable, _, err := provider.Create(ctx, base.FileTypeTable, base.DiskFileNum(1), objstorage.CreateOptions{})
 					require.NoError(t, err)
 
 					// With invariants on, Write will modify its input buffer.
-					size := rand.Int63n(cacheSize)
+					// If size == 0, we can see panics below, so force a nonzero size.
+					size := rng.Int64N(cacheSize-1) + 1
 					objData := make([]byte, size)
 					wrote := make([]byte, size)
 					for i := 0; i < int(size); i++ {
@@ -162,7 +163,7 @@ func TestSharedCacheRandomized(t *testing.T) {
 					require.NoError(t, writable.Write(wrote))
 					require.NoError(t, writable.Finish())
 
-					readable, err := provider.OpenForReading(ctx, base.FileTypeTable, base.FileNum(1).DiskFileNum(), objstorage.OpenOptions{})
+					readable, err := provider.OpenForReading(ctx, base.FileTypeTable, base.DiskFileNum(1), objstorage.OpenOptions{})
 					require.NoError(t, err)
 					defer readable.Close()
 
@@ -170,22 +171,21 @@ func TestSharedCacheRandomized(t *testing.T) {
 					wg := sync.WaitGroup{}
 					for i := 0; i < numDistinctReads; i++ {
 						wg.Add(1)
-						go func() {
+						go func(offset int64) {
 							defer wg.Done()
-							offset := rand.Int63n(size)
 
 							got := make([]byte, size-offset)
-							err := cache.ReadAt(ctx, base.FileNum(1).DiskFileNum(), got, offset, readable, readable.Size(), sharedcache.ReadFlags{})
+							err := cache.ReadAt(ctx, base.DiskFileNum(1), got, offset, readable, readable.Size(), sharedcache.ReadFlags{})
 							require.NoError(t, err)
 							require.Equal(t, objData[int(offset):], got)
 
 							got = make([]byte, size-offset)
-							err = cache.ReadAt(ctx, base.FileNum(1).DiskFileNum(), got, offset, readable, readable.Size(), sharedcache.ReadFlags{})
+							err = cache.ReadAt(ctx, base.DiskFileNum(1), got, offset, readable, readable.Size(), sharedcache.ReadFlags{})
 							require.NoError(t, err)
 							require.Equal(t, objData[int(offset):], got)
-						}()
+						}(rng.Int64N(size))
 						// If concurrent reads, only wait 50% of loop iterations on average.
-						if concurrentReads && rand.Intn(2) == 0 {
+						if concurrentReads && rng.Int64N(2) == 0 {
 							wg.Wait()
 						}
 						if !concurrentReads {
@@ -202,11 +202,11 @@ func TestSharedCacheRandomized(t *testing.T) {
 
 	if !invariants.RaceEnabled {
 		for i := 0; i < 5; i++ {
-			exp := rand.Intn(11) + 10   // [10, 20]
+			exp := rng.IntN(11) + 10    // [10, 20]
 			randomBlockSize := 1 << exp // [1 KB, 1 MB]
 
-			factor := rand.Intn(10) + 1                                // [1, 10]
-			randomShardingBlockSize := int64(randomBlockSize * factor) // [1 KB, 10 MB]
+			factor := rng.IntN(4) + 1                                  // [1, 4]
+			randomShardingBlockSize := int64(randomBlockSize * factor) // [1 KB, 4 MB]
 
 			t.Run("random block and sharding block size", helper(randomBlockSize, randomShardingBlockSize))
 		}

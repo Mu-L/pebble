@@ -8,8 +8,10 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 
+	"github.com/cockroachdb/crlib/crtime"
+	"github.com/cockroachdb/pebble/batchrepr"
+	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/record"
 )
 
@@ -66,7 +68,7 @@ func (q *commitQueue) enqueue(b *Batch) {
 	}
 	slot := &q.slots[head&uint32(len(q.slots)-1)]
 
-	// Check if the head slot has been released by dequeue.
+	// Check if the head slot has been released by dequeueApplied.
 	for slot.Load() != nil {
 		// Another goroutine is still cleaning up the tail, so the queue is
 		// actually still full. We spin because this should resolve itself
@@ -77,12 +79,16 @@ func (q *commitQueue) enqueue(b *Batch) {
 	// The head slot is free, so we own it.
 	slot.Store(b)
 
-	// Increment head. This passes ownership of slot to dequeue and acts as a
+	// Increment head. This passes ownership of slot to dequeueApplied and acts as a
 	// store barrier for writing the slot.
 	q.headTail.Add(1 << dequeueBits)
 }
 
-func (q *commitQueue) dequeue() *Batch {
+// dequeueApplied removes the earliest enqueued Batch, if it is applied.
+//
+// Returns nil if the commit queue is empty or the earliest Batch is not yet
+// applied.
+func (q *commitQueue) dequeueApplied() *Batch {
 	for {
 		ptrs := q.headTail.Load()
 		head, tail := q.unpack(ptrs)
@@ -121,10 +127,10 @@ func (q *commitQueue) dequeue() *Batch {
 type commitEnv struct {
 	// The next sequence number to give to a batch. Protected by
 	// commitPipeline.mu.
-	logSeqNum *atomic.Uint64
+	logSeqNum *base.AtomicSeqNum
 	// The visible sequence number at which reads should be performed. Ratcheted
 	// upwards atomically as batches are applied to the memtable.
-	visibleSeqNum *atomic.Uint64
+	visibleSeqNum *base.AtomicSeqNum
 
 	// Apply the batch to the specified memtable. Called concurrently.
 	apply func(b *Batch, mem *memTable) error
@@ -294,13 +300,13 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {
 		return nil
 	}
 
-	commitStartTime := time.Now()
+	commitStartTime := crtime.NowMono()
 	// Acquire semaphores.
 	p.commitQueueSem <- struct{}{}
 	if syncWAL {
 		p.logSyncQSem <- struct{}{}
 	}
-	b.commitStats.SemaphoreWaitDuration = time.Since(commitStartTime)
+	b.commitStats.SemaphoreWaitDuration = commitStartTime.Elapsed()
 
 	// Prepare the batch for committing: enqueuing the batch in the pending
 	// queue, determining the batch sequence number and writing the data to the
@@ -342,7 +348,7 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {
 	// b.commitErr. We will read b.commitErr in Batch.SyncWait after the
 	// LogWriter is done writing.
 
-	b.commitStats.TotalDuration = time.Since(commitStartTime)
+	b.commitStats.TotalDuration = commitStartTime.Elapsed()
 
 	return err
 }
@@ -355,18 +361,18 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {
 // invoked with commitPipeline.mu held, but note that DB.mu is not held and
 // must be locked if necessary.
 func (p *commitPipeline) AllocateSeqNum(
-	count int, prepare func(seqNum uint64), apply func(seqNum uint64),
+	count int, prepare func(seqNum base.SeqNum), apply func(seqNum base.SeqNum),
 ) {
 	// This method is similar to Commit and prepare. Be careful about trying to
 	// share additional code with those methods because Commit and prepare are
 	// performance critical code paths.
 
 	b := newBatch(nil)
-	defer b.release()
+	defer b.Close()
 
 	// Give the batch a count of 1 so that the log and visible sequence number
 	// are incremented correctly.
-	b.data = make([]byte, batchHeaderLen)
+	b.data = make([]byte, batchrepr.HeaderLen)
 	b.setCount(uint32(count))
 	b.commit.Add(1)
 
@@ -382,7 +388,7 @@ func (p *commitPipeline) AllocateSeqNum(
 	// Assign the batch a sequence number. Note that we use atomic operations
 	// here to handle concurrent reads of logSeqNum. commitPipeline.mu provides
 	// mutual exclusion for other goroutines writing to logSeqNum.
-	logSeqNum := p.env.logSeqNum.Add(uint64(count)) - uint64(count)
+	logSeqNum := p.env.logSeqNum.Add(base.SeqNum(count)) - base.SeqNum(count)
 	seqNum := logSeqNum
 	if seqNum == 0 {
 		// We can't use the value 0 for the global seqnum during ingestion, because
@@ -456,7 +462,7 @@ func (p *commitPipeline) prepare(b *Batch, syncWAL bool, noSyncWait bool) (*memT
 	// Assign the batch a sequence number. Note that we use atomic operations
 	// here to handle concurrent reads of logSeqNum. commitPipeline.mu provides
 	// mutual exclusion for other goroutines writing to logSeqNum.
-	b.setSeqNum(p.env.logSeqNum.Add(n) - n)
+	b.setSeqNum(p.env.logSeqNum.Add(base.SeqNum(n)) - base.SeqNum(n))
 
 	// Write the data to the WAL.
 	mem, err := p.env.write(b, syncWG, syncErr)
@@ -472,19 +478,19 @@ func (p *commitPipeline) publish(b *Batch) {
 
 	// Loop dequeuing applied batches from the pending queue. If our batch was
 	// the head of the pending queue we are guaranteed that either we'll publish
-	// it or someone else will dequeue and publish it. If our batch is not the
-	// head of the queue then either we'll dequeue applied batches and reach our
+	// it or someone else will dequeueApplied and publish it. If our batch is not the
+	// head of the queue then either we'll dequeueApplied applied batches and reach our
 	// batch or there is an unapplied batch blocking us. When that unapplied
 	// batch applies it will go through the same process and publish our batch
 	// for us.
 	for {
-		t := p.pending.dequeue()
+		t := p.pending.dequeueApplied()
 		if t == nil {
 			// Wait for another goroutine to publish us. We might also be waiting for
 			// the WAL sync to finish.
-			now := time.Now()
+			now := crtime.NowMono()
 			b.commit.Wait()
-			b.commitStats.CommitWaitDuration += time.Since(now)
+			b.commitStats.CommitWaitDuration += now.Elapsed()
 			break
 		}
 		if !t.applied.Load() {
@@ -497,7 +503,7 @@ func (p *commitPipeline) publish(b *Batch) {
 		// that the sequence number ratchets up.
 		for {
 			curSeqNum := p.env.visibleSeqNum.Load()
-			newSeqNum := t.SeqNum() + uint64(t.Count())
+			newSeqNum := t.SeqNum() + base.SeqNum(t.Count())
 			if newSeqNum <= curSeqNum {
 				// t's sequence number has already been published.
 				break

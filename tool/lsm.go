@@ -10,7 +10,7 @@ import (
 	"io"
 	"log"
 	"math"
-	"sort"
+	"slices"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
@@ -27,8 +27,9 @@ type lsmFileMetadata struct {
 	Size           uint64
 	Smallest       int // ID of smallest key
 	Largest        int // ID of largest key
-	SmallestSeqNum uint64
-	LargestSeqNum  uint64
+	SmallestSeqNum base.SeqNum
+	LargestSeqNum  base.SeqNum
+	Virtual        bool
 }
 
 type lsmVersionEdit struct {
@@ -44,7 +45,7 @@ type lsmVersionEdit struct {
 
 type lsmKey struct {
 	Pretty string
-	SeqNum uint64
+	SeqNum base.SeqNum
 	Kind   int
 }
 
@@ -53,7 +54,7 @@ type lsmState struct {
 	Edits     []lsmVersionEdit                 `json:",omitempty"`
 	Files     map[base.FileNum]lsmFileMetadata `json:",omitempty"`
 	Keys      []lsmKey                         `json:",omitempty"`
-	StartEdit int
+	StartEdit int64
 }
 
 type lsmT struct {
@@ -66,9 +67,9 @@ type lsmT struct {
 	fmtKey    keyFormatter
 	embed     bool
 	pretty    bool
-	startEdit int
-	endEdit   int
-	editCount int
+	startEdit int64
+	endEdit   int64
+	editCount int64
 
 	cmp    *base.Comparer
 	state  lsmState
@@ -105,9 +106,9 @@ indicate size).
 	l.Root.Flags().Var(&l.fmtKey, "key", "key formatter")
 	l.Root.Flags().BoolVar(&l.embed, "embed", true, "embed javascript in HTML (disable for development)")
 	l.Root.Flags().BoolVar(&l.pretty, "pretty", false, "pretty JSON output")
-	l.Root.Flags().IntVar(&l.startEdit, "start-edit", 0, "starting edit # to include in visualization")
-	l.Root.Flags().IntVar(&l.endEdit, "end-edit", math.MaxInt64, "ending edit # to include in visualization")
-	l.Root.Flags().IntVar(&l.editCount, "edit-count", math.MaxInt64, "count of edits to include in visualization")
+	l.Root.Flags().Int64Var(&l.startEdit, "start-edit", 0, "starting edit # to include in visualization")
+	l.Root.Flags().Int64Var(&l.endEdit, "end-edit", math.MaxInt64, "ending edit # to include in visualization")
+	l.Root.Flags().Int64Var(&l.editCount, "edit-count", math.MaxInt64, "count of edits to include in visualization")
 	return l
 }
 
@@ -148,10 +149,10 @@ func (l *lsmT) runLSM(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	}
-	if l.endEdit < len(edits) {
+	if l.endEdit < int64(len(edits)) {
 		edits = edits[:l.endEdit-l.startEdit+1]
 	}
-	if l.editCount < len(edits) {
+	if l.editCount < int64(len(edits)) {
 		edits = edits[:l.editCount]
 	}
 
@@ -231,7 +232,9 @@ func (l *lsmT) readManifest(path string) []*manifest.VersionEdit {
 			}
 			l.fmtKey.setForComparer(ve.ComparerName, l.comparers)
 		} else if l.cmp == nil {
-			l.cmp = base.DefaultComparer
+			l.cmp = &base.Comparer{}
+			*l.cmp = *base.DefaultComparer
+			l.cmp.FormatKey = l.fmtKey.fn
 		}
 	}
 	return edits
@@ -249,8 +252,8 @@ func (l *lsmT) buildKeys(edits []*manifest.VersionEdit) {
 
 	l.keyMap = make(map[lsmKey]int)
 
-	sort.Slice(keys, func(i, j int) bool {
-		return base.InternalCompare(l.cmp.Compare, keys[i], keys[j]) < 0
+	slices.SortFunc(keys, func(a, b base.InternalKey) int {
+		return base.InternalCompare(l.cmp.Compare, a, b)
 	})
 
 	for i := range keys {
@@ -274,7 +277,12 @@ func (l *lsmT) buildEdits(edits []*manifest.VersionEdit) error {
 	l.state.Files = make(map[base.FileNum]lsmFileMetadata)
 	var currentFiles [manifest.NumLevels][]*manifest.FileMetadata
 
+	backings := make(map[base.DiskFileNum]*manifest.FileBacking)
+
 	for _, ve := range edits {
+		for _, i := range ve.CreatedBackingTables {
+			backings[i.DiskFileNum] = i
+		}
 		if len(ve.DeletedFiles) == 0 && len(ve.NewFiles) == 0 {
 			continue
 		}
@@ -287,6 +295,9 @@ func (l *lsmT) buildEdits(edits []*manifest.VersionEdit) error {
 
 		for j := range ve.NewFiles {
 			nf := &ve.NewFiles[j]
+			if b, ok := backings[nf.BackingFileNum]; ok && nf.Meta.Virtual {
+				nf.Meta.FileBacking = b
+			}
 			if _, ok := l.state.Files[nf.Meta.FileNum]; !ok {
 				l.state.Files[nf.Meta.FileNum] = lsmFileMetadata{
 					Size:           nf.Meta.Size,
@@ -294,6 +305,7 @@ func (l *lsmT) buildEdits(edits []*manifest.VersionEdit) error {
 					Largest:        l.findKey(nf.Meta.Largest),
 					SmallestSeqNum: nf.Meta.SmallestSeqNum,
 					LargestSeqNum:  nf.Meta.LargestSeqNum,
+					Virtual:        nf.Meta.Virtual,
 				}
 			}
 			edit.Added[nf.Level] = append(edit.Added[nf.Level], nf.Meta.FileNum)
@@ -310,7 +322,7 @@ func (l *lsmT) buildEdits(edits []*manifest.VersionEdit) error {
 			}
 		}
 
-		v := manifest.NewVersion(l.cmp.Compare, l.fmtKey.fn, 0, currentFiles)
+		v := manifest.NewVersion(l.cmp, 0, currentFiles)
 		edit.Sublevels = make(map[base.FileNum]int)
 		for sublevel, files := range v.L0SublevelFiles {
 			iter := files.Iter()
@@ -334,7 +346,7 @@ func (l *lsmT) buildEdits(edits []*manifest.VersionEdit) error {
 }
 
 func (l *lsmT) coalesceEdits(edits []*manifest.VersionEdit) ([]*manifest.VersionEdit, error) {
-	if l.startEdit >= len(edits) {
+	if l.startEdit >= int64(len(edits)) {
 		return nil, errors.Errorf("start-edit is more than the number of edits, %d", len(edits))
 	}
 

@@ -6,6 +6,7 @@ package base
 
 import (
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -14,35 +15,38 @@ import (
 	"github.com/cockroachdb/redact"
 )
 
-// FileNum is an internal DB identifier for a file.
+// FileNum is an internal DB identifier for a table. Tables can be physical (in
+// which case the FileNum also identifies the backing object) or virtual.
 type FileNum uint64
 
 // String returns a string representation of the file number.
 func (fn FileNum) String() string { return fmt.Sprintf("%06d", fn) }
 
-// DiskFileNum converts a FileNum to a DiskFileNum. DiskFileNum should only be
-// called if the caller can ensure that the FileNum belongs to a physical file
-// on disk. These could be manifests, log files, physical sstables on disk, the
-// options file, but not virtual sstables.
-func (fn FileNum) DiskFileNum() DiskFileNum {
-	return DiskFileNum{fn}
+// SafeFormat implements redact.SafeFormatter.
+func (fn FileNum) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("%06d", redact.SafeUint(fn))
 }
 
-// A DiskFileNum is just a FileNum belonging to a file which exists on disk.
-// Note that a FileNum is an internal DB identifier and it could belong to files
-// which don't exist on disk. An example would be virtual sstable FileNums.
-// Converting a DiskFileNum to a FileNum is always valid, whereas converting a
-// FileNum to DiskFileNum may not be valid and care should be taken to prove
-// that the FileNum actually exists on disk.
-type DiskFileNum struct {
-	fn FileNum
+// PhysicalTableDiskFileNum converts the FileNum of a physical table to the
+// backing DiskFileNum. The underlying numbers always match for physical tables.
+func PhysicalTableDiskFileNum(n FileNum) DiskFileNum {
+	return DiskFileNum(n)
 }
 
-func (dfn DiskFileNum) String() string { return dfn.fn.String() }
+// PhysicalTableFileNum converts the DiskFileNum backing a physical table into
+// the table's FileNum. The underlying numbers always match for physical tables.
+func PhysicalTableFileNum(f DiskFileNum) FileNum {
+	return FileNum(f)
+}
 
-// FileNum converts a DiskFileNum to a FileNum. This conversion is always valid.
-func (dfn DiskFileNum) FileNum() FileNum {
-	return dfn.fn
+// A DiskFileNum identifies a file or object with exists on disk.
+type DiskFileNum uint64
+
+func (dfn DiskFileNum) String() string { return fmt.Sprintf("%06d", dfn) }
+
+// SafeFormat implements redact.SafeFormatter.
+func (dfn DiskFileNum) SafeFormat(w redact.SafePrinter, verb rune) {
+	w.Printf("%06d", redact.SafeUint(dfn))
 }
 
 // FileType enumerates the types of files found in a DB.
@@ -54,7 +58,6 @@ const (
 	FileTypeLock
 	FileTypeTable
 	FileTypeManifest
-	FileTypeCurrent
 	FileTypeOptions
 	FileTypeOldTemp
 	FileTypeTemp
@@ -64,15 +67,13 @@ const (
 func MakeFilename(fileType FileType, dfn DiskFileNum) string {
 	switch fileType {
 	case FileTypeLog:
-		return fmt.Sprintf("%s.log", dfn)
+		panic("the pebble/wal pkg is responsible for constructing WAL filenames")
 	case FileTypeLock:
 		return "LOCK"
 	case FileTypeTable:
 		return fmt.Sprintf("%s.sst", dfn)
 	case FileTypeManifest:
 		return fmt.Sprintf("MANIFEST-%s", dfn)
-	case FileTypeCurrent:
-		return "CURRENT"
 	case FileTypeOptions:
 		return fmt.Sprintf("OPTIONS-%s", dfn)
 	case FileTypeOldTemp:
@@ -92,32 +93,30 @@ func MakeFilepath(fs vfs.FS, dirname string, fileType FileType, dfn DiskFileNum)
 func ParseFilename(fs vfs.FS, filename string) (fileType FileType, dfn DiskFileNum, ok bool) {
 	filename = fs.PathBase(filename)
 	switch {
-	case filename == "CURRENT":
-		return FileTypeCurrent, DiskFileNum{0}, true
 	case filename == "LOCK":
-		return FileTypeLock, DiskFileNum{0}, true
+		return FileTypeLock, 0, true
 	case strings.HasPrefix(filename, "MANIFEST-"):
-		dfn, ok = parseDiskFileNum(filename[len("MANIFEST-"):])
+		dfn, ok = ParseDiskFileNum(filename[len("MANIFEST-"):])
 		if !ok {
 			break
 		}
 		return FileTypeManifest, dfn, true
 	case strings.HasPrefix(filename, "OPTIONS-"):
-		dfn, ok = parseDiskFileNum(filename[len("OPTIONS-"):])
+		dfn, ok = ParseDiskFileNum(filename[len("OPTIONS-"):])
 		if !ok {
 			break
 		}
 		return FileTypeOptions, dfn, ok
 	case strings.HasPrefix(filename, "CURRENT.") && strings.HasSuffix(filename, ".dbtmp"):
 		s := strings.TrimSuffix(filename[len("CURRENT."):], ".dbtmp")
-		dfn, ok = parseDiskFileNum(s)
+		dfn, ok = ParseDiskFileNum(s)
 		if !ok {
 			break
 		}
 		return FileTypeOldTemp, dfn, ok
 	case strings.HasPrefix(filename, "temporary.") && strings.HasSuffix(filename, ".dbtmp"):
 		s := strings.TrimSuffix(filename[len("temporary."):], ".dbtmp")
-		dfn, ok = parseDiskFileNum(s)
+		dfn, ok = ParseDiskFileNum(s)
 		if !ok {
 			break
 		}
@@ -127,26 +126,26 @@ func ParseFilename(fs vfs.FS, filename string) (fileType FileType, dfn DiskFileN
 		if i < 0 {
 			break
 		}
-		dfn, ok = parseDiskFileNum(filename[:i])
+		dfn, ok = ParseDiskFileNum(filename[:i])
 		if !ok {
 			break
 		}
+		// TODO(sumeer): stop handling FileTypeLog in this function.
 		switch filename[i+1:] {
 		case "sst":
 			return FileTypeTable, dfn, true
-		case "log":
-			return FileTypeLog, dfn, true
 		}
 	}
 	return 0, dfn, false
 }
 
-func parseDiskFileNum(s string) (dfn DiskFileNum, ok bool) {
+// ParseDiskFileNum parses the provided string as a disk file number.
+func ParseDiskFileNum(s string) (dfn DiskFileNum, ok bool) {
 	u, err := strconv.ParseUint(s, 10, 64)
 	if err != nil {
 		return dfn, false
 	}
-	return DiskFileNum{FileNum(u)}, true
+	return DiskFileNum(u), true
 }
 
 // A Fataler fatals a process with a message when called.
@@ -165,7 +164,7 @@ func MustExist(fs vfs.FS, filename string, fataler Fataler, err error) {
 
 	ls, lsErr := fs.List(fs.PathDir(filename))
 	if lsErr != nil {
-		// TODO(jackson): if oserror.IsNotExist(lsErr), the the data directory
+		// TODO(jackson): if oserror.IsNotExist(lsErr), the data directory
 		// doesn't exist anymore. Another process likely deleted it before
 		// killing the process. We want to fatal the process, but without
 		// triggering error reporting like Sentry.
@@ -174,6 +173,15 @@ func MustExist(fs vfs.FS, filename string, fataler Fataler, err error) {
 	var total, unknown, tables, logs, manifests int
 	total = len(ls)
 	for _, f := range ls {
+		// The file format of log files is an implementation detail of the wal/
+		// package that the internal/base package is not privy to. We can't call
+		// into the wal package because that would introduce a cyclical
+		// dependency. For our purposes, an exact count isn't important and we
+		// just count files with .log extensions.
+		if filepath.Ext(f) == ".log" {
+			logs++
+			continue
+		}
 		typ, _, ok := ParseFilename(fs, f)
 		if !ok {
 			unknown++
@@ -182,8 +190,6 @@ func MustExist(fs vfs.FS, filename string, fataler Fataler, err error) {
 		switch typ {
 		case FileTypeTable:
 			tables++
-		case FileTypeLog:
-			logs++
 		case FileTypeManifest:
 			manifests++
 		}
@@ -191,4 +197,10 @@ func MustExist(fs vfs.FS, filename string, fataler Fataler, err error) {
 
 	fataler.Fatalf("%s:\n%s\ndirectory contains %d files, %d unknown, %d tables, %d logs, %d manifests",
 		fs.PathBase(filename), err, total, unknown, tables, logs, manifests)
+}
+
+// FileInfo provides some rudimentary information about a file.
+type FileInfo struct {
+	FileNum  DiskFileNum
+	FileSize uint64
 }

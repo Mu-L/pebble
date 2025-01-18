@@ -12,24 +12,25 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/dsl"
 	"github.com/cockroachdb/pebble/internal/randvar"
-	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/errorfs"
 	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -40,8 +41,10 @@ type runAndCompareOptions struct {
 	initialStatePath  string
 	initialStateDesc  string
 	traceFile         string
+	innerBinary       string
 	mutateTestOptions []func(*TestOptions)
 	customRuns        map[string]string
+	numInstances      int
 	runOnceOptions
 }
 
@@ -106,6 +109,12 @@ func RuntimeTrace(name string) RunOption {
 	return closureOpt(func(ro *runAndCompareOptions) { ro.traceFile = name })
 }
 
+// InnerBinary configures the binary that is called for each run. If not
+// specified, this binary (os.Args[0]) is called.
+func InnerBinary(path string) RunOption {
+	return closureOpt(func(ro *runAndCompareOptions) { ro.innerBinary = path })
+}
+
 // ParseCustomTestOption adds support for parsing the provided CustomOption from
 // OPTIONS files serialized by the metamorphic tests. This RunOption alone does
 // not cause the metamorphic tests to run with any variant of the provided
@@ -125,9 +134,7 @@ type closureOpt func(*runAndCompareOptions)
 
 func (f closureOpt) apply(ro *runAndCompareOptions) { f(ro) }
 
-// RunAndCompare runs the metamorphic tests, using the provided root directory
-// to hold test data.
-func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
+func buildRunAndCompareOpts(rOpts []RunOption) runAndCompareOptions {
 	runOpts := runAndCompareOptions{
 		ops:        randvar.NewUniform(1000, 10000),
 		customRuns: map[string]string{},
@@ -141,7 +148,13 @@ func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
 	if runOpts.seed == 0 {
 		runOpts.seed = uint64(time.Now().UnixNano())
 	}
+	return runOpts
+}
 
+// RunAndCompare runs the metamorphic tests, using the provided root directory
+// to hold test data.
+func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
+	runOpts := buildRunAndCompareOpts(rOpts)
 	require.NoError(t, os.MkdirAll(rootDir, 0755))
 	metaDir, err := os.MkdirTemp(rootDir, time.Now().Format("060102-150405.000"))
 	require.NoError(t, err)
@@ -152,13 +165,26 @@ func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
 		}
 	}()
 
-	rng := rand.New(rand.NewSource(runOpts.seed))
+	topLevelTestName := t.Name()
+	for path.Dir(topLevelTestName) != "." {
+		topLevelTestName = path.Dir(topLevelTestName)
+	}
+
+	rng := rand.New(rand.NewPCG(0, runOpts.seed))
 	opCount := runOpts.ops.Uint64(rng)
 
 	// Generate a new set of random ops, writing them to <dir>/ops. These will be
 	// read by the child processes when performing a test run.
-	km := newKeyManager()
-	cfg := defaultConfig()
+	km := newKeyManager(runOpts.numInstances)
+	cfg := presetConfigs[rng.IntN(len(presetConfigs))]
+	if runOpts.numInstances > 1 {
+		// The multi-instance variant does not support all operations yet.
+		//
+		// TODO(bilal): Address this and use the default configs.
+		cfg = multiInstancePresetConfig
+		cfg.numInstances = runOpts.numInstances
+	}
+	g := newGenerator(rng, cfg, km)
 	if runOpts.previousOpsPath != "" {
 		// During cross-version testing, we load keys from an `ops` file
 		// produced by a metamorphic test run of an earlier Pebble version.
@@ -167,13 +193,14 @@ func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
 		opsPath := filepath.Join(filepath.Dir(filepath.Clean(runOpts.previousOpsPath)), "ops")
 		opsData, err := os.ReadFile(opsPath)
 		require.NoError(t, err)
-		ops, err := parse(opsData)
+		ops, err := parse(opsData, parserOpts{})
 		require.NoError(t, err)
-		loadPrecedingKeys(t, ops, &cfg, km)
+		loadPrecedingKeys(ops, g.keyGenerator, km)
 	}
-	ops := generate(rng, opCount, cfg, km)
+
+	ops := g.generate(opCount)
 	opsPath := filepath.Join(metaDir, "ops")
-	formattedOps := formatOps(ops)
+	formattedOps := formatOps(km.kf, ops)
 	require.NoError(t, os.WriteFile(opsPath, []byte(formattedOps), 0644))
 
 	// runOptions performs a particular test run with the specified options. The
@@ -196,13 +223,21 @@ func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
 		args := []string{
 			"-keep=" + fmt.Sprint(runOpts.keep),
 			"-run-dir=" + runDir,
-			"-test.run=" + t.Name() + "$",
+			"-test.run=" + topLevelTestName + "$",
+			"--op-timeout=" + runOpts.opTimeout.String(),
+		}
+		if runOpts.numInstances > 1 {
+			args = append(args, "--num-instances="+strconv.Itoa(runOpts.numInstances))
 		}
 		if runOpts.traceFile != "" {
 			args = append(args, "-test.trace="+filepath.Join(runDir, runOpts.traceFile))
 		}
 
-		cmd := exec.Command(os.Args[0], args...)
+		binary := os.Args[0]
+		if runOpts.innerBinary != "" {
+			binary = runOpts.innerBinary
+		}
+		cmd := exec.Command(binary, args...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf(`
@@ -217,50 +252,23 @@ func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
 ===== OPS =====
 %s
 ===== HISTORY =====
-%s`, runOpts.seed, err, out, optionsStr, formattedOps, readFile(filepath.Join(runDir, "history")))
+%s
+To reduce:  go test ./internal/metamorphic -tags invariants -run '%s$' --run-dir %s --try-to-reduce -v`,
+				runOpts.seed,
+				err,
+				out,
+				optionsStr,
+				opsPath,
+				readFile(filepath.Join(runDir, "history")),
+				topLevelTestName, runDir,
+			)
 		}
 	}
 
-	var names []string
-	options := map[string]*TestOptions{}
-
-	// Create the standard options.
-	for i, opts := range standardOptions() {
-		name := fmt.Sprintf("standard-%03d", i)
-		names = append(names, name)
-		options[name] = opts
-	}
-
-	// Create the custom option runs, if any.
-	for name, customOptsStr := range runOpts.customRuns {
-		options[name] = defaultTestOptions()
-		if err := parseOptions(options[name], customOptsStr, runOpts.customOptionParsers); err != nil {
-			t.Fatalf("custom opts %q: %s", name, err)
-		}
-	}
-	// Sort the custom options names for determinism (they're currently in
-	// random order from map iteration).
-	sort.Strings(names[len(names)-len(runOpts.customRuns):])
-
-	// Create random options. We make an arbitrary choice to run with as many
-	// random options as we have standard options.
-	nOpts := len(options)
-	for i := 0; i < nOpts; i++ {
-		name := fmt.Sprintf("random-%03d", i)
-		names = append(names, name)
-		opts := randomOptions(rng, runOpts.customOptionParsers)
-		options[name] = opts
-	}
-
-	// If the user provided the path to an initial database state to use, update
-	// all the options to pull from it.
-	if runOpts.initialStatePath != "" {
-		for _, o := range options {
-			var err error
-			o.initialStatePath, err = filepath.Abs(runOpts.initialStatePath)
-			require.NoError(t, err)
-			o.initialStateDesc = runOpts.initialStateDesc
-		}
+	// Construct the various OPTIONS to test with.
+	names, options, err := buildOptions(rng, runOpts)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// Run the options.
@@ -309,18 +317,25 @@ func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
 					optionsStrB := optionsToString(options[names[i]])
 
 					fmt.Printf(`
-		===== SEED =====
-		%d
-		===== DIFF =====
-		%s/{%s,%s}
-		%s
-		===== OPTIONS %s =====
-		%s
-		===== OPTIONS %s =====
-		%s
-		===== OPS =====
-		%s
-		`, runOpts.seed, metaDir, names[0], names[i], text, names[0], optionsStrA, names[i], optionsStrB, formattedOps)
+===== SEED =====
+%d
+===== DIFF =====
+%s/{%s,%s}
+%s
+===== OPTIONS %s =====
+%s
+===== OPTIONS %s =====
+%s
+===== OPS =====
+%s
+To reduce:  go test ./internal/metamorphic -tags invariants -run '%s$' --compare "%s/{%s,%s}" --try-to-reduce -v
+`,
+						runOpts.seed,
+						metaDir, names[0], names[i], text,
+						names[0], optionsStrA,
+						names[i], optionsStrB,
+						opsPath,
+						topLevelTestName, metaDir, names[0], names[i])
 					os.Exit(1)
 				}
 			})
@@ -328,11 +343,64 @@ func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
 	})
 }
 
+func buildOptions(
+	rng *rand.Rand, runOpts runAndCompareOptions,
+) (names []string, options map[string]*TestOptions, err error) {
+	options = map[string]*TestOptions{}
+
+	// Create the standard options.
+	for i, opts := range standardOptions() {
+		name := fmt.Sprintf("standard-%03d", i)
+		names = append(names, name)
+		options[name] = opts
+	}
+
+	// Create the custom option runs, if any.
+	for name, customOptsStr := range runOpts.customRuns {
+		options[name] = defaultTestOptions()
+		if err = parseOptions(options[name], customOptsStr, runOpts.customOptionParsers); err != nil {
+			return nil, nil, errors.Wrapf(err, "custom opts %q: %s", name, err)
+		}
+	}
+	// Sort the custom options names for determinism (they're currently in
+	// random order from map iteration).
+	sort.Strings(names[len(names)-len(runOpts.customRuns):])
+
+	// Create random options. We make an arbitrary choice to run with as many
+	// random options as we have standard options.
+	nOpts := len(options)
+	for i := 0; i < nOpts; i++ {
+		name := fmt.Sprintf("random-%03d", i)
+		names = append(names, name)
+		opts := RandomOptions(rng, runOpts.customOptionParsers)
+		options[name] = opts
+	}
+
+	// If the user provided the path to an initial database state to use, update
+	// all the options to pull from it.
+	if runOpts.initialStatePath != "" {
+		for _, o := range options {
+			o.initialStatePath, err = filepath.Abs(runOpts.initialStatePath)
+			if err != nil {
+				return nil, nil, err
+			}
+			o.initialStateDesc = runOpts.initialStateDesc
+		}
+	}
+	return names, options, nil
+}
+
 type runOnceOptions struct {
-	keep                bool
-	maxThreads          int
+	// Note: when adding a new option, a new flag might need to be passed to the
+	// "inner" execution of the test binary in RunAndCompare.
+
+	keep       bool
+	maxThreads int
+	// opTimeout causes the test to fail if any one op takes longer than this.
+	opTimeout           time.Duration
 	errorRate           float64
 	failRegexp          *regexp.Regexp
+	numInstances        int
 	customOptionParsers map[string]func(string) (CustomOption, bool)
 }
 
@@ -364,6 +432,13 @@ type MaxThreads int
 func (m MaxThreads) apply(ro *runAndCompareOptions) { ro.maxThreads = int(m) }
 func (m MaxThreads) applyOnce(ro *runOnceOptions)   { ro.maxThreads = int(m) }
 
+// OpTimeout sets a timeout for each executed operation. A value of 0 means no
+// timeout.
+type OpTimeout time.Duration
+
+func (t OpTimeout) apply(ro *runAndCompareOptions) { ro.opTimeout = time.Duration(t) }
+func (t OpTimeout) applyOnce(ro *runOnceOptions)   { ro.opTimeout = time.Duration(t) }
+
 // FailOnMatch configures the run to fail immediately if the history matches the
 // provided regular expression.
 type FailOnMatch struct {
@@ -372,6 +447,12 @@ type FailOnMatch struct {
 
 func (f FailOnMatch) apply(ro *runAndCompareOptions) { ro.failRegexp = f.Regexp }
 func (f FailOnMatch) applyOnce(ro *runOnceOptions)   { ro.failRegexp = f.Regexp }
+
+// MultiInstance configures the number of pebble instances to create.
+type MultiInstance int
+
+func (m MultiInstance) apply(ro *runAndCompareOptions) { ro.numInstances = int(m) }
+func (m MultiInstance) applyOnce(ro *runOnceOptions)   { ro.numInstances = int(m) }
 
 // RunOnce performs one run of the metamorphic tests. RunOnce expects the
 // directory named by `runDir` to already exist and contain an `OPTIONS` file
@@ -391,23 +472,22 @@ func RunOnce(t TestingT, runDir string, seed uint64, historyPath string, rOpts .
 	opsData, err := os.ReadFile(opsPath)
 	require.NoError(t, err)
 
-	ops, err := parse(opsData)
-	require.NoError(t, err)
-	_ = ops
-
 	optionsPath := filepath.Join(runDir, "OPTIONS")
 	optionsData, err := os.ReadFile(optionsPath)
 	require.NoError(t, err)
 
-	opts := &pebble.Options{}
-	testOpts := &TestOptions{Opts: opts}
+	// NB: It's important to use defaultTestOptions() here as the base into
+	// which we parse the serialized options. It contains the relevant defaults,
+	// like the appropriate block-property collectors.
+	testOpts := defaultTestOptions()
+	opts := testOpts.Opts
 	require.NoError(t, parseOptions(testOpts, string(optionsData), runOpts.customOptionParsers))
 
-	// Always use our custom comparer which provides a Split method, splitting
-	// keys at the trailing '@'.
-	opts.Comparer = testkeys.Comparer
-	// Use an archive cleaner to ease post-mortem debugging.
-	opts.Cleaner = base.ArchiveCleaner{}
+	ops, err := parse(opsData, parserOpts{
+		parseFormattedUserKey:       testOpts.KeyFormat.ParseFormattedKey,
+		parseFormattedUserKeySuffix: testOpts.KeyFormat.ParseFormattedKeySuffix,
+	})
+	require.NoError(t, err)
 
 	// Set up the filesystem to use for the test. Note that by default we use an
 	// in-memory FS.
@@ -416,17 +496,29 @@ func RunOnce(t TestingT, runDir string, seed uint64, historyPath string, rOpts .
 		require.NoError(t, os.RemoveAll(opts.FS.PathJoin(runDir, "data")))
 	} else {
 		opts.Cleaner = base.ArchiveCleaner{}
-		if testOpts.strictFS {
-			opts.FS = vfs.NewStrictMem()
-		} else {
-			opts.FS = vfs.NewMem()
-		}
 	}
-	opts.WithFSDefaults()
+	// Wrap the filesystem with a VFS that will inject random latency if the
+	// test options require it. We cap the overlal injected latency to ten
+	// seconds to avoid excessive test run times when paired with small target
+	// file sizes, block sizes, etc.
+	if testOpts.ioLatencyProbability > 0 {
+		opts.FS = errorfs.Wrap(opts.FS, errorfs.RandomLatency(
+			errorfs.Randomly(testOpts.ioLatencyProbability, testOpts.ioLatencySeed),
+			testOpts.ioLatencyMean,
+			testOpts.ioLatencySeed,
+			10*time.Second,
+		))
+	}
 
-	threads := testOpts.threads
-	if runOpts.maxThreads < threads {
-		threads = runOpts.maxThreads
+	// Wrap the filesystem with one that will inject errors into read
+	// operations with *errorRate probability.
+	opts.FS = errorfs.Wrap(opts.FS, errorfs.ErrInjected.If(
+		dsl.And(errorfs.Reads, errorfs.Randomly(runOpts.errorRate, int64(seed))),
+	))
+
+	// Bound testOpts.threads to runOpts.maxThreads.
+	if runOpts.maxThreads < testOpts.Threads {
+		testOpts.Threads = runOpts.maxThreads
 	}
 
 	dir := opts.FS.PathJoin(runDir, "data")
@@ -438,12 +530,27 @@ func RunOnce(t TestingT, runDir string, seed uint64, historyPath string, rOpts .
 		require.NoError(t, setupInitialState(dir, testOpts))
 	}
 
-	// Wrap the filesystem with one that will inject errors into read
-	// operations with *errorRate probability.
-	opts.FS = errorfs.Wrap(opts.FS, errorfs.WithProbability(errorfs.OpKindRead, runOpts.errorRate))
+	if testOpts.Opts.WALFailover != nil {
+		if runOpts.numInstances > 1 {
+			// TODO(bilal,jackson): Allow opts to diverge on a per-instance
+			// basis, and use that to set unique WAL dirs for all instances in
+			// multi-instance mode.
+			testOpts.Opts.WALFailover = nil
+		} else {
+			testOpts.Opts.WALFailover.Secondary.FS = opts.FS
+			testOpts.Opts.WALFailover.Secondary.Dirname = opts.FS.PathJoin(
+				runDir, testOpts.Opts.WALFailover.Secondary.Dirname)
+		}
+	}
 
 	if opts.WALDir != "" {
-		opts.WALDir = opts.FS.PathJoin(runDir, opts.WALDir)
+		if runOpts.numInstances > 1 {
+			// TODO(bilal): Allow opts to diverge on a per-instance basis, and use
+			// that to set unique WAL dirs for all instances in multi-instance mode.
+			opts.WALDir = ""
+		} else {
+			opts.WALDir = opts.FS.PathJoin(runDir, opts.WALDir)
+		}
 	}
 
 	historyFile, err := os.Create(historyPath)
@@ -455,73 +562,93 @@ func RunOnce(t TestingT, runDir string, seed uint64, historyPath string, rOpts .
 		writers = append(writers, os.Stdout)
 	}
 	h := newHistory(runOpts.failRegexp, writers...)
+	defer h.Close()
 
 	m := newTest(ops)
-	require.NoError(t, m.init(h, dir, testOpts))
+	require.NoError(t, m.init(h, dir, testOpts, runOpts.numInstances, runOpts.opTimeout))
 
-	if threads <= 1 {
-		for m.step(h) {
-			if err := h.Error(); err != nil {
-				fmt.Fprintf(os.Stderr, "Seed: %d\n", seed)
-				fmt.Fprintln(os.Stderr, err)
-				m.maybeSaveData()
-				os.Exit(1)
-			}
+	if err := Execute(m); err != nil {
+		fmt.Fprintf(os.Stderr, "Seed: %d\n", seed)
+		fmt.Fprintln(os.Stderr, err)
+	}
+
+	// If we have unclosed databases, print LSM details. This will be the case
+	// when we use --try-to-reduce.
+	for i, db := range m.dbs {
+		if db != nil {
+			fmt.Fprintf(os.Stderr, "\ndb%d:\n%s", i+1, db.DebugString())
+			fmt.Fprintf(os.Stderr, "\n%s\n", db.LSMViewURL())
 		}
-	} else {
-		eg, ctx := errgroup.WithContext(context.Background())
-		for t := 0; t < threads; t++ {
-			t := t // bind loop var to scope
-			eg.Go(func() error {
-				for idx := 0; idx < len(m.ops); idx++ {
-					// Skip any operations whose receiver object hashes to a
-					// different thread. All operations with the same receiver
-					// are performed from the same thread. This goroutine is
-					// only responsible for executing operations that hash to
-					// `t`.
-					if hashThread(m.ops[idx].receiver(), threads) != t {
-						continue
-					}
+	}
+	// Don't let the test pass if it issued a Fatalf.
+	err = errors.CombineErrors(err, h.Error())
 
-					// Some operations have additional synchronization
-					// dependencies. If this operation has any, wait for its
-					// dependencies to complete before executing.
-					for _, waitOnIdx := range m.opsWaitOn[idx] {
-						select {
-						case <-ctx.Done():
-							// Exit if some other thread already errored out.
-							return ctx.Err()
-						case <-m.opsDone[waitOnIdx]:
-						}
-					}
-
-					m.ops[idx].run(m, h.recorder(t, idx))
-
-					// If this operation has a done channel, close it so that
-					// other operations that synchronize on this operation know
-					// that it's been completed.
-					if ch := m.opsDone[idx]; ch != nil {
-						close(ch)
-					}
-
-					if err := h.Error(); err != nil {
-						return err
-					}
-				}
-				return nil
-			})
-		}
-		if err := eg.Wait(); err != nil {
-			fmt.Fprintf(os.Stderr, "Seed: %d\n", seed)
-			fmt.Fprintln(os.Stderr, err)
-			m.maybeSaveData()
-			os.Exit(1)
-		}
+	if err != nil {
+		m.saveInMemoryData()
+		os.Exit(1)
 	}
 
 	if runOpts.keep && !testOpts.useDisk {
-		m.maybeSaveData()
+		m.saveInMemoryData()
 	}
+}
+
+// Execute runs the provided test, writing the execution history into the Test's
+// sink.
+func Execute(m *Test) error {
+	if m.testOpts.Threads <= 1 {
+		for m.step(m.h, nil /* optionalRecordf */) {
+			if err := m.h.Error(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Run in parallel using an errgroup.
+	eg, ctx := errgroup.WithContext(context.Background())
+	for t := 0; t < m.testOpts.Threads; t++ {
+		t := t // bind loop var to scope
+		eg.Go(func() error {
+			for idx := 0; idx < len(m.ops); idx++ {
+				// Skip any operations whose receiver object hashes to a
+				// different thread. All operations with the same receiver
+				// are performed from the same thread. This goroutine is
+				// only responsible for executing operations that hash to
+				// `t`.
+				if hashThread(m.ops[idx].receiver(), m.testOpts.Threads) != t {
+					continue
+				}
+
+				// Some operations have additional synchronization
+				// dependencies. If this operation has any, wait for its
+				// dependencies to complete before executing.
+				for _, waitOnIdx := range m.opsWaitOn[idx] {
+					select {
+					case <-ctx.Done():
+						// Exit if some other thread already errored out.
+						return ctx.Err()
+					case <-m.opsDone[waitOnIdx]:
+					}
+				}
+
+				m.runOp(idx, m.h.recorder(t, idx, nil /* optionalRecordf */))
+
+				// If this operation has a done channel, close it so that
+				// other operations that synchronize on this operation know
+				// that it's been completed.
+				if ch := m.opsDone[idx]; ch != nil {
+					close(ch)
+				}
+
+				if err := m.h.Error(); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	return eg.Wait()
 }
 
 func hashThread(objID objID, numThreads int) int {

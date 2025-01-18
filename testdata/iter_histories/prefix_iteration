@@ -39,7 +39,7 @@ flush
 
 lsm
 ----
-0.0:
+L0.0:
   000005:[a#10,RANGEKEYSET-c#inf,RANGEKEYSET]
   000007:[c#11,RANGEKEYSET-f#inf,RANGEKEYSET]
   000009:[f#12,RANGEKEYSET-m#inf,RANGEKEYSET]
@@ -68,7 +68,7 @@ d@7: (., [d-"d\x00") @5=foo UPDATED)
 # Test a LSM with range keys fragmented within a prefix.
 # This is a regression test for cockroachdb/cockroach#86102.
 
-reset target-file-size=1
+reset target-file-sizes=(1)
 ----
 
 batch commit
@@ -93,17 +93,20 @@ flush
 
 lsm
 ----
-0.0:
-  000005:[a#10,RANGEKEYSET-c@8#inf,RANGEKEYSET]
-  000006:[c@8#13,SET-c@7#inf,RANGEKEYSET]
-  000007:[c@7#14,SET-c@6#inf,RANGEKEYSET]
-  000008:[c@6#15,SET-c@5#inf,RANGEKEYSET]
-  000009:[c@5#16,SET-c@4#inf,RANGEKEYSET]
-  000010:[c@4#17,SET-c@3#inf,RANGEKEYSET]
-  000011:[c@3#18,SET-c@2#inf,RANGEKEYSET]
-  000012:[c@2#19,SET-d@0#inf,RANGEKEYSET]
-  000013:[d@0#20,SET-e#inf,RANGEKEYSET]
-  000014:[y#21,RANGEKEYSET-z#22,SET]
+L0.0:
+  000005:[a#10,RANGEKEYSET-c#inf,RANGEKEYSET]
+  000006:[c#11,RANGEKEYSET-c@9#inf,RANGEKEYSET]
+  000007:[c@9#12,SET-c@8#inf,RANGEKEYSET]
+  000008:[c@8#13,SET-c@7#inf,RANGEKEYSET]
+  000009:[c@7#14,SET-c@6#inf,RANGEKEYSET]
+  000010:[c@6#15,SET-c@5#inf,RANGEKEYSET]
+  000011:[c@5#16,SET-c@4#inf,RANGEKEYSET]
+  000012:[c@4#17,SET-c@3#inf,RANGEKEYSET]
+  000013:[c@3#18,SET-c@2#inf,RANGEKEYSET]
+  000014:[c@2#19,SET-d@0#inf,RANGEKEYSET]
+  000015:[d@0#20,SET-e#inf,RANGEKEYSET]
+  000016:[y#21,RANGEKEYSET-z#inf,RANGEKEYSET]
+  000017:[z#22,SET-z#22,SET]
 
 # The first seek-prefix-ge y@1 converts the iterator from lazy combined iterator
 # to combined iteration.
@@ -137,8 +140,14 @@ ingest ext1
 range-key-set a c@8 @1 bar
 set c@9 c@9
 ----
+pebble: ingest sstable has suffixed largest range key that does not match the start key of the next sstable: c@8
 
-ingest ext2
+build ext1
+range-key-set a c@8 @1 bar
+set c@9 c@9
+----
+
+build ext2
 range-key-set c@8 e @1 bar
 set c@8 c@8
 set c@7 c@7
@@ -149,6 +158,9 @@ set c@3 c@3
 set c@2 c@2
 ----
 
+ingest-existing ext1 ext2
+----
+
 ingest ext2
 range-key-set y z @1 foo
 set z z
@@ -156,10 +168,10 @@ set z z
 
 lsm
 ----
-6:
-  000004:[a#10,RANGEKEYSET-c@8#inf,RANGEKEYSET]
-  000005:[c@8#11,RANGEKEYSET-e#inf,RANGEKEYSET]
-  000006:[y#12,RANGEKEYSET-z#12,SET]
+L6:
+  000005:[a#10,RANGEKEYSET-c@8#inf,RANGEKEYSET]
+  000006:[c@8#11,RANGEKEYSET-e#inf,RANGEKEYSET]
+  000007:[y#12,RANGEKEYSET-z#12,SET]
 
 
 # The first seek-prefix-ge y@1 converts the iterator from lazy combined iterator
@@ -224,7 +236,7 @@ c@10: (., [c-"c\x00") @1=bar UPDATED)
 #      b. In L6, the level iterator seeks to 000004 which contains a key with
 #         the prefix, returning 'b@4'.
 #   2. Next():
-#      a. Next advances the the L6 iterator to file 000005. This file contains a
+#      a. Next advances the L6 iterator to file 000005. This file contains a
 #         range key [e,f)@1=bar, which updates the lazy-combined iterator's
 #         state, recording the earliest observed range key as 'e'. The L6 level
 #         iterator then returns the file single point key 'c'.
@@ -283,10 +295,10 @@ range-key-set d e @1 bar
 
 lsm
 ----
-0.0:
+L0.0:
   000006:[a#12,SET-d#inf,RANGEDEL]
   000007:[d#13,RANGEKEYSET-e#inf,RANGEKEYSET]
-6:
+L6:
   000004:[b@4#10,SET-b@4#10,SET]
   000005:[c#11,SET-f#inf,RANGEKEYSET]
 
@@ -322,9 +334,9 @@ L6
   c@2.SET.2:v
   d@2.SET.2:v
 ----
-5:
+L5:
   000004:[b#3,RANGEDEL-d@9#9,SET]
-6:
+L6:
   000005:[b@2#2,SET-d@2#2,SET]
 
 combined-iter snapshot=4
@@ -333,3 +345,122 @@ seek-prefix-ge c@9
 ----
 .
 .
+
+# Regression test for #3610.
+#
+# Similar to the above case, this test consists of two SeekPrefixGEs for
+# ascending keys, resulting in TrySeekUsingNext()=true for the second seek.
+# Previously, during the first SeekPrefixGE the mergingIter could Next the
+# levelIter beyond the file containing point keys relevant to both seeks.
+
+define bloom-bits-per-key=100
+L4
+  b@0.SET.10:b@0
+L5
+  b@8.RANGEDEL.3:b@1
+  c@3.SET.0:c@3
+----
+L4:
+  000004:[b@0#10,SET-b@0#10,SET]
+L5:
+  000005:[b@8#3,RANGEDEL-c@3#0,SET]
+
+combined-iter
+seek-prefix-ge b@10
+seek-prefix-ge c@10
+----
+b@0: (b@0, .)
+c@3: (c@3, .)
+
+# Test a seek for a prefix that falls entirely in the gap between file
+# boundaries. The iterator stats should indicate that no blocks are loaded.
+
+define bloom-bits-per-key=100
+L4
+  b@0.SET.10:b@0
+L4
+  d@3.SET.10:d@3
+----
+L4:
+  000004:[b@0#10,SET-b@0#10,SET]
+  000005:[d@3#10,SET-d@3#10,SET]
+
+combined-iter
+seek-prefix-ge c@10
+stats
+----
+.
+stats: seeked 1 times (1 internal); stepped 0 times (0 internal)
+
+# Test that a prefix seek through a batch iterator that enforces the prefix
+# strictly.
+
+reset
+----
+
+batch name=foo
+set b@1 b@1
+set d@9 d@9
+set g@4 g@4
+set e@2 e@2
+----
+wrote 4 keys to batch "foo"
+
+# The stats should indicate only 3 KVs were ever surfaced to the merging iterator.
+
+combined-iter reader=foo name=fooiter
+seek-prefix-ge b@10
+seek-prefix-ge c@10
+seek-prefix-ge d@10
+seek-prefix-ge g@2
+seek-prefix-ge e@2
+stats
+----
+b@1: (b@1, .)
+.
+d@9: (d@9, .)
+.
+e@2: (e@2, .)
+stats: seeked 5 times (5 internal); stepped 0 times (0 internal); blocks: 0B cached; points: 3 (9B keys, 9B values)
+
+# Test the above case but with a large committed batch (which should be a
+# flushableBatchIter).
+
+define memtable-size=65536
+----
+
+# We diable flushes to avoid scheduling a flush that might race with our
+# iterator. If the iterator observed the state after the large batch has been
+# flushed to sstables, we would see nonzero block bytes appear in the iterator
+# stats.
+disable-flushes
+----
+
+batch commit
+set b@1 <rand-bytes=10000>
+set d@9 <rand-bytes=10000>
+set g@4 <rand-bytes=10000>
+set e@2 <rand-bytes=10000>
+----
+committed 4 keys
+
+lsm
+----
+
+combined-iter
+seek-prefix-ge b@10
+seek-prefix-ge c@10
+seek-prefix-ge d@10
+seek-prefix-ge g@2
+seek-prefix-ge e@2
+stats
+----
+b@1: ([LARGE VALUE len=10000], .)
+.
+d@9: ([LARGE VALUE len=10000], .)
+.
+e@2: ([LARGE VALUE len=10000], .)
+stats: seeked 5 times (5 internal); stepped 0 times (0 internal); blocks: 0B cached; points: 3 (9B keys, 29KB values)
+
+enable-flushes
+----

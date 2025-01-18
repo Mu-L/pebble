@@ -148,7 +148,7 @@ func TestMarker(t *testing.T) {
 
 		case "touch":
 			for _, filename := range strings.Split(td.Input, "\n") {
-				f, err := memFS.Create(filename)
+				f, err := memFS.Create(filename, vfs.WriteCategoryUnspecified)
 				if err != nil {
 					return err.Error()
 				}
@@ -166,7 +166,7 @@ func TestMarker(t *testing.T) {
 
 func TestMarker_StrictSync(t *testing.T) {
 	// Use an in-memory FS that strictly enforces syncs.
-	mem := vfs.NewStrictMem()
+	mem := vfs.NewCrashableMem()
 	syncDir := func(dir string) {
 		fdir, err := mem.OpenDir(dir)
 		require.NoError(t, err)
@@ -184,16 +184,16 @@ func TestMarker_StrictSync(t *testing.T) {
 
 	// Discard any unsynced writes to make sure we set up the test
 	// preconditions correctly.
-	mem.ResetToSyncedState()
-	m, v, err = LocateMarker(mem, "foo", "bar")
+	crashFS := mem.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: 0})
+	m, v, err = LocateMarker(crashFS, "foo", "bar")
 	require.NoError(t, err)
 	require.Equal(t, "hello", v)
 	require.NoError(t, m.Move("hello-world"))
 	require.NoError(t, m.Close())
 
 	// Discard any unsynced writes.
-	mem.ResetToSyncedState()
-	m, v, err = LocateMarker(mem, "foo", "bar")
+	crashFS = crashFS.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: 0})
+	m, v, err = LocateMarker(crashFS, "foo", "bar")
 	require.NoError(t, err)
 	require.Equal(t, "hello-world", v)
 	require.NoError(t, m.Close())
@@ -210,9 +210,9 @@ func TestMarker_FaultTolerance(t *testing.T) {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			var count atomic.Int32
 			count.Store(int32(i))
-			inj := errorfs.InjectorFunc(func(op errorfs.Op, path string) error {
+			inj := errorfs.InjectorFunc(func(op errorfs.Op) error {
 				// Don't inject on Sync errors. They're fatal.
-				if op == errorfs.OpFileSync {
+				if op.Kind == errorfs.OpFileSync {
 					return nil
 				}
 				if v := count.Add(-1); v == 0 {

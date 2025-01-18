@@ -5,9 +5,12 @@
 package tool
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/cockroachdb/errors"
@@ -16,11 +19,13 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/tool/logs"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/spf13/cobra"
 )
 
@@ -29,6 +34,7 @@ import (
 type dbT struct {
 	Root       *cobra.Command
 	Check      *cobra.Command
+	Upgrade    *cobra.Command
 	Checkpoint *cobra.Command
 	Get        *cobra.Command
 	Logs       *cobra.Command
@@ -38,11 +44,15 @@ type dbT struct {
 	Set        *cobra.Command
 	Space      *cobra.Command
 	IOBench    *cobra.Command
+	Excise     *cobra.Command
 
 	// Configuration.
-	opts      *pebble.Options
-	comparers sstable.Comparers
-	mergers   sstable.Mergers
+	opts            *pebble.Options
+	comparers       sstable.Comparers
+	mergers         sstable.Mergers
+	openErrEnhancer func(error) error
+	openOptions     []OpenOption
+	exciseSpanFn    DBExciseSpanFn
 
 	// Flags.
 	comparerName  string
@@ -57,21 +67,37 @@ type dbT struct {
 	ioParallelism int
 	ioSizes       string
 	verbose       bool
+	bypassPrompt  bool
+	lsmURL        bool
 }
 
-func newDB(opts *pebble.Options, comparers sstable.Comparers, mergers sstable.Mergers) *dbT {
+func newDB(
+	opts *pebble.Options,
+	comparers sstable.Comparers,
+	mergers sstable.Mergers,
+	openErrEnhancer func(error) error,
+	openOptions []OpenOption,
+	exciseSpanFn DBExciseSpanFn,
+) *dbT {
 	d := &dbT{
-		opts:      opts,
-		comparers: comparers,
-		mergers:   mergers,
+		opts:            opts,
+		comparers:       comparers,
+		mergers:         mergers,
+		openErrEnhancer: openErrEnhancer,
+		openOptions:     openOptions,
+		exciseSpanFn:    exciseSpanFn,
 	}
 	d.fmtKey.mustSet("quoted")
 	d.fmtValue.mustSet("[%x]")
 
 	d.Root = &cobra.Command{
-		Use:   "db",
-		Short: "DB introspection tools",
+		Use:     "db",
+		Short:   "DB introspection tools",
+		Version: fmt.Sprintf("supported Pebble format versions: %d-%d", pebble.FormatMinSupported, pebble.FormatNewest),
 	}
+	d.Root.SetVersionTemplate(`{{printf "%s" .Short}}
+{{printf "%s" .Version}}
+`)
 	d.Check = &cobra.Command{
 		Use:   "check <dir>",
 		Short: "verify checksums and metadata",
@@ -81,6 +107,17 @@ database not be in use by another process.
 `,
 		Args: cobra.ExactArgs(1),
 		Run:  d.runCheck,
+	}
+	d.Upgrade = &cobra.Command{
+		Use:   "upgrade <dir>",
+		Short: "upgrade the DB internal format version",
+		Long: `
+Upgrades the DB internal format version to the latest version.
+It is recommended to make a backup copy of the DB directory before upgrading.
+Requires that the specified database not be in use by another process.
+`,
+		Args: cobra.ExactArgs(1),
+		Run:  d.runUpgrade,
 	}
 	d.Checkpoint = &cobra.Command{
 		Use:   "checkpoint <src-dir> <dest-dir>",
@@ -155,6 +192,16 @@ use by another process.
 		Args: cobra.ExactArgs(1),
 		Run:  d.runSpace,
 	}
+	d.Excise = &cobra.Command{
+		Use:   "excise <dir>",
+		Short: "excise a key range",
+		Long: `
+Excise a key range, removing all SSTs inside the range and virtualizing any SSTs
+that partially overlap the range.
+`,
+		Args: cobra.ExactArgs(1),
+		Run:  d.runExcise,
+	}
 	d.IOBench = &cobra.Command{
 		Use:   "io-bench <dir>",
 		Short: "perform sstable IO benchmark",
@@ -166,32 +213,46 @@ specified database.
 		Run:  d.runIOBench,
 	}
 
-	d.Root.AddCommand(d.Check, d.Checkpoint, d.Get, d.Logs, d.LSM, d.Properties, d.Scan, d.Set, d.Space, d.IOBench)
+	d.Root.AddCommand(d.Check, d.Upgrade, d.Checkpoint, d.Get, d.Logs, d.LSM, d.Properties, d.Scan, d.Set, d.Space, d.Excise, d.IOBench)
 	d.Root.PersistentFlags().BoolVarP(&d.verbose, "verbose", "v", false, "verbose output")
 
-	for _, cmd := range []*cobra.Command{d.Check, d.Checkpoint, d.Get, d.LSM, d.Properties, d.Scan, d.Set, d.Space} {
+	for _, cmd := range []*cobra.Command{d.Check, d.Upgrade, d.Checkpoint, d.Get, d.LSM, d.Properties, d.Scan, d.Set, d.Space, d.Excise} {
 		cmd.Flags().StringVar(
 			&d.comparerName, "comparer", "", "comparer name (use default if empty)")
 		cmd.Flags().StringVar(
 			&d.mergerName, "merger", "", "merger name (use default if empty)")
 	}
 
-	for _, cmd := range []*cobra.Command{d.Scan, d.Space} {
-		cmd.Flags().Var(
-			&d.start, "start", "start key for the range")
-		cmd.Flags().Var(
-			&d.end, "end", "end key for the range")
-	}
-
-	d.Scan.Flags().Var(
-		&d.fmtKey, "key", "key formatter")
 	for _, cmd := range []*cobra.Command{d.Scan, d.Get} {
 		cmd.Flags().Var(
 			&d.fmtValue, "value", "value formatter")
 	}
+	for _, cmd := range []*cobra.Command{d.Upgrade, d.Excise} {
+		cmd.Flags().BoolVarP(
+			&d.bypassPrompt, "yes", "y", false, "bypass prompt")
+	}
 
+	d.LSM.Flags().BoolVar(
+		&d.lsmURL, "url", false, "generate LSM viewer URL")
+
+	d.Space.Flags().Var(
+		&d.start, "start", "start key for the range")
+	d.Space.Flags().Var(
+		&d.end, "end", "inclusive end key for the range")
+
+	d.Scan.Flags().Var(
+		&d.fmtKey, "key", "key formatter")
+	d.Scan.Flags().Var(
+		&d.start, "start", "start key for the range")
+	d.Scan.Flags().Var(
+		&d.end, "end", "exclusive end key for the range")
 	d.Scan.Flags().Int64Var(
 		&d.count, "count", 0, "key count for scan (0 is unlimited)")
+
+	d.Excise.Flags().Var(
+		&d.start, "start", "start key for the excised range")
+	d.Excise.Flags().Var(
+		&d.end, "end", "exclusive end key for the excised range")
 
 	d.IOBench.Flags().BoolVar(
 		&d.allLevels, "all-levels", false, "if set, benchmark all levels (default is only L5/L6)")
@@ -276,13 +337,26 @@ func (d *dbT) loadOptions(dir string) error {
 	return nil
 }
 
-type openOption interface {
-	apply(opts *pebble.Options)
+// OpenOption is an option that may be applied to the *pebble.Options before
+// calling pebble.Open.
+type OpenOption interface {
+	Apply(dirname string, opts *pebble.Options)
 }
 
-func (d *dbT) openDB(dir string, openOptions ...openOption) (*pebble.DB, error) {
-	if err := d.loadOptions(dir); err != nil {
+func (d *dbT) openDB(dir string, openOptions ...OpenOption) (*pebble.DB, error) {
+	db, err := d.openDBInternal(dir, openOptions...)
+	if err != nil {
+		if d.openErrEnhancer != nil {
+			err = d.openErrEnhancer(err)
+		}
 		return nil, err
+	}
+	return db, nil
+}
+
+func (d *dbT) openDBInternal(dir string, openOptions ...OpenOption) (*pebble.DB, error) {
+	if err := d.loadOptions(dir); err != nil {
+		return nil, errors.Wrap(err, "error loading options")
 	}
 	if d.comparerName != "" {
 		d.opts.Comparer = d.comparers[d.comparerName]
@@ -298,77 +372,110 @@ func (d *dbT) openDB(dir string, openOptions ...openOption) (*pebble.DB, error) 
 	}
 	opts := *d.opts
 	for _, opt := range openOptions {
-		opt.apply(&opts)
+		opt.Apply(dir, &opts)
+	}
+	for _, opt := range d.openOptions {
+		opt.Apply(dir, &opts)
 	}
 	opts.Cache = pebble.NewCache(128 << 20 /* 128 MB */)
 	defer opts.Cache.Unref()
 	return pebble.Open(dir, &opts)
 }
 
-func (d *dbT) closeDB(stdout io.Writer, db *pebble.DB) {
+func (d *dbT) closeDB(stderr io.Writer, db *pebble.DB) {
 	if err := db.Close(); err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 	}
 }
 
 func (d *dbT) runCheck(cmd *cobra.Command, args []string) {
-	stdout := cmd.OutOrStdout()
+	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	db, err := d.openDB(args[0])
 	if err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 		return
 	}
-	defer d.closeDB(stdout, db)
+	defer d.closeDB(stderr, db)
 
 	var stats pebble.CheckLevelsStats
 	if err := db.CheckLevels(&stats); err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 	}
 	fmt.Fprintf(stdout, "checked %d %s and %d %s\n",
 		stats.NumPoints, makePlural("point", stats.NumPoints), stats.NumTombstones, makePlural("tombstone", int64(stats.NumTombstones)))
 }
 
-type nonReadOnly struct{}
+func (d *dbT) runUpgrade(cmd *cobra.Command, args []string) {
+	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
+	db, err := d.openDB(args[0], nonReadOnly{})
+	if err != nil {
+		fmt.Fprintf(stderr, "%s\n", err)
+		return
+	}
+	defer d.closeDB(stderr, db)
 
-func (n nonReadOnly) apply(opts *pebble.Options) {
-	opts.ReadOnly = false
-	// Increase the L0 compaction threshold to reduce the likelihood of an
-	// unintended compaction changing test output.
-	opts.L0CompactionThreshold = 10
+	targetVersion := pebble.FormatNewest
+	current := db.FormatMajorVersion()
+	if current >= targetVersion {
+		fmt.Fprintf(stdout, "DB is already at internal version %d.\n", current)
+		return
+	}
+	fmt.Fprintf(stdout, "Upgrading DB from internal version %d to %d.\n", current, targetVersion)
+
+	prompt := `WARNING!!!
+This DB will not be usable with older versions of Pebble!
+
+It is strongly recommended to back up the data before upgrading.
+`
+
+	if len(d.opts.BlockPropertyCollectors) == 0 {
+		prompt += `
+If this DB uses custom block property collectors, the upgrade should be invoked
+through a custom binary that configures them. Otherwise, any new tables created
+during upgrade will not have the relevant block properties.
+`
+	}
+	if !d.promptForConfirmation(prompt, cmd.InOrStdin(), stdout, stderr) {
+		return
+	}
+	if err := db.RatchetFormatMajorVersion(targetVersion); err != nil {
+		fmt.Fprintf(stderr, "error: %s\n", err)
+	}
+	fmt.Fprintf(stdout, "Upgrade complete.\n")
 }
 
 func (d *dbT) runCheckpoint(cmd *cobra.Command, args []string) {
-	stdout := cmd.OutOrStdout()
+	stderr := cmd.ErrOrStderr()
 	db, err := d.openDB(args[0], nonReadOnly{})
 	if err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 		return
 	}
-	defer d.closeDB(stdout, db)
+	defer d.closeDB(stderr, db)
 	destDir := args[1]
 
 	if err := db.Checkpoint(destDir); err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 	}
 }
 
 func (d *dbT) runGet(cmd *cobra.Command, args []string) {
-	stdout := cmd.OutOrStdout()
+	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	db, err := d.openDB(args[0])
 	if err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 		return
 	}
-	defer d.closeDB(stdout, db)
+	defer d.closeDB(stderr, db)
 	var k key
 	if err := k.Set(args[1]); err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 		return
 	}
 
 	val, closer, err := db.Get(k)
 	if err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 		return
 	}
 	defer func() {
@@ -382,25 +489,28 @@ func (d *dbT) runGet(cmd *cobra.Command, args []string) {
 }
 
 func (d *dbT) runLSM(cmd *cobra.Command, args []string) {
-	stdout := cmd.OutOrStdout()
+	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	db, err := d.openDB(args[0])
 	if err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 		return
 	}
-	defer d.closeDB(stdout, db)
+	defer d.closeDB(stderr, db)
 
 	fmt.Fprintf(stdout, "%s", db.Metrics())
+	if d.lsmURL {
+		fmt.Fprintf(stdout, "\nLSM viewer: %s\n", db.LSMViewURL())
+	}
 }
 
 func (d *dbT) runScan(cmd *cobra.Command, args []string) {
-	stdout := cmd.OutOrStdout()
+	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	db, err := d.openDB(args[0])
 	if err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 		return
 	}
-	defer d.closeDB(stdout, db)
+	defer d.closeDB(stderr, db)
 
 	// Update the internal formatter if this comparator has one specified.
 	if d.opts.Comparer != nil {
@@ -413,7 +523,7 @@ func (d *dbT) runScan(cmd *cobra.Command, args []string) {
 	fmtValues := d.fmtValue.spec != "null"
 	var count int64
 
-	iter := db.NewIter(&pebble.IterOptions{
+	iter, _ := db.NewIter(&pebble.IterOptions{
 		UpperBound: d.end,
 	})
 	for valid := iter.SeekGE(d.start); valid; valid = iter.Next() {
@@ -439,7 +549,7 @@ func (d *dbT) runScan(cmd *cobra.Command, args []string) {
 	}
 
 	if err := iter.Close(); err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 	}
 
 	elapsed := timeNow().Sub(start)
@@ -449,7 +559,7 @@ func (d *dbT) runScan(cmd *cobra.Command, args []string) {
 }
 
 func (d *dbT) runSpace(cmd *cobra.Command, args []string) {
-	stdout, stderr := cmd.OutOrStdout(), cmd.OutOrStderr()
+	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	db, err := d.openDB(args[0])
 	if err != nil {
 		fmt.Fprintf(stderr, "%s\n", err)
@@ -465,8 +575,101 @@ func (d *dbT) runSpace(cmd *cobra.Command, args []string) {
 	fmt.Fprintf(stdout, "%d\n", bytes)
 }
 
+func (d *dbT) getExciseSpan() (pebble.KeyRange, error) {
+	// If a DBExciseSpanFn is specified, try to use it and see if it returns a
+	// valid span.
+	if d.exciseSpanFn != nil {
+		span, err := d.exciseSpanFn()
+		if err != nil {
+			return pebble.KeyRange{}, err
+		}
+		if span.Valid() {
+			if d.start != nil || d.end != nil {
+				return pebble.KeyRange{}, errors.Errorf(
+					"--start/--end cannot be used when span is specified by other methods.")
+			}
+			return span, nil
+		}
+	}
+	if d.start == nil || d.end == nil {
+		return pebble.KeyRange{}, errors.Errorf("excise range not specified.")
+	}
+	return pebble.KeyRange{
+		Start: d.start,
+		End:   d.end,
+	}, nil
+}
+
+func (d *dbT) runExcise(cmd *cobra.Command, args []string) {
+	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
+
+	span, err := d.getExciseSpan()
+	if err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return
+	}
+
+	dbOpts := d.opts.EnsureDefaults()
+	// Disable all processes that would try to open tables: table stats,
+	// consistency check, automatic compactions.
+	dbOpts.DisableTableStats = true
+	dbOpts.DisableConsistencyCheck = true
+	dbOpts.DisableAutomaticCompactions = true
+
+	dbDir := args[0]
+	db, err := d.openDB(dbDir, nonReadOnly{})
+	if err != nil {
+		fmt.Fprintf(stderr, "%s\n", err)
+		return
+	}
+	defer d.closeDB(stdout, db)
+
+	// Update the internal formatter if this comparator has one specified.
+	if d.opts.Comparer != nil {
+		d.fmtKey.setForComparer(d.opts.Comparer.Name, d.comparers)
+	}
+
+	fmt.Fprintf(stdout, "Excising range:\n")
+	fmt.Fprintf(stdout, "  start: %s\n", d.fmtKey.fn(span.Start))
+	fmt.Fprintf(stdout, "  end:   %s\n", d.fmtKey.fn(span.End))
+
+	prompt := `WARNING!!!
+This command will remove all keys in this range!`
+	if !d.promptForConfirmation(prompt, cmd.InOrStdin(), stdout, stderr) {
+		return
+	}
+
+	// Write a temporary sst that only has excise tombstones. We write it inside
+	// the database directory so that the command works against any FS.
+	// TODO(radu): remove this if we add a separate DB.Excise method.
+	path := dbOpts.FS.PathJoin(dbDir, fmt.Sprintf("excise-%0x.sst", rand.Uint32()))
+	defer dbOpts.FS.Remove(path)
+	f, err := dbOpts.FS.Create(path, vfs.WriteCategoryUnspecified)
+	if err != nil {
+		fmt.Fprintf(stderr, "Error creating temporary sst file %q: %s\n", path, err)
+		return
+	}
+	writable := objstorageprovider.NewFileWritable(f)
+	writerOpts := dbOpts.MakeWriterOptions(0, db.TableFormat())
+	w := sstable.NewWriter(writable, writerOpts)
+	err = w.DeleteRange(span.Start, span.End)
+	err = errors.CombineErrors(err, w.RangeKeyDelete(span.Start, span.End))
+	err = errors.CombineErrors(err, w.Close())
+	if err != nil {
+		fmt.Fprintf(stderr, "Error writing temporary sst file %q: %s\n", path, err)
+		return
+	}
+
+	_, err = db.IngestAndExcise(context.Background(), []string{path}, nil, nil, span)
+	if err != nil {
+		fmt.Fprintf(stderr, "Error excising: %s\n", err)
+		return
+	}
+	fmt.Fprintf(stdout, "Excise complete.\n")
+}
+
 func (d *dbT) runProperties(cmd *cobra.Command, args []string) {
-	stdout, stderr := cmd.OutOrStdout(), cmd.OutOrStderr()
+	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	dirname := args[0]
 	err := func() error {
 		desc, err := pebble.Peek(dirname, d.opts.FS)
@@ -511,8 +714,8 @@ func (d *dbT) runProperties(cmd *cobra.Command, args []string) {
 			}
 		}
 		v, err := bve.Apply(
-			nil /* version */, cmp.Compare, d.fmtKey.fn, d.opts.FlushSplitBytes,
-			d.opts.Experimental.ReadCompactionRate, nil, /* zombies */
+			nil /* version */, cmp, d.opts.FlushSplitBytes,
+			d.opts.Experimental.ReadCompactionRate,
 		)
 		if err != nil {
 			return err
@@ -620,26 +823,66 @@ func (d *dbT) runProperties(cmd *cobra.Command, args []string) {
 }
 
 func (d *dbT) runSet(cmd *cobra.Command, args []string) {
-	stdout := cmd.OutOrStdout()
+	stderr := cmd.ErrOrStderr()
 	db, err := d.openDB(args[0], nonReadOnly{})
 	if err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 		return
 	}
-	defer d.closeDB(stdout, db)
+	defer d.closeDB(stderr, db)
 	var k, v key
 	if err := k.Set(args[1]); err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 		return
 	}
 	if err := v.Set(args[2]); err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 		return
 	}
 
 	if err := db.Set(k, v, nil); err != nil {
-		fmt.Fprintf(stdout, "%s\n", err)
+		fmt.Fprintf(stderr, "%s\n", err)
 	}
+}
+
+func (d *dbT) promptForConfirmation(prompt string, stdin io.Reader, stdout, stderr io.Writer) bool {
+	if d.bypassPrompt {
+		return true
+	}
+	if _, err := fmt.Fprintf(stdout, "%s\n", prompt); err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return false
+	}
+	reader := bufio.NewReader(stdin)
+	for {
+		if _, err := fmt.Fprintf(stdout, "Continue? [Y/N] "); err != nil {
+			fmt.Fprintf(stderr, "Error: %v\n", err)
+			return false
+		}
+		answer, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Fprintf(stderr, "Error: %v\n", err)
+			return false
+		}
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if answer == "y" || answer == "yes" {
+			return true
+		}
+
+		if answer == "n" || answer == "no" {
+			_, _ = fmt.Fprintf(stderr, "Aborting\n")
+			return false
+		}
+	}
+}
+
+type nonReadOnly struct{}
+
+func (n nonReadOnly) Apply(dirname string, opts *pebble.Options) {
+	opts.ReadOnly = false
+	// Increase the L0 compaction threshold to reduce the likelihood of an
+	// unintended compaction changing test output.
+	opts.L0CompactionThreshold = 10
 }
 
 func propArgs(props []props, getProp func(*props) interface{}) []interface{} {
@@ -652,8 +895,8 @@ func propArgs(props []props, getProp func(*props) interface{}) []interface{} {
 
 type props struct {
 	Count                      uint64
-	SmallestSeqNum             uint64
-	LargestSeqNum              uint64
+	SmallestSeqNum             base.SeqNum
+	LargestSeqNum              base.SeqNum
 	DataSize                   uint64
 	FilterSize                 uint64
 	IndexSize                  uint64
@@ -716,7 +959,13 @@ func (d *dbT) addProps(
 	if err != nil {
 		return err
 	}
-	r, err := sstable.NewReader(f, sstable.ReaderOptions{}, d.mergers, d.comparers)
+	opts := d.opts.MakeReaderOptions()
+	opts.Mergers = d.mergers
+	opts.Comparers = d.comparers
+	opts.ReaderOptions.CacheOpts = sstableinternal.CacheOptions{
+		FileNum: m.FileBacking.DiskFileNum,
+	}
+	r, err := sstable.NewReader(ctx, f, opts)
 	if err != nil {
 		_ = f.Close()
 		return err

@@ -6,7 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/batchrepr"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datatest"
 	"github.com/cockroachdb/pebble/internal/humanize"
@@ -91,7 +92,7 @@ func runReplayTest(t *testing.T, path string) {
 			opts := &pebble.Options{
 				FS:                        fs,
 				Comparer:                  testkeys.Comparer,
-				FormatMajorVersion:        pebble.FormatRangeKeys,
+				FormatMajorVersion:        pebble.FormatMinSupported,
 				L0CompactionFileThreshold: 1,
 			}
 			setDefaultExperimentalOpts(opts)
@@ -111,7 +112,7 @@ func runReplayTest(t *testing.T, path string) {
 			return ""
 		case "scan-keys":
 			var buf bytes.Buffer
-			it := r.d.NewIter(nil)
+			it, _ := r.d.NewIter(nil)
 			defer it.Close()
 			for valid := it.First(); valid; valid = it.Next() {
 				fmt.Fprintf(&buf, "%s: %s\n", it.Key(), it.Value())
@@ -149,7 +150,7 @@ func runReplayTest(t *testing.T, path string) {
 }
 
 func setDefaultExperimentalOpts(opts *pebble.Options) {
-	opts.Experimental.TableCacheShards = 2
+	opts.Experimental.FileCacheShards = 2
 }
 
 func TestReplay(t *testing.T) {
@@ -168,13 +169,13 @@ func TestLoadFlushedSSTableKeys(t *testing.T) {
 		EventListener: &pebble.EventListener{
 			FlushEnd: func(info pebble.FlushInfo) {
 				for _, tbl := range info.Output {
-					diskFileNums = append(diskFileNums, tbl.FileNum.DiskFileNum())
+					diskFileNums = append(diskFileNums, base.PhysicalTableDiskFileNum(tbl.FileNum))
 				}
 			},
 		},
 		FS:                 vfs.NewMem(),
 		Comparer:           testkeys.Comparer,
-		FormatMajorVersion: pebble.FormatRangeKeys,
+		FormatMajorVersion: pebble.FormatMinSupported,
 	}
 	d, err := pebble.Open("", opts)
 	require.NoError(t, err)
@@ -204,8 +205,9 @@ func TestLoadFlushedSSTableKeys(t *testing.T) {
 				return err.Error()
 			}
 
-			br, _ := pebble.ReadBatch(b.Repr())
-			for kind, ukey, v, ok := br.Next(); ok; kind, ukey, v, ok = br.Next() {
+			br := batchrepr.Read(b.Repr())
+			kind, ukey, v, ok, err := br.Next()
+			for ; ok; kind, ukey, v, ok, err = br.Next() {
 				fmt.Fprintf(&buf, "%s.%s", ukey, kind)
 				switch kind {
 				case base.InternalKeyKindRangeDelete,
@@ -229,6 +231,9 @@ func TestLoadFlushedSSTableKeys(t *testing.T) {
 					fmt.Fprintf(&buf, ": %x", v)
 				}
 				fmt.Fprintln(&buf)
+			}
+			if err != nil {
+				fmt.Fprintf(&buf, "err: %s\n", err)
 			}
 
 			s := buf.String()
@@ -278,7 +283,7 @@ func collectCorpus(t *testing.T, fs *vfs.MemFS, name string) {
 			opts := &pebble.Options{
 				Comparer:                    testkeys.Comparer,
 				DisableAutomaticCompactions: true,
-				FormatMajorVersion:          pebble.FormatRangeKeys,
+				FormatMajorVersion:          pebble.FormatMinSupported,
 				FS:                          fs,
 				MaxManifestFileSize:         96,
 			}
@@ -330,17 +335,19 @@ func collectCorpus(t *testing.T, fs *vfs.MemFS, name string) {
 			if fT != "file" {
 				fileNumInt, err := strconv.Atoi(td.CmdArgs[2].String())
 				require.NoError(t, err)
-				fileNum := base.FileNum(fileNumInt)
+				fileNum := base.DiskFileNum(fileNumInt)
 				switch fT {
 				case "table":
-					filePath = base.MakeFilepath(fs, dir, base.FileTypeTable, fileNum.DiskFileNum())
+					filePath = base.MakeFilepath(fs, dir, base.FileTypeTable, fileNum)
 				case "log":
-					filePath = base.MakeFilepath(fs, dir, base.FileTypeLog, fileNum.DiskFileNum())
+					// TODO(jackson): expose a func from the wal package for
+					// constructing log filenames for tests?
+					filePath = fs.PathJoin(dir, fmt.Sprintf("%s.log", fileNum))
 				case "manifest":
-					filePath = base.MakeFilepath(fs, dir, base.FileTypeManifest, fileNum.DiskFileNum())
+					filePath = base.MakeFilepath(fs, dir, base.FileTypeManifest, fileNum)
 				}
 			}
-			f, err := fs.Create(filePath)
+			f, err := fs.Create(filePath, vfs.WriteCategoryUnspecified)
 			require.NoError(t, err)
 			b, err := hex.DecodeString(strings.ReplaceAll(td.Input, "\n", ""))
 			require.NoError(t, err)
@@ -434,7 +441,7 @@ func TestBenchmarkString(t *testing.T) {
 	var buf bytes.Buffer
 	require.NoError(t, m.WriteBenchmarkString("tpcc", &buf))
 	require.Equal(t, strings.TrimSpace(`
-BenchmarkBenchmarkReplay/tpcc/CompactionCounts 1 0 compactions 0 default 0 delete 0 elision 0 move 0 read 0 rewrite 0 multilevel
+BenchmarkBenchmarkReplay/tpcc/CompactionCounts 1 0 compactions 0 default 0 delete 0 elision 0 move 0 read 0 rewrite 0 copy 0 multilevel
 BenchmarkBenchmarkReplay/tpcc/DatabaseSize/mean 1 5.36870912e+09 bytes
 BenchmarkBenchmarkReplay/tpcc/DatabaseSize/max 1 5.36870912e+09 bytes
 BenchmarkBenchmarkReplay/tpcc/DurationWorkload 1 1 sec/op
@@ -507,6 +514,9 @@ func TestCompactionsQuiesce(t *testing.T) {
 			wait := 30 * time.Second
 			if invariants.Enabled {
 				wait = time.Minute
+				if invariants.RaceEnabled {
+					wait = 5 * time.Minute
+				}
 			}
 
 			// The above call to [Wait] should eventually return. [Wait] blocks
@@ -560,18 +570,20 @@ func buildHeavyWorkload(t *testing.T) vfs.FS {
 	ks := testkeys.Alpha(5)
 	var bufKey = make([]byte, ks.MaxLen())
 	var bufVal [512]byte
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	for i := 0; i < 100; i++ {
 		b := d.NewBatch()
 		for j := 0; j < 1000; j++ {
-			rng.Read(bufVal[:])
-			n := testkeys.WriteKey(bufKey[:], ks, rng.Intn(ks.Count()))
+			for k := range bufVal {
+				bufVal[k] = byte(rng.Uint32())
+			}
+			n := testkeys.WriteKey(bufKey[:], ks, rng.Int64N(ks.Count()))
 			require.NoError(t, b.Set(bufKey[:n], bufVal[:], pebble.NoSync))
 		}
 		require.NoError(t, b.Commit(pebble.NoSync))
 		require.NoError(t, d.Flush())
 	}
-	wc.Stop()
+	wc.WaitAndStop()
 
 	defer d.Close()
 	return destFS

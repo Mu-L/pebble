@@ -1,26 +1,36 @@
 # Format for define command:
+#
+# L
+#   <filenum>:[<smallest-key>-<largest-key>)
+#     kv kv kv ..
+#     kv kv ..
+#   <filenum>:[<smallest-key>-<largest-key>)
+#     kv kv kv ..
+#     kv kv ..
+# L
+# ...
+#
 # Levels are ordered from higher to lower, and each new level starts with an L
-# Each level is defined using an even number of lines where every pair of lines represents
-# a file. The files within a level are ordered from smaller to larger keys.
-# Each file is defined using: the first line specifies the smallest and largest internal
-# keys and the second line the point key-value pairs in the sstable in order. The rangedel
-# key-value pairs should also be in increasing order relative to the other rangedel pairs.
-# The largest file key can take the form of <userkey>.RANGEDEL.72057594037927935, which
-# represents the range deletion sentinel.
+# For each level, one or more files are defined. A file definition starts with
+# the file metadata representation, at one indentation level. Followed are KVs
+# arbitrarily spread over one or more lines, at two indentation levels. Point
+# KVs should be ordered relative to each other, and rangedels should be ordered
+# relative to each other.
 
 # The rangedel should not delete any points in any sstable.  The two files were involved in a
 # compaction and then the second file got moved to a lower level.
 define
 L
-a.SET.30 e.RANGEDEL.72057594037927935
-a.SET.30:30 c.SET.27:27 a.RANGEDEL.8:f
-L
-e.SET.10 g.SET.20
-e.SET.10:10 g.SET.20:20 e.RANGEDEL.8:f
-----
-1:
   000000:[a#30,SET-e#inf,RANGEDEL]
-2:
+    a#30,SET:30 c#27,SET:27
+    a#8,RANGEDEL:e
+L
+  000001:[e#10,SET-g#20,SET]
+    e#10,SET:10 g#20,SET:20 e#8,RANGEDEL:g
+----
+L1:
+  000000:[a#30,SET-e#inf,RANGEDEL]
+L2:
   000001:[e#10,SET-g#20,SET]
 
 # isNextEntryDeleted() should not allow the rangedel to act on the points in the lower sstable
@@ -35,12 +45,12 @@ stats
 reset-stats
 stats
 ----
-a#30,1:30
-c#27,1:27
-e#10,1:10
-g#20,1:20
+a#30,SET:30
+c#27,SET:27
+e#10,SET:10
+g#20,SET:20
 .
-{BlockBytes:116 BlockBytesInCache:0 BlockReadDuration:0s KeyBytes:5 ValueBytes:8 PointCount:5 PointsCoveredByRangeTombstones:0 SeparatedPointValue:{Count:0 ValueBytes:0 ValueBytesFetched:0}}
+{BlockBytes:200 BlockBytesInCache:0 BlockReadDuration:0s KeyBytes:4 ValueBytes:8 PointCount:4 PointsCoveredByRangeTombstones:0 SeparatedPointValue:{Count:0 ValueBytes:0 ValueBytesFetched:0}}
 {BlockBytes:0 BlockBytesInCache:0 BlockReadDuration:0s KeyBytes:0 ValueBytes:0 PointCount:0 PointsCoveredByRangeTombstones:0 SeparatedPointValue:{Count:0 ValueBytes:0 ValueBytesFetched:0}}
 
 # seekGE() should not allow the rangedel to act on points in the lower sstable that are after it.
@@ -49,9 +59,27 @@ seek-ge d
 next
 next
 ----
-e#10,1:10
-g#20,1:20
+e#10,SET:10
+g#20,SET:20
 .
+
+iter probe-rangedels=(000000,(Log "#  000000.rangeDelIter.")) probe-rangedels=(000001,(If (Equal SeekKey (Bytes "g")) ErrInjected noop),(Log "#  000001.rangeDelIter."))
+seek-ge d
+next
+----
+#  000000.rangeDelIter.opSpanSeekGE("d") = a-e:{(#8,RANGEDEL)}
+#  000000.rangeDelIter.opSpanSeekGE("d") = a-e:{(#8,RANGEDEL)}
+#  000001.rangeDelIter.opSpanSeekGE("e") = e-g:{(#8,RANGEDEL)}
+#  000001.rangeDelIter.opSpanSeekGE("e") = e-g:{(#8,RANGEDEL)}
+#  000000.rangeDelIter.opSpanSeekGE("d") = a-e:{(#8,RANGEDEL)}
+#  000000.rangeDelIter.opSpanNext() = nil
+#  000000.rangeDelIter.opSpanClose() = nil
+#  000000.rangeDelIter.opSpanClose() = nil
+#  000001.rangeDelIter.opSpanSeekGE("e") = e-g:{(#8,RANGEDEL)}
+e#10,SET:10
+#  000001.rangeDelIter.opSpanNext() = nil
+#  000001.rangeDelIter.opSpanSeekGE("g") = nil <err="injected error">
+err=injected error
 
 # isPrevEntryDeleted() should not allow the rangedel to act on the points in the lower sstable
 # that are after it.
@@ -61,10 +89,10 @@ prev
 prev
 prev
 ----
-g#20,1:20
-e#10,1:10
-c#27,1:27
-a#30,1:30
+g#20,SET:20
+e#10,SET:10
+c#27,SET:27
+a#30,SET:30
 
 # seekLT() should not allow the rangedel to act on points in the lower sstable that are after it.
 iter
@@ -73,25 +101,23 @@ prev
 prev
 prev
 ----
-g#20,1:20
-e#10,1:10
-c#27,1:27
-a#30,1:30
+g#20,SET:20
+e#10,SET:10
+c#27,SET:27
+a#30,SET:30
 
-# We keep the rangedel alive by having a point in the higher level past the first point in the
-# lower level. This rangedel hides that first point in the lower level but we should not seek to
-# h and hide the second point.
 define
 L
-a.SET.15 f.SET.16
-a.SET.15:15 c.SET.13:13 f.SET.16:16 a.RANGEDEL.12:h
-L
-e.SET.10 g.SET.15
-e.SET.10:10 g.SET.15:15
-----
-1:
   000002:[a#15,SET-f#16,SET]
-2:
+    a#15,SET:15 c#13,SET:13 f#16,SET:16
+    a#12,RANGEDEL:f
+L
+  000003:[e#10,SET-g#15,SET]
+    e#10,SET:10 g#15,SET:15
+----
+L1:
+  000002:[a#15,SET-f#16,SET]
+L2:
   000003:[e#10,SET-g#15,SET]
 
 iter
@@ -100,17 +126,17 @@ next
 next
 next
 ----
-a#15,1:15
-c#13,1:13
-f#16,1:16
-g#15,1:15
+a#15,SET:15
+c#13,SET:13
+f#16,SET:16
+g#15,SET:15
 
 iter
 seek-ge d
 next
 ----
-f#16,1:16
-g#15,1:15
+f#16,SET:16
+g#15,SET:15
 
 iter
 last
@@ -118,24 +144,24 @@ prev
 prev
 prev
 ----
-g#15,1:15
-f#16,1:16
-c#13,1:13
-a#15,1:15
+g#15,SET:15
+f#16,SET:16
+c#13,SET:13
+a#15,SET:15
 
-# The rangedel should not delete any points in any sstable.  The two files were involved in an
-# compaction and then the first file got moved to a lower level.
+# The rangedel should not delete any points in any sstable.
+
 define
 L
-c.SET.30 f.RANGEDEL.0
-c.SET.30:30 d.SET.27:27 a.RANGEDEL.8:f
+  000004:[c#30,SET-f#inf,RANGEDEL]
+    c#30,SET:30 d#27,SET:27 e#8,RANGEDEL:f
 L
-a.SET.10 c.RANGEDEL.72057594037927935
-a.SET.10:10 b.SET.12:12 a.RANGEDEL.8:f
+  000005:[a#10,SET-c#inf,RANGEDEL]
+    a#10,SET:10 b#12,SET:12 a#8,RANGEDEL:c
 ----
-1:
-  000004:[c#30,SET-f#0,RANGEDEL]
-2:
+L1:
+  000004:[c#30,SET-f#inf,RANGEDEL]
+L2:
   000005:[a#10,SET-c#inf,RANGEDEL]
 
 # isNextEntryDeleted() should not allow the rangedel to act on the points in the lower sstable
@@ -146,10 +172,10 @@ next
 next
 next
 ----
-a#10,1:10
-b#12,1:12
-c#30,1:30
-d#27,1:27
+a#10,SET:10
+b#12,SET:12
+c#30,SET:30
+d#27,SET:27
 
 # seekGE() should not allow the rangedel to act on points in the lower sstable that are before it.
 iter
@@ -158,10 +184,10 @@ next
 next
 next
 ----
-a#10,1:10
-b#12,1:12
-c#30,1:30
-d#27,1:27
+a#10,SET:10
+b#12,SET:12
+c#30,SET:30
+d#27,SET:27
 
 # isPrevEntryDeleted() should not allow the rangedel to act on the points in the lower sstable
 # that are before it.
@@ -171,10 +197,10 @@ prev
 prev
 prev
 ----
-d#27,1:27
-c#30,1:30
-b#12,1:12
-a#10,1:10
+d#27,SET:27
+c#30,SET:30
+b#12,SET:12
+a#10,SET:10
 
 # seekLT() should not allow the rangedel to act on points in the lower sstable that are before it.
 iter
@@ -183,25 +209,23 @@ prev
 prev
 prev
 ----
-d#27,1:27
-c#30,1:30
-b#12,1:12
-a#10,1:10
+d#27,SET:27
+c#30,SET:30
+b#12,SET:12
+a#10,SET:10
 
-# We keep the rangedel alive in prev iteration by having a point in the higher level before
-# the last point in the lower level. This rangedel hides that first point in the lower level
-# but we should not seek to a and hide the second point.
 define
 L
-c.SET.15 g.SET.16
-c.SET.15:15 f.SET.13:13 g.SET.16:16 a.RANGEDEL.12:h
-L
-b.SET.14 d.SET.10
-b.SET.14:14 d.SET.10:10
-----
-1:
   000006:[c#15,SET-g#16,SET]
-2:
+    c#15,SET:15 f#13,SET:13 g#16,SET:16
+    c#12,RANGEDEL:g
+L
+  000007:[b#14,SET-d#10,SET]
+    b#14,SET:14 d#10,SET:10
+----
+L1:
+  000006:[c#15,SET-g#16,SET]
+L2:
   000007:[b#14,SET-d#10,SET]
 
 iter
@@ -210,30 +234,30 @@ prev
 prev
 prev
 ----
-g#16,1:16
-f#13,1:13
-c#15,1:15
-b#14,1:14
+g#16,SET:16
+f#13,SET:13
+c#15,SET:15
+b#14,SET:14
 
 iter
 seek-lt f
 prev
 ----
-c#15,1:15
-b#14,1:14
+c#15,SET:15
+b#14,SET:14
 
 # The rangedel should not delete anything.
 define
 L
-a.SET.30 e.RANGEDEL.72057594037927935
-a.SET.30:30 c.SET.27:27 a.RANGEDEL.8:g
-L
-e.SET.10 g.SET.20
-e.SET.10:10 g.SET.20:20 e.RANGEDEL.8:g
-----
-1:
   000008:[a#30,SET-e#inf,RANGEDEL]
-2:
+    a#30,SET:30 c#27,SET:27 a#8,RANGEDEL:e
+L
+  000009:[e#10,SET-g#20,SET]
+    e#10,SET:10 g#20,SET:20 e#8,RANGEDEL:g
+----
+L1:
+  000008:[a#30,SET-e#inf,RANGEDEL]
+L2:
   000009:[e#10,SET-g#20,SET]
 
 # When doing seek-lt f, the rangedel should not apply to e in the lower sstable. This is the
@@ -244,25 +268,25 @@ seek-lt f
 prev
 prev
 ----
-e#10,1:10
-c#27,1:27
-a#30,1:30
+e#10,SET:10
+c#27,SET:27
+a#30,SET:30
 
 iter
 seek-ge e
 next
 ----
-e#10,1:10
-g#20,1:20
+e#10,SET:10
+g#20,SET:20
 
 iter
 first
 seek-ge e
 next
 ----
-a#30,1:30
-e#10,1:10
-g#20,1:20
+a#30,SET:30
+e#10,SET:10
+g#20,SET:20
 
 iter
 first
@@ -271,20 +295,20 @@ next
 next
 next
 ----
-a#30,1:30
-c#27,1:27
-e#10,1:10
-g#20,1:20
+a#30,SET:30
+c#27,SET:27
+e#10,SET:10
+g#20,SET:20
 .
 
 # Verify that switching directions respects lower/upper bound.
 
 define
 L
-a.SET.9 d.SET.6
-a.SET.9:9 b.SET.8:8 c.SET.7:7 d.SET.6:6
+  000010:[a#9,SET-d#6,SET]
+    a#9,SET:9 b#8,SET:8 c#7,SET:7 d#6,SET:6
 ----
-1:
+L1:
   000010:[a#9,SET-d#6,SET]
 
 # Verify the lower bound is respected in switchToMinHeap() when the
@@ -297,10 +321,10 @@ prev
 prev
 next
 ----
-c#7,1:7
+c#7,SET:7
 .
 .
-c#7,1:7
+c#7,SET:7
 
 # Verify the upper bound is respected in switchToMaxHeap() when the
 # heap is empty.
@@ -312,25 +336,25 @@ next
 next
 prev
 ----
-b#8,1:8
+b#8,SET:8
 .
 .
-b#8,1:8
+b#8,SET:8
 
 # Verify the lower bound is respected in switchToMinHeap() when the
 # heap is not empty.
 
 define
 L
-a.SET.9 d.SET.6
-a.SET.9:9 b.SET.8:8 c.SET.7:7 d.SET.6:6
-L
-c.SET.5 f.SET.2
-c.SET.5:5 d.SET.4:4 e.SET.3:3 f.SET.2:2
-----
-1:
   000011:[a#9,SET-d#6,SET]
-2:
+    a#9,SET:9 b#8,SET:8 c#7,SET:7 d#6,SET:6
+L
+  000012:[c#5,SET-f#2,SET]
+    c#5,SET:5 d#4,SET:4 e#3,SET:3 f#2,SET:2
+----
+L1:
+  000011:[a#9,SET-d#6,SET]
+L2:
   000012:[c#5,SET-f#2,SET]
 
 iter
@@ -341,11 +365,25 @@ prev
 next
 next
 ----
-d#6,1:6
+d#6,SET:6
 .
 .
-d#6,1:6
-d#4,1:4
+d#6,SET:6
+d#4,SET:4
+
+# Test the above but an error is encountered when Prev-ing to establish the min
+# heap. The error should be propagated up.
+iter probe-points=(000011,(If OpPrev ErrInjected noop),(Log "# L1.000011.")) probe-points=(000012,(Log "# L2.000012."))
+set-bounds lower=d
+seek-ge d
+prev
+----
+# L1.000011.SeekGE("d") = (d#6,SET,"6")
+# L2.000012.SeekGE("d") = (d#4,SET,"4")
+d#6,SET:6
+# L2.000012.Prev() = nil
+# L1.000011.Prev() = nil <err="injected error">
+err=injected error
 
 # Check the behavior of reverse prefix iteration.
 
@@ -354,7 +392,7 @@ seek-prefix-ge d
 prev
 next
 ----
-d#6,1:6
+d#6,SET:6
 err=pebble: unsupported reverse prefix iteration
 err=pebble: unsupported reverse prefix iteration
 
@@ -363,15 +401,15 @@ err=pebble: unsupported reverse prefix iteration
 
 define
 L
-c.SET.9 f.SET.6
-c.SET.9:9 d.SET.8:8 e.SET.7:7 f.SET.6:6
-L
-a.SET.5 d.SET.2
-a.SET.5:5 b.SET.4:4 c.SET.3:3 d.SET.2:2
-----
-1:
   000013:[c#9,SET-f#6,SET]
-2:
+    c#9,SET:9 d#8,SET:8 e#7,SET:7 f#6,SET:6
+L
+  000014:[a#5,SET-d#2,SET]
+    a#5,SET:5 b#4,SET:4 c#3,SET:3 d#2,SET:2
+----
+L1:
+  000013:[c#9,SET-f#6,SET]
+L2:
   000014:[a#5,SET-d#2,SET]
 
 iter
@@ -382,11 +420,24 @@ next
 prev
 prev
 ----
-c#3,1:3
+c#3,SET:3
 .
 .
-c#3,1:3
-c#9,1:9
+c#3,SET:3
+c#9,SET:9
+
+# Test the above scenario, but an error is encountered when Next-ing to switch
+# to a max heap. The error should be propagated to the caller.
+iter probe-points=(000013,(If OpNext ErrInjected noop),(Log "# L1.000013.")) probe-points=(000014,(Log "# L2.000014."))
+set-bounds upper=d
+seek-lt d
+next
+----
+# L1.000013.SeekLT("d") = (c#9,SET,"9")
+# L2.000014.SeekLT("d") = (c#3,SET,"3")
+c#3,SET:3
+# L1.000013.Next() = nil <err="injected error">
+err=injected error
 
 # Verify that the tombstone for the current level is updated correctly
 # when we advance the iterator on the level and step into a new
@@ -395,21 +446,21 @@ c#9,1:9
 
 define
 L
-a.SET.2 a.SET.2
-a.SET.2:2
-c.RANGEDEL.4 e.RANGEDEL.72057594037927935
-c.RANGEDEL.4:e
-f.SET.3 f.SET.3
-f.SET.3:3
+  000015:[a#2,SET-a#2,SET]
+    a#2,SET:2
+  000016:[c#4,RANGEDEL-e#inf,RANGEDEL]
+    c#4,RANGEDEL:e
+  000017:[f#3,SET-f#3,SET]
+    f#3,SET:3
 L
-a.SET.0 f.SET.0
-a.SET.0:1 b.SET.0:1 c.SET.0:1 d.SET.0:1 e.SET.0:1 f.SET.0:1
+  000018:[a#0,SET-f#0,SET]
+    a#0,SET:1 b#0,SET:1 c#0,SET:1 d#0,SET:1 e#0,SET:1 f#0,SET:1
 ----
-1:
+L1:
   000015:[a#2,SET-a#2,SET]
   000016:[c#4,RANGEDEL-e#inf,RANGEDEL]
   000017:[f#3,SET-f#3,SET]
-2:
+L2:
   000018:[a#0,SET-f#0,SET]
 
 iter
@@ -422,12 +473,12 @@ next
 next
 next
 ----
-a#2,1:2
-a#0,1:1
-b#0,1:1
-e#0,1:1
-f#3,1:3
-f#0,1:1
+a#2,SET:2
+a#0,SET:1
+b#0,SET:1
+e#0,SET:1
+f#3,SET:3
+f#0,SET:1
 .
 .
 
@@ -441,12 +492,12 @@ prev
 prev
 prev
 ----
-f#0,1:1
-f#3,1:3
-e#0,1:1
-b#0,1:1
-a#0,1:1
-a#2,1:2
+f#0,SET:1
+f#3,SET:3
+e#0,SET:1
+b#0,SET:1
+a#0,SET:1
+a#2,SET:2
 .
 .
 
@@ -455,20 +506,21 @@ a#2,1:2
 
 define
 L
-kq.RANGEDEL.100 p.RANGEDEL.72057594037927935
-kq.RANGEDEL.100:p
-L
-b.SET.90 o.SET.65
-b.SET.90:90 cat.SET.70:70 g.SET.80:80 o.SET.65:65
-L
-a.SET.41 z.RANGEDEL.72057594037927935
-a.SET.41:41 koujdlp.MERGE.37:37 ok.SET.46:46 v.SET.43:43 v.RANGEDEL.19:z
-----
-1:
   000019:[kq#100,RANGEDEL-p#inf,RANGEDEL]
-2:
+    kq#100,RANGEDEL:p
+L
   000020:[b#90,SET-o#65,SET]
-3:
+    b#90,SET:90 cat#70,SET:70 g#80,SET:80 o#65,SET:65
+L
+  000021:[a#41,SET-z#inf,RANGEDEL]
+    a#41,SET:41 koujdlp.MERGE.37:37 ok#46,SET:46 v#43,SET:43
+    v#19,RANGEDEL:z
+----
+L1:
+  000019:[kq#100,RANGEDEL-p#inf,RANGEDEL]
+L2:
+  000020:[b#90,SET-o#65,SET]
+L3:
   000021:[a#41,SET-z#inf,RANGEDEL]
 
 iter
@@ -477,27 +529,28 @@ seek-ge krgywquurww
 prev
 ----
 .
-koujdlp#37,2:37
+koujdlp#37,MERGE:37
 
 # Verify the lower bound is respected when switching directions at a RANGEDEL
 # boundary.
 
 define
 L
-a.SET.103 jyk.RANGEDEL.72057594037927935
-a.SET.103:103 imd.SET.793:793 iwoeionch.SET.792:792 c.RANGEDEL.101:jyk
-L
-b.SET.90 o.SET.65
-b.SET.90:90 cat.SET.70:70 g.SET.80:80 o.SET.65:65
-L
-all.SET.0 zk.SET.722
-all.SET.0:0 c.SET.0:0 zk.SET.722:722
-----
-1:
   000022:[a#103,SET-jyk#inf,RANGEDEL]
-2:
+    a#103,SET:103 imd#793,SET:793 iwoeionch#792,SET:792
+    c#101,RANGEDEL:jyk
+L
   000023:[b#90,SET-o#65,SET]
-3:
+    b#90,SET:90 cat#70,SET:70 g#80,SET:80 o#65,SET:65
+L
+  000024:[all#0,SET-zk#722,SET]
+    all#0,SET:0 c#0,SET:0 zk#722,SET:722
+----
+L1:
+  000022:[a#103,SET-jyk#inf,RANGEDEL]
+L2:
+  000023:[b#90,SET-o#65,SET]
+L3:
   000024:[all#0,SET-zk#722,SET]
 
 iter
@@ -505,17 +558,33 @@ set-bounds lower=cz upper=jd
 seek-lt jd
 next
 ----
-iwoeionch#792,1:792
+iwoeionch#792,SET:792
 .
+
+# Test the above case, but injecting an error when we re-seek the iterator in
+# accordance with the lower bound. The error should be propagated.
+
+iter probe-points=(000022,(Log "#  000022.")) probe-points=(000023,(If OpSeekGE ErrInjected noop),(Log "#  000023.")) probe-points=(000024,(Log "#  000024."))
+set-bounds lower=cz upper=jd
+seek-lt jd
+next
+----
+#  000022.SeekLT("jd") = (iwoeionch#792,SET,"792")
+#  000023.SeekLT("c") = nil
+#  000024.SeekLT("c") = nil
+iwoeionch#792,SET:792
+#  000023.SeekGE("cz") = nil <err="injected error">
+err=injected error
 
 # Exercise the early stopping behavior for prefix iteration when encountering
 # range deletion tombstones. Keys a, d are not deleted, while the rest are.
 define
 L
-a.SET.10 d.SET.10
-a.SET.10:a10 b.SET.10:b10 c.SET.10:c10 d.SET.10:d10 b.RANGEDEL.12:d
+  000025:[a#10,SET-d#10,SET]
+    a#10,SET:a10 b#10,SET:b10 c#10,SET:c10 d#10,SET:d10
+    b#12,RANGEDEL:d
 ----
-1:
+L1:
   000025:[a#10,SET-d#10,SET]
 
 iter
@@ -523,8 +592,8 @@ first
 next
 next
 ----
-a#10,1:a10
-d#10,1:d10
+a#10,SET:a10
+d#10,SET:d10
 .
 
 # The seek to c finds d since iteration cannot stop at c as it matches the
@@ -539,11 +608,11 @@ seek-prefix-ge b true
 seek-prefix-ge c true
 seek-prefix-ge d true
 ----
-a#10,1:a10
+a#10,SET:a10
 .
 .
-d#10,1:d10
-d#10,1:d10
+.
+d#10,SET:d10
 
 iter
 seek-prefix-ge a false
@@ -552,10 +621,10 @@ seek-prefix-ge b false
 seek-prefix-ge d true
 next
 ----
-a#10,1:a10
+a#10,SET:a10
 .
 .
-d#10,1:d10
+d#10,SET:d10
 .
 
 # Create a sstable which has a range tombstone that covers 4 points in the
@@ -563,10 +632,10 @@ d#10,1:d10
 # stats.
 define
 L
-a.SET.30 g.RANGEDEL.72057594037927935
-a.SET.30:30 a.RANGEDEL.20:g b.SET.19:19 c.SET.18:18 d.SET.17:17 e.SET.16:16 f.SET.21:21
+  000026:[a#30,SET-g#inf,RANGEDEL]
+    a#30,SET:30 a#20,RANGEDEL:g b#19,SET:19 c#18,SET:18 d#17,SET:17 e#16,SET:16 f#21,SET:21
 ----
-1:
+L1:
   000026:[a#30,SET-g#inf,RANGEDEL]
 
 iter
@@ -581,12 +650,279 @@ stats
 next
 stats
 ----
-a#30,1:30
-{BlockBytes:97 BlockBytesInCache:0 BlockReadDuration:0s KeyBytes:1 ValueBytes:2 PointCount:1 PointsCoveredByRangeTombstones:0 SeparatedPointValue:{Count:0 ValueBytes:0 ValueBytesFetched:0}}
+a#30,SET:30
+{BlockBytes:139 BlockBytesInCache:0 BlockReadDuration:0s KeyBytes:1 ValueBytes:2 PointCount:1 PointsCoveredByRangeTombstones:0 SeparatedPointValue:{Count:0 ValueBytes:0 ValueBytesFetched:0}}
 {BlockBytes:0 BlockBytesInCache:0 BlockReadDuration:0s KeyBytes:0 ValueBytes:0 PointCount:0 PointsCoveredByRangeTombstones:0 SeparatedPointValue:{Count:0 ValueBytes:0 ValueBytesFetched:0}}
-f#21,1:21
+f#21,SET:21
 {BlockBytes:0 BlockBytesInCache:0 BlockReadDuration:0s KeyBytes:5 ValueBytes:10 PointCount:5 PointsCoveredByRangeTombstones:4 SeparatedPointValue:{Count:0 ValueBytes:0 ValueBytesFetched:0}}
 .
-{BlockBytes:0 BlockBytesInCache:0 BlockReadDuration:0s KeyBytes:6 ValueBytes:10 PointCount:6 PointsCoveredByRangeTombstones:4 SeparatedPointValue:{Count:0 ValueBytes:0 ValueBytesFetched:0}}
+{BlockBytes:0 BlockBytesInCache:0 BlockReadDuration:0s KeyBytes:5 ValueBytes:10 PointCount:5 PointsCoveredByRangeTombstones:4 SeparatedPointValue:{Count:0 ValueBytes:0 ValueBytesFetched:0}}
 .
-{BlockBytes:0 BlockBytesInCache:0 BlockReadDuration:0s KeyBytes:6 ValueBytes:10 PointCount:6 PointsCoveredByRangeTombstones:4 SeparatedPointValue:{Count:0 ValueBytes:0 ValueBytesFetched:0}}
+{BlockBytes:0 BlockBytesInCache:0 BlockReadDuration:0s KeyBytes:5 ValueBytes:10 PointCount:5 PointsCoveredByRangeTombstones:4 SeparatedPointValue:{Count:0 ValueBytes:0 ValueBytesFetched:0}}
+
+# Test a dead simple error handling case of a 1-level seek erroring.
+
+define
+L
+  000027:[a#30,SET-g#inf,RANGEDEL]
+    a#30,SET:30 a#20,RANGEDEL:g b#19,SET:19 c#18,SET:18 d#17,SET:17 e#16,SET:16 f#21,SET:21
+----
+L1:
+  000027:[a#30,SET-g#inf,RANGEDEL]
+
+iter probe-points=(000027,ErrInjected,(Log "#  L1.000027."))
+first
+last
+seek-ge boo
+seek-lt coo
+seek-prefix-ge b
+----
+#  L1.000027.First() = nil <err="injected error">
+err=injected error
+#  L1.000027.Last() = nil <err="injected error">
+err=injected error
+#  L1.000027.SeekGE("boo") = nil <err="injected error">
+err=injected error
+#  L1.000027.SeekLT("coo") = nil <err="injected error">
+err=injected error
+#  L1.000027.SeekPrefixGE("b") = nil <err="injected error">
+err=injected error
+
+# Test error injection with two simple levels.
+
+define
+L
+  000028:[a#30,SET-c#27,SET]
+    a#30,SET:30 c#27,SET:27
+L
+  000029:[e#10,SET-g#20,SET]
+    e#10,SET:10 g#20,SET:20
+----
+L1:
+  000028:[a#30,SET-c#27,SET]
+L2:
+  000029:[e#10,SET-g#20,SET]
+
+# Inject errors for each of the L1 operations.
+
+iter probe-points=(000028,ErrInjected,(Log "# L1.000028.")) probe-points=(000029,(Log "# L2.000029."))
+first
+last
+seek-ge boo
+seek-lt coo
+seek-prefix-ge b
+----
+# L1.000028.First() = nil <err="injected error">
+err=injected error
+# L1.000028.Last() = nil <err="injected error">
+err=injected error
+# L1.000028.SeekGE("boo") = nil <err="injected error">
+err=injected error
+# L1.000028.SeekLT("coo") = nil <err="injected error">
+err=injected error
+# L1.000028.SeekPrefixGE("b") = nil <err="injected error">
+err=injected error
+
+# Inject errors for each of the L2 operations.
+
+iter probe-points=(000028,(Log "# L1.000028.")) probe-points=(000029,ErrInjected,(Log "# L2.000029."))
+first
+last
+seek-ge boo
+seek-lt coo
+seek-prefix-ge b
+----
+# L1.000028.First() = (a#30,SET,"30")
+# L2.000029.First() = nil <err="injected error">
+err=injected error
+# L1.000028.Last() = (c#27,SET,"27")
+# L2.000029.Last() = nil <err="injected error">
+err=injected error
+# L1.000028.SeekGE("boo") = (c#27,SET,"27")
+# L2.000029.SeekGE("boo") = nil <err="injected error">
+err=injected error
+# L1.000028.SeekLT("coo") = (c#27,SET,"27")
+# L2.000029.Close() = nil <err="injected error">
+err=injected error
+# L1.000028.SeekPrefixGE("b") = (c#27,SET,"27")
+.
+
+# Inject errors during L1.{Next,NextPrefix,Prev}.
+
+iter probe-points=(000028,(If (Or OpNext OpNextPrefix OpPrev) ErrInjected noop),(Log "# L1.000028.")) probe-points=(000029,(Log "# L2.000029."))
+first
+next
+first
+next-prefix
+last
+prev
+prev
+prev
+----
+# L1.000028.First() = (a#30,SET,"30")
+# L2.000029.First() = (e#10,SET,"10")
+a#30,SET:30
+# L1.000028.Next() = nil <err="injected error">
+err=injected error
+# L1.000028.First() = (a#30,SET,"30")
+# L2.000029.First() = (e#10,SET,"10")
+a#30,SET:30
+# L1.000028.NextPrefix("a\x00") = nil <err="injected error">
+err=injected error
+# L1.000028.Last() = (c#27,SET,"27")
+# L2.000029.Last() = (g#20,SET,"20")
+g#20,SET:20
+# L2.000029.Prev() = (e#10,SET,"10")
+e#10,SET:10
+# L2.000029.Prev() = nil
+# L2.000029.Close() = nil
+c#27,SET:27
+# L1.000028.Prev() = nil <err="injected error">
+err=injected error
+
+# Inject errors during L2.{Next,NextPrefix,Prev}.
+
+iter probe-points=(000028,(Log "# L1.000028.")) probe-points=(000029,(If (Or OpNext OpNextPrefix OpPrev) ErrInjected noop),(Log "# L2.000029."))
+first
+next
+next
+next
+first
+next-prefix
+next-prefix
+next-prefix
+last
+prev
+----
+# L1.000028.First() = (a#30,SET,"30")
+# L2.000029.First() = (e#10,SET,"10")
+a#30,SET:30
+# L1.000028.Next() = (c#27,SET,"27")
+c#27,SET:27
+# L1.000028.Next() = nil
+# L1.000028.Close() = nil
+e#10,SET:10
+# L2.000029.Next() = nil <err="injected error">
+err=injected error
+# L1.000028.First() = (a#30,SET,"30")
+# L2.000029.First() = (e#10,SET,"10")
+a#30,SET:30
+# L1.000028.NextPrefix("a\x00") = (c#27,SET,"27")
+c#27,SET:27
+# L1.000028.NextPrefix("c\x00") = nil
+# L1.000028.Close() = nil
+e#10,SET:10
+# L2.000029.NextPrefix("e\x00") = nil <err="injected error">
+err=injected error
+# L1.000028.Last() = (c#27,SET,"27")
+# L2.000029.Last() = (g#20,SET,"20")
+g#20,SET:20
+# L2.000029.Prev() = nil <err="injected error">
+err=injected error
+
+# Test errors reading the range deletion block of an sstable with a simple
+# single-sstable version that contains a range deletion deleting keys within the
+# same table.
+define
+L
+  000030:[a#30,SET-g#inf,RANGEDEL]
+    a#30,SET:30 a#20,RANGEDEL:g b#19,SET:19 c#18,SET:18 d#17,SET:17 e#16,SET:16 f#21,SET:21
+----
+L1:
+  000030:[a#30,SET-g#inf,RANGEDEL]
+
+iter probe-points=(000030,(Log "#  iter.")) probe-rangedels=(000030,ErrInjected,(Log "#  rangedelIter."))
+first
+last
+seek-ge boo
+seek-lt coo
+seek-prefix-ge b
+----
+#  iter.First() = (a#30,SET,"30")
+#  rangedelIter.opSpanFirst() = nil <err="injected error">
+err=injected error
+#  iter.Last() = (f#21,SET,"21")
+#  rangedelIter.opSpanLast() = nil <err="injected error">
+err=injected error
+#  iter.SeekGE("boo") = (c#18,SET,"18")
+#  rangedelIter.opSpanSeekGE("boo") = nil <err="injected error">
+err=injected error
+#  iter.SeekLT("coo") = (c#18,SET,"18")
+#  rangedelIter.opSpanSeekLT("coo") = nil <err="injected error">
+err=injected error
+#  iter.SeekPrefixGE("b") = (b#19,SET,"19")
+#  rangedelIter.opSpanSeekGE("b") = nil <err="injected error">
+err=injected error
+
+# Ensure that when a level iterator is progressing to the next, it propagates
+# errors on First/Last.
+
+define
+L
+  000031:[a#10,SET-c#10,SET]
+    a#10,SET:a10 c#10,SET:c10
+  000032:[d#10,SET-g#10,SET]
+    d#10,SET:d10 g#10,SET:g10
+----
+L1:
+  000031:[a#10,SET-c#10,SET]
+  000032:[d#10,SET-g#10,SET]
+
+iter probe-points=(000031,(Log "#  000031.")) probe-points=(000032,(If OpFirst ErrInjected noop),(Log "#  000032."))
+first
+next
+next
+----
+#  000031.First() = (a#10,SET,"a10")
+a#10,SET:a10
+#  000031.Next() = (c#10,SET,"c10")
+c#10,SET:c10
+#  000031.Next() = nil
+#  000031.Close() = nil
+#  000032.First() = nil <err="injected error">
+err=injected error
+
+iter probe-points=(000031,(If OpLast ErrInjected noop),(Log "#  000031.")) probe-points=(000032,(Log "#  000032."))
+last
+prev
+prev
+----
+#  000032.Last() = (g#10,SET,"g10")
+g#10,SET:g10
+#  000032.Prev() = (d#10,SET,"d10")
+d#10,SET:d10
+#  000032.Prev() = nil
+#  000032.Close() = nil
+#  000031.Last() = nil <err="injected error">
+err=injected error
+
+# Test a case where a SeekLT encounters a tombstone that has an
+# end boundary exactly equal to the seek key. The tombstone should
+# allow the cascading seek optimization.
+
+define
+L
+  000033:[a#103,SET-jd#inf,RANGEDEL]
+    a#103,SET:103 imd#793,SET:793 iwoeionch#792,SET:792 c#101,RANGEDEL:jd
+L
+  000034:[b#90,SET-o#65,SET]
+    b#90,SET:90 cat#70,SET:70 g#80,SET:80 o#65,SET:65
+L
+  000035:[all#0,SET-zk#722,SET]
+    all#0,SET:0 c#0,SET:0 zk#722,SET:722
+----
+L1:
+  000033:[a#103,SET-jd#inf,RANGEDEL]
+L2:
+  000034:[b#90,SET-o#65,SET]
+L3:
+  000035:[all#0,SET-zk#722,SET]
+
+iter probe-points=(000033,(Log "#  000033.")) probe-points=(000034,(Log "#  000034.")) probe-points=(000035,(Log "#  000035."))
+set-bounds lower=cz upper=jd
+seek-lt jd
+----
+#  000033.SeekLT("jd") = (iwoeionch#792,SET,"792")
+#  000034.SeekLT("c") = nil
+#  000035.SeekLT("c") = nil
+iwoeionch#792,SET:792

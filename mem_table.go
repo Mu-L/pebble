@@ -66,7 +66,7 @@ type memTable struct {
 	cmp         Compare
 	formatKey   base.FormatKey
 	equal       Equal
-	arenaBuf    []byte
+	arenaBuf    manual.Buf
 	skl         arenaskl.Skiplist
 	rangeDelSkl arenaskl.Skiplist
 	rangeKeySkl arenaskl.Skiplist
@@ -85,15 +85,15 @@ type memTable struct {
 	rangeKeys  keySpanCache
 	// The current logSeqNum at the time the memtable was created. This is
 	// guaranteed to be less than or equal to any seqnum stored in the memtable.
-	logSeqNum                    uint64
+	logSeqNum                    base.SeqNum
 	releaseAccountingReservation func()
 }
 
 func (m *memTable) free() {
 	if m != nil {
 		m.releaseAccountingReservation()
-		manual.Free(m.arenaBuf)
-		m.arenaBuf = nil
+		manual.Free(manual.MemTable, m.arenaBuf)
+		m.arenaBuf = manual.Buf{}
 	}
 }
 
@@ -102,16 +102,16 @@ func (m *memTable) free() {
 // which is used by tests.
 type memTableOptions struct {
 	*Options
-	arenaBuf                     []byte
+	arenaBuf                     manual.Buf
 	size                         int
-	logSeqNum                    uint64
+	logSeqNum                    base.SeqNum
 	releaseAccountingReservation func()
 }
 
 func checkMemTable(obj interface{}) {
 	m := obj.(*memTable)
-	if m.arenaBuf != nil {
-		fmt.Fprintf(os.Stderr, "%p: memTable buffer was not freed\n", m.arenaBuf)
+	if m.arenaBuf.Data() != nil {
+		fmt.Fprintf(os.Stderr, "%v: memTable buffer was not freed\n", m.arenaBuf)
 		os.Exit(1)
 	}
 }
@@ -127,7 +127,7 @@ func newMemTable(opts memTableOptions) *memTable {
 
 func (m *memTable) init(opts memTableOptions) {
 	if opts.size == 0 {
-		opts.size = opts.MemTableSize
+		opts.size = int(opts.MemTableSize)
 	}
 	*m = memTable{
 		cmp:                          opts.Comparer.Compare,
@@ -151,11 +151,11 @@ func (m *memTable) init(opts memTableOptions) {
 		constructSpan: rangekey.Decode,
 	}
 
-	if m.arenaBuf == nil {
-		m.arenaBuf = make([]byte, opts.size)
+	if m.arenaBuf.Data() == nil {
+		m.arenaBuf = manual.New(manual.MemTable, uintptr(opts.size))
 	}
 
-	arena := arenaskl.NewArena(m.arenaBuf)
+	arena := arenaskl.NewArena(m.arenaBuf.Slice())
 	m.skl.Reset(arena, m.cmp)
 	m.rangeDelSkl.Reset(arena, m.cmp)
 	m.rangeKeySkl.Reset(arena, m.cmp)
@@ -169,7 +169,8 @@ func (m *memTable) writerRef() {
 	}
 }
 
-func (m *memTable) writerUnref() bool {
+// writerUnref drops a ref on the memtable. Returns true if this was the last ref.
+func (m *memTable) writerUnref() (wasLastRef bool) {
 	switch v := m.writerRefs.Add(-1); {
 	case v < 0:
 		panic(fmt.Sprintf("pebble: inconsistent reference count: %d", v))
@@ -180,6 +181,7 @@ func (m *memTable) writerUnref() bool {
 	}
 }
 
+// readyForFlush is part of the flushable interface.
 func (m *memTable) readyForFlush() bool {
 	return m.writerRefs.Load() == 0
 }
@@ -199,7 +201,7 @@ func (m *memTable) prepare(batch *Batch) error {
 	return nil
 }
 
-func (m *memTable) apply(batch *Batch, seqNum uint64) error {
+func (m *memTable) apply(batch *Batch, seqNum base.SeqNum) error {
 	if seqNum < m.logSeqNum {
 		return base.CorruptionErrorf("pebble: batch seqnum %d is less than memtable creation seqnum %d",
 			errors.Safe(seqNum), errors.Safe(m.logSeqNum))
@@ -209,11 +211,13 @@ func (m *memTable) apply(batch *Batch, seqNum uint64) error {
 	var tombstoneCount, rangeKeyCount uint32
 	startSeqNum := seqNum
 	for r := batch.Reader(); ; seqNum++ {
-		kind, ukey, value, ok := r.Next()
+		kind, ukey, value, ok, err := r.Next()
 		if !ok {
+			if err != nil {
+				return err
+			}
 			break
 		}
-		var err error
 		ikey := base.MakeInternalKey(ukey, seqNum, kind)
 		switch kind {
 		case InternalKeyKindRangeDelete:
@@ -226,8 +230,8 @@ func (m *memTable) apply(batch *Batch, seqNum uint64) error {
 			// Don't increment seqNum for LogData, since these are not applied
 			// to the memtable.
 			seqNum--
-		case InternalKeyKindIngestSST:
-			panic("pebble: cannot apply ingested sstable key kind to memtable")
+		case InternalKeyKindIngestSST, InternalKeyKindExcise:
+			panic("pebble: cannot apply ingested sstable or excise kind keys to memtable")
 		default:
 			err = ins.Add(&m.skl, ikey, value)
 		}
@@ -235,9 +239,9 @@ func (m *memTable) apply(batch *Batch, seqNum uint64) error {
 			return err
 		}
 	}
-	if seqNum != startSeqNum+uint64(batch.Count()) {
+	if seqNum != startSeqNum+base.SeqNum(batch.Count()) {
 		return base.CorruptionErrorf("pebble: inconsistent batch count: %d vs %d",
-			errors.Safe(seqNum), errors.Safe(startSeqNum+uint64(batch.Count())))
+			errors.Safe(seqNum), errors.Safe(startSeqNum+base.SeqNum(batch.Count())))
 	}
 	if tombstoneCount != 0 {
 		m.tombstones.invalidate(tombstoneCount)
@@ -248,17 +252,19 @@ func (m *memTable) apply(batch *Batch, seqNum uint64) error {
 	return nil
 }
 
-// newIter returns an iterator that is unpositioned (Iterator.Valid() will
-// return false). The iterator can be positioned via a call to SeekGE,
-// SeekLT, First or Last.
+// newIter is part of the flushable interface. It returns an iterator that is
+// unpositioned (Iterator.Valid() will return false). The iterator can be
+// positioned via a call to SeekGE, SeekLT, First or Last.
 func (m *memTable) newIter(o *IterOptions) internalIterator {
 	return m.skl.NewIter(o.GetLowerBound(), o.GetUpperBound())
 }
 
-func (m *memTable) newFlushIter(o *IterOptions, bytesFlushed *uint64) internalIterator {
-	return m.skl.NewFlushIter(bytesFlushed)
+// newFlushIter is part of the flushable interface.
+func (m *memTable) newFlushIter(o *IterOptions) internalIterator {
+	return m.skl.NewFlushIter()
 }
 
+// newRangeDelIter is part of the flushable interface.
 func (m *memTable) newRangeDelIter(*IterOptions) keyspan.FragmentIterator {
 	tombstones := m.tombstones.get()
 	if tombstones == nil {
@@ -267,6 +273,7 @@ func (m *memTable) newRangeDelIter(*IterOptions) keyspan.FragmentIterator {
 	return keyspan.NewIter(m.cmp, tombstones)
 }
 
+// newRangeKeyIter is part of the flushable interface.
 func (m *memTable) newRangeKeyIter(*IterOptions) keyspan.FragmentIterator {
 	rangeKeys := m.rangeKeys.get()
 	if rangeKeys == nil {
@@ -275,6 +282,7 @@ func (m *memTable) newRangeKeyIter(*IterOptions) keyspan.FragmentIterator {
 	return keyspan.NewIter(m.cmp, rangeKeys)
 }
 
+// containsRangeKeys is part of the flushable interface.
 func (m *memTable) containsRangeKeys() bool {
 	return m.rangeKeys.count.Load() > 0
 }
@@ -282,6 +290,12 @@ func (m *memTable) containsRangeKeys() bool {
 func (m *memTable) availBytes() uint32 {
 	a := m.skl.Arena()
 	if m.writerRefs.Load() == 1 {
+		// Note that one ref is maintained as long as the memtable is the
+		// current mutable memtable, so when evaluating whether the current
+		// mutable memtable has sufficient space for committing a batch, it is
+		// guaranteed that m.writerRefs() >= 1. This means a writerRefs() of 1
+		// indicates there are no other concurrent apply operations.
+		//
 		// If there are no other concurrent apply operations, we can update the
 		// reserved bytes setting to accurately reflect how many bytes of been
 		// allocated vs the over-estimation present in memTableEntrySize.
@@ -290,10 +304,12 @@ func (m *memTable) availBytes() uint32 {
 	return a.Capacity() - m.reserved
 }
 
+// inuseBytes is part of the flushable interface.
 func (m *memTable) inuseBytes() uint64 {
 	return uint64(m.skl.Size() - memTableEmptySize)
 }
 
+// totalBytes is part of the flushable interface.
 func (m *memTable) totalBytes() uint64 {
 	return uint64(m.skl.Arena().Capacity())
 }
@@ -301,6 +317,11 @@ func (m *memTable) totalBytes() uint64 {
 // empty returns whether the MemTable has no key/value pairs.
 func (m *memTable) empty() bool {
 	return m.skl.Size() == memTableEmptySize
+}
+
+// computePossibleOverlaps is part of the flushable interface.
+func (m *memTable) computePossibleOverlaps(fn func(bounded) shouldContinue, bounded ...bounded) {
+	computePossibleOverlapsGenericImpl[*memTable](m, m.cmp, fn, bounded)
 }
 
 // A keySpanFrags holds a set of fragmented keyspan.Spans with a particular key
@@ -353,8 +374,8 @@ func (f *keySpanFrags) get(
 		}
 		it := skl.NewIter(nil, nil)
 		var keysDst []keyspan.Key
-		for key, val := it.First(); key != nil; key, val = it.Next() {
-			s, err := constructSpan(*key, val.InPlaceValue(), keysDst)
+		for kv := it.First(); kv != nil; kv = it.Next() {
+			s, err := constructSpan(kv.K, kv.InPlaceValue(), keysDst)
 			if err != nil {
 				panic(err)
 			}

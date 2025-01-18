@@ -5,6 +5,7 @@
 package vfs
 
 import (
+	"fmt"
 	"io"
 	"os"
 )
@@ -28,9 +29,9 @@ type loggingFS struct {
 
 var _ FS = (*loggingFS)(nil)
 
-func (fs *loggingFS) Create(name string) (File, error) {
+func (fs *loggingFS) Create(name string, category DiskWriteCategory) (File, error) {
 	fs.logFn("create: %s", name)
-	f, err := fs.FS.Create(name)
+	f, err := fs.FS.Create(name, category)
 	if err != nil {
 		return nil, err
 	}
@@ -38,7 +39,15 @@ func (fs *loggingFS) Create(name string) (File, error) {
 }
 
 func (fs *loggingFS) Open(name string, opts ...OpenOption) (File, error) {
-	fs.logFn("open: %s", name)
+	var optsStr string
+	if len(opts) > 0 {
+		optsStr = " (options:"
+		for i := range opts {
+			optsStr += fmt.Sprintf(" %T", opts[i])
+		}
+		optsStr += ")"
+	}
+	fs.logFn("open: %s%s", name, optsStr)
 	f, err := fs.FS.Open(name, opts...)
 	if err != nil {
 		return nil, err
@@ -46,9 +55,11 @@ func (fs *loggingFS) Open(name string, opts ...OpenOption) (File, error) {
 	return newLoggingFile(f, name, fs.logFn), nil
 }
 
-func (fs *loggingFS) OpenReadWrite(name string, opts ...OpenOption) (File, error) {
+func (fs *loggingFS) OpenReadWrite(
+	name string, category DiskWriteCategory, opts ...OpenOption,
+) (File, error) {
 	fs.logFn("open-read-write: %s", name)
-	f, err := fs.FS.OpenReadWrite(name, opts...)
+	f, err := fs.FS.OpenReadWrite(name, category, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -74,9 +85,11 @@ func (fs *loggingFS) Rename(oldname, newname string) error {
 	return fs.FS.Rename(oldname, newname)
 }
 
-func (fs *loggingFS) ReuseForWrite(oldname, newname string) (File, error) {
+func (fs *loggingFS) ReuseForWrite(
+	oldname, newname string, category DiskWriteCategory,
+) (File, error) {
 	fs.logFn("reuseForWrite: %s -> %s", oldname, newname)
-	f, err := fs.FS.ReuseForWrite(oldname, newname)
+	f, err := fs.FS.ReuseForWrite(oldname, newname, category)
 	if err != nil {
 		return nil, err
 	}

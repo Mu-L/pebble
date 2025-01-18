@@ -35,13 +35,13 @@ k.SET.90:k o.SET.150:o
 L4
 m.SET.30:m u.SET.60:u
 ----
-0.0:
+L0.0:
   000004:[b#230,RANGEDEL-r#inf,RANGEDEL]
-2:
+L2:
   000005:[d#110,SET-i#140,SET]
-3:
+L3:
   000006:[k#90,SET-o#150,SET]
-4:
+L4:
   000007:[m#30,SET-u#60,SET]
 
 # Test a hint that is blocked by open snapshots. No compaction should occur
@@ -49,12 +49,12 @@ m.SET.30:m u.SET.60:u
 
 get-hints
 ----
-L0.000004 b-r seqnums(tombstone=200-230, file-smallest=90, type=point-key-only)
+L0.000004 b-r seqnums(tombstone=200-230, file-smallest=30, type=point-key-only)
 
 maybe-compact
 ----
 Deletion hints:
-  L0.000004 b-r seqnums(tombstone=200-230, file-smallest=90, type=point-key-only)
+  L0.000004 b-r seqnums(tombstone=200-230, file-smallest=30, type=point-key-only)
 Compactions:
   (none)
 
@@ -70,25 +70,25 @@ k.SET.90:k o.SET.150:o
 L4
 m.SET.30:m u.SET.60:u
 ----
-0.0:
+L0.0:
   000004:[b#230,RANGEDEL-r#inf,RANGEDEL]
-2:
+L2:
   000005:[d#110,SET-i#140,SET]
-3:
+L3:
   000006:[k#90,SET-o#150,SET]
-4:
+L4:
   000007:[m#30,SET-u#60,SET]
 
 get-hints
 ----
-L0.000004 b-r seqnums(tombstone=200-230, file-smallest=90, type=point-key-only)
+L0.000004 b-r seqnums(tombstone=200-230, file-smallest=30, type=point-key-only)
 
 maybe-compact
 ----
 Deletion hints:
-  (none)
+  L0.000004 b-r seqnums(tombstone=200-230, file-smallest=30, type=point-key-only)
 Compactions:
-  [JOB 100] compacted(delete-only) L2 [000005] (677B) + L3 [000006] (677B) -> L6 [] (0B), in 1.0s (2.0s total), output rate 0B/s
+  [JOB 100] compacted(delete-only) multilevel L2 [000005] (743B) Score=0.00 + L3 [000006] (743B) Score=0.00 + L4 [000007] (743B) Score=0.00 -> L6 [000008] (94B), in 1.0s (2.0s total), output rate 94B/s
 
 # Verify that compaction correctly handles the presence of multiple
 # overlapping hints which might delete a file multiple times. All of the
@@ -106,28 +106,28 @@ k.SET.90:k o.SET.150:o
 L4
 m.SET.30:m u.SET.60:u
 ----
-0.0:
+L0.0:
   000004:[a#300,RANGEDEL-k#inf,RANGEDEL]
-1:
+L1:
   000005:[b#230,RANGEDEL-r#inf,RANGEDEL]
-2:
+L2:
   000006:[d#110,SET-i#140,SET]
-3:
+L3:
   000007:[k#90,SET-o#150,SET]
-4:
+L4:
   000008:[m#30,SET-u#60,SET]
 
 get-hints
 ----
 L0.000004 a-k seqnums(tombstone=300-300, file-smallest=110, type=point-key-only)
-L1.000005 b-r seqnums(tombstone=200-230, file-smallest=90, type=point-key-only)
+L1.000005 b-r seqnums(tombstone=200-230, file-smallest=30, type=point-key-only)
 
 maybe-compact
 ----
 Deletion hints:
-  (none)
+  L1.000005 b-r seqnums(tombstone=200-230, file-smallest=30, type=point-key-only)
 Compactions:
-  [JOB 100] compacted(delete-only) L2 [000006] (677B) + L3 [000007] (677B) -> L6 [] (0B), in 1.0s (2.0s total), output rate 0B/s
+  [JOB 100] compacted(delete-only) multilevel L2 [000005] (743B) Score=0.00 + L3 [000006] (743B) Score=0.00 + L4 [000007] (743B) Score=0.00 -> L6 [000008] (94B), in 1.0s (2.0s total), output rate 94B/s
 
 # Test a range tombstone that is already compacted into L6.
 
@@ -141,28 +141,28 @@ k.SET.90:k o.SET.150:o
 L4
 m.SET.30:m u.SET.60:u
 ----
-0.0:
+L0.0:
   000004:[b#230,RANGEDEL-r#inf,RANGEDEL]
-2:
+L2:
   000005:[d#110,SET-i#140,SET]
-3:
+L3:
   000006:[k#90,SET-o#150,SET]
-4:
+L4:
   000007:[m#30,SET-u#60,SET]
 
 get-hints
 ----
-L0.000004 b-r seqnums(tombstone=200-230, file-smallest=90, type=point-key-only)
+L0.000004 b-r seqnums(tombstone=200-230, file-smallest=30, type=point-key-only)
 
 compact a-z
 ----
-5:
-  000008:[b#230,RANGEDEL-u#0,SET]
+L5:
+  000009:[b#230,RANGEDEL-u#0,SET]
 
 maybe-compact
 ----
 Deletion hints:
-  (none)
+  L0.000004 b-r seqnums(tombstone=200-230, file-smallest=30, type=point-key-only)
 Compactions:
   (none)
 
@@ -181,20 +181,20 @@ m.SET.30:m u.SET.60:u
 L0
 e.SET.240:e m.SET.260:m
 ----
-0.0:
+L0.0:
   000008:[e#240,SET-m#260,SET]
-1:
+L1:
   000004:[b#230,RANGEDEL-r#inf,RANGEDEL]
-2:
+L2:
   000005:[d#110,SET-i#140,SET]
-3:
+L3:
   000006:[k#90,SET-o#150,SET]
-4:
+L4:
   000007:[m#30,SET-u#60,SET]
 
 get-hints
 ----
-L1.000004 b-r seqnums(tombstone=200-230, file-smallest=90, type=point-key-only)
+L1.000004 b-r seqnums(tombstone=200-230, file-smallest=30, type=point-key-only)
 
 # Tables 000005 and 000006 can be deleted as their largest sequence numbers fall
 # below the smallest sequence number of the range del. Table 000007 falls
@@ -206,7 +206,7 @@ maybe-compact
 Deletion hints:
   (none)
 Compactions:
-  [JOB 100] compacted(delete-only) L2 [000005] (677B) + L3 [000006] (677B) -> L6 [] (0B), in 1.0s (2.0s total), output rate 0B/s
+  [JOB 100] compacted(delete-only) multilevel L2 [000005] (743B) Score=0.00 + L3 [000006] (743B) Score=0.00 + L4 [000007] (743B) Score=0.00 -> L6 [000009] (94B), in 1.0s (2.0s total), output rate 94B/s
 
 # A deletion hint present on an sstable in a higher level should NOT result in a
 # deletion-only compaction incorrectly removing an sstable in L6 following an
@@ -220,8 +220,8 @@ define snapshots=(10, 25)
 L6
 a.SET.20:b a.RANGEDEL.15:z
 ----
-6:
-  000004:[a#20,SETWITHDEL-z#inf,RANGEDEL]
+L6:
+  000004:[a#20,SET-z#inf,RANGEDEL]
 
 # Note that this test depends on stats being present on the sstables, so we
 # collect hints here. We expect none, as the table is in L6.
@@ -255,12 +255,20 @@ L0.000001 a-z seqnums(tombstone=5-27, file-smallest=0, type=point-key-only)
 close-snapshot
 10
 ----
-[JOB 100] compacted(elision-only) L6 [000004] (741B) + L6 [] (0B) -> L6 [000005] (662B), in 1.0s (2.0s total), output rate 662B/s
+[JOB 100] compacted(elision-only) L6 [000004] (813B) Score=0.00 + L6 [] (0B) Score=0.00 -> L6 [000005] (732B), in 1.0s (2.0s total), output rate 732B/s
 
-# The deletion hint was removed by the elision-only compaction.
+# In previous versions of the code, the deletion hint was removed by the
+# elision-only compaction because it zeroed sequence numbers of keys with
+# sequence numbers higher than the lowest tombstone sequence number.
+#
+# In the current code, the hint remains but when the hint is resolved the hint
+# will not apply to any sstables containing keys that previously had sequence
+# numbers higher than the hint's lowest tombstone sequence number. We use
+# FileMetadata.LargestSeqNumAbsolute for this purpose.
+
 get-hints
 ----
-(none)
+L0.000001 a-z seqnums(tombstone=5-27, file-smallest=0, type=point-key-only)
 
 # The LSM contains the key, as expected.
 iter
@@ -270,10 +278,18 @@ next
 a: (b, .)
 .
 
-# Closing the next snapshot should NOT trigger another compaction, as the
-# deletion hint was removed in the elision-only compaction.
+# Closing the next snapshot should NOT trigger another compaction but SHOULD
+# clear the hint. Although the file 000005's largest sequence number is zero
+# (due to sequence number zeroing), the file's LargestSeqNumAbsolute
+# indicates that some of the keys previously had higher sequence numbers, so
+# the hint cannot be used to drop the file 000005.
+
 close-snapshot
 25
+----
+(none)
+
+get-hints
 ----
 (none)
 
@@ -390,9 +406,9 @@ OK
 
 describe-lsm
 ----
-0.0:
+L0.0:
   000013:[a#19,RANGEDEL-z#inf,RANGEKEYDEL]
-6:
+L6:
   000004:[a#10,RANGEKEYSET-c#10,SET]
   000005:[d#11,RANGEKEYSET-f#inf,RANGEKEYSET]
   000006:[g#12,SET-h#12,SET]
@@ -414,4 +430,275 @@ maybe-compact
 Deletion hints:
   (none)
 Compactions:
-  [JOB 100] compacted(delete-only) L6 [000006 000007 000008 000009 000011] (3.9KB) -> L6 [] (0B), in 1.0s (2.0s total), output rate 0B/s
+  [JOB 100] compacted(delete-only) L6 [000006 000007 000008 000009 000011] (3.9KB) Score=0.00 -> L6 [] (0B), in 1.0s (2.0s total), output rate 0B/s
+
+# Verify that a delete-only compaction can partially excise a file.
+
+define
+L0
+a.RANGEDEL.300:k
+L1
+b.RANGEDEL.230:h h.RANGEDEL.200:r
+L2
+d.SET.110:d i.SET.140:i
+L3
+k.SET.90:k o.SET.150:o
+L4
+m.SET.30:m u.SET.60:u
+----
+L0.0:
+  000004:[a#300,RANGEDEL-k#inf,RANGEDEL]
+L1:
+  000005:[b#230,RANGEDEL-r#inf,RANGEDEL]
+L2:
+  000006:[d#110,SET-i#140,SET]
+L3:
+  000007:[k#90,SET-o#150,SET]
+L4:
+  000008:[m#30,SET-u#60,SET]
+
+get-hints
+----
+L0.000004 a-k seqnums(tombstone=300-300, file-smallest=110, type=point-key-only)
+L1.000005 b-r seqnums(tombstone=200-230, file-smallest=30, type=point-key-only)
+
+iter
+first
+next
+----
+u: (u, .)
+.
+
+maybe-compact
+----
+Deletion hints:
+  (none)
+Compactions:
+  [JOB 100] compacted(delete-only) multilevel L1 [000005] (730B) Score=0.00 + L2 [000006] (743B) Score=0.00 + L3 [000007] (743B) Score=0.00 + L4 [000008] (743B) Score=0.00 -> L6 [000009 000010] (95B), in 1.0s (2.0s total), output rate 95B/s
+
+describe-lsm
+----
+L0.0:
+  000004:[a#300,RANGEDEL-k#inf,RANGEDEL]
+L1:
+  000009(000005):[k#200,RANGEDEL-r#inf,RANGEDEL]
+L4:
+  000010(000008):[u#60,SET-u#60,SET]
+
+iter
+first
+next
+----
+u: (u, .)
+.
+
+get-hints
+----
+(none)
+
+# Verify that a delete-only compaction hint for point keys does not excise a file
+# if it has range keys
+
+reset
+----
+
+ingest ext
+set k k
+set o o
+range-key-set k o @3 foo
+----
+OK
+
+ingest ext
+set d d
+set i i
+----
+OK
+
+ingest ext
+del-range b r
+----
+OK
+
+describe-lsm
+----
+L0.0:
+  000006:[b#12,RANGEDEL-r#inf,RANGEDEL]
+L6:
+  000005:[d#11,SET-i#11,SET]
+  000004:[k#10,RANGEKEYSET-o#10,SET]
+
+get-hints
+----
+L0.000006 b-r seqnums(tombstone=12-12, file-smallest=11, type=point-key-only)
+
+iter
+first
+----
+.
+
+maybe-compact
+----
+Deletion hints:
+  (none)
+Compactions:
+  [JOB 100] compacted(delete-only) L6 [000005] (730B) Score=0.00 -> L6 [] (0B), in 1.0s (2.0s total), output rate 0B/s
+
+describe-lsm
+----
+L0.0:
+  000006:[b#12,RANGEDEL-r#inf,RANGEDEL]
+L6:
+  000004:[k#10,RANGEKEYSET-o#10,SET]
+
+iter
+first
+----
+.
+
+get-hints
+----
+(none)
+
+# Verify that a delete-only compaction hint can excise a file twice
+
+reset
+----
+
+ingest ext
+set k k
+set ll mm
+set m m
+set o o
+range-key-set k o @3 foo
+----
+OK
+
+ingest ext
+del-range b l
+del-range m n
+range-key-del b l
+range-key-del m n
+----
+OK
+
+describe-lsm
+----
+L0.0:
+  000005:[b#11,RANGEKEYDEL-n#inf,RANGEDEL]
+L6:
+  000004:[k#10,RANGEKEYSET-o#10,SET]
+
+get-hints
+----
+L0.000005 b-l seqnums(tombstone=11-11, file-smallest=10, type=point-and-range-key)
+L0.000005 m-n seqnums(tombstone=11-11, file-smallest=10, type=point-and-range-key)
+
+iter
+first
+next
+next
+----
+ll: (mm, .)
+o: (o, .)
+.
+
+maybe-compact
+----
+Deletion hints:
+  (none)
+Compactions:
+  [JOB 100] compacted(delete-only) L6 [000004] (912B) Score=0.00 -> L6 [000007 000008] (186B), in 1.0s (2.0s total), output rate 186B/s
+
+describe-lsm
+----
+L0.0:
+  000005:[b#11,RANGEKEYDEL-n#inf,RANGEDEL]
+L6:
+  000007(000004):[l#10,RANGEKEYSET-m#inf,RANGEKEYSET]
+  000008(000004):[n#10,RANGEKEYSET-o#10,SET]
+
+iter
+first
+next
+next
+----
+ll: (mm, .)
+o: (o, .)
+.
+
+get-hints
+----
+(none)
+
+# Verify that a delete-only compaction hint does not apply if it increases
+# sstable count.
+
+reset
+----
+
+ingest ext
+set k k
+set ll mm
+set m m
+set o o
+range-key-set k o @3 foo
+----
+OK
+
+ingest ext
+del-range l m
+range-key-del l m
+----
+OK
+
+describe-lsm
+----
+L0.0:
+  000005:[l#11,RANGEKEYDEL-m#inf,RANGEDEL]
+L6:
+  000004:[k#10,RANGEKEYSET-o#10,SET]
+
+get-hints
+----
+L0.000005 l-m seqnums(tombstone=11-11, file-smallest=10, type=point-and-range-key)
+
+iter
+first
+next
+next
+next
+----
+k: (k, .)
+m: (m, .)
+o: (o, .)
+.
+
+maybe-compact
+----
+Deletion hints:
+  (none)
+Compactions:
+  (none)
+
+describe-lsm
+----
+L0.0:
+  000005:[l#11,RANGEKEYDEL-m#inf,RANGEDEL]
+L6:
+  000004:[k#10,RANGEKEYSET-o#10,SET]
+
+iter
+first
+next
+next
+next
+----
+k: (k, .)
+m: (m, .)
+o: (o, .)
+.
+
+get-hints
+----
+(none)

@@ -11,7 +11,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,7 +55,7 @@ func Open(fs vfs.FS, fsDir string) *Tracer {
 		workerDataCh: make(chan eventBuf, channelBufSize),
 	}
 
-	t.handleID.Store(uint64(rand.NewSource(time.Now().UnixNano()).Int63()))
+	t.handleID.Store(rand.Uint64())
 
 	t.workerWait.Add(1)
 	go t.workerLoop()
@@ -76,18 +76,18 @@ func (t *Tracer) Close() {
 // WrapWritable wraps an objstorage.Writable with one that generates tracing
 // events.
 func (t *Tracer) WrapWritable(
-	ctx context.Context, w objstorage.Writable, fileNum base.FileNum,
+	ctx context.Context, w objstorage.Writable, fileNum base.DiskFileNum,
 ) objstorage.Writable {
 	return &writable{
 		w:       w,
 		fileNum: fileNum,
-		g:       makeEventGenerator(ctx, t),
+		g:       makeEventGenerator(infoFromCtx(ctx), t),
 	}
 }
 
 type writable struct {
 	w         objstorage.Writable
-	fileNum   base.FileNum
+	fileNum   base.DiskFileNum
 	curOffset int64
 	g         eventGenerator
 }
@@ -125,20 +125,22 @@ func (w *writable) Abort() {
 // WrapReadable wraps an objstorage.Readable with one that generates tracing
 // events.
 func (t *Tracer) WrapReadable(
-	ctx context.Context, r objstorage.Readable, fileNum base.FileNum,
+	ctx context.Context, r objstorage.Readable, fileNum base.DiskFileNum,
 ) objstorage.Readable {
 	res := &readable{
-		r:       r,
-		fileNum: fileNum,
+		r:           r,
+		fileNum:     fileNum,
+		baseCtxInfo: infoFromCtx(ctx),
 	}
-	res.mu.g = makeEventGenerator(ctx, t)
+	res.mu.g = makeEventGenerator(res.baseCtxInfo, t)
 	return res
 }
 
 type readable struct {
-	r       objstorage.Readable
-	fileNum base.FileNum
-	mu      struct {
+	r           objstorage.Readable
+	fileNum     base.DiskFileNum
+	baseCtxInfo ctxInfo
+	mu          struct {
 		sync.Mutex
 		g eventGenerator
 	}
@@ -147,7 +149,7 @@ type readable struct {
 var _ objstorage.Readable = (*readable)(nil)
 
 // ReadAt is part of the objstorage.Readable interface.
-func (r *readable) ReadAt(ctx context.Context, v []byte, off int64) (n int, err error) {
+func (r *readable) ReadAt(ctx context.Context, v []byte, off int64) error {
 	r.mu.Lock()
 	r.mu.g.add(ctx, Event{
 		Op:      ReadOp,
@@ -171,20 +173,20 @@ func (r *readable) Size() int64 {
 }
 
 // NewReadHandle is part of the objstorage.Readable interface.
-func (r *readable) NewReadHandle(ctx context.Context) objstorage.ReadHandle {
+func (r *readable) NewReadHandle(readBeforeSize objstorage.ReadBeforeSize) objstorage.ReadHandle {
 	// It's safe to get the tracer from the generator without the mutex since it never changes.
 	t := r.mu.g.t
 	return &readHandle{
-		rh:       r.r.NewReadHandle(ctx),
+		rh:       r.r.NewReadHandle(readBeforeSize),
 		fileNum:  r.fileNum,
 		handleID: t.handleID.Add(1),
-		g:        makeEventGenerator(ctx, t),
+		g:        makeEventGenerator(r.baseCtxInfo, t),
 	}
 }
 
 type readHandle struct {
 	rh       objstorage.ReadHandle
-	fileNum  base.FileNum
+	fileNum  base.DiskFileNum
 	handleID uint64
 	g        eventGenerator
 }
@@ -192,7 +194,7 @@ type readHandle struct {
 var _ objstorage.ReadHandle = (*readHandle)(nil)
 
 // ReadAt is part of the objstorage.ReadHandle interface.
-func (rh *readHandle) ReadAt(ctx context.Context, p []byte, off int64) (n int, err error) {
+func (rh *readHandle) ReadAt(ctx context.Context, p []byte, off int64) error {
 	rh.g.add(ctx, Event{
 		Op:       ReadOp,
 		FileNum:  rh.fileNum,
@@ -308,10 +310,10 @@ type eventGenerator struct {
 	buf         eventBuf
 }
 
-func makeEventGenerator(ctx context.Context, t *Tracer) eventGenerator {
+func makeEventGenerator(baseCtxInfo ctxInfo, t *Tracer) eventGenerator {
 	return eventGenerator{
 		t:           t,
-		baseCtxInfo: infoFromCtx(ctx),
+		baseCtxInfo: baseCtxInfo,
 	}
 }
 
@@ -381,7 +383,7 @@ func (t *Tracer) workerWriteTraces(state *workerState, data eventBuf) {
 func (t *Tracer) workerNewFile(state *workerState) {
 	filename := fmt.Sprintf("IOTRACES-%s", time.Now().UTC().Format(time.RFC3339Nano))
 
-	file, err := t.fs.Create(t.fs.PathJoin(t.fsDir, filename))
+	file, err := t.fs.Create(t.fs.PathJoin(t.fsDir, filename), vfs.WriteCategoryUnspecified)
 	if err != nil {
 		panic(err)
 	}

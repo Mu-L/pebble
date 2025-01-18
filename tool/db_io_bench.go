@@ -9,7 +9,8 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -133,7 +134,7 @@ func genBenchIOs(
 	// The choice of objects will be the same across all IO sizes.
 	b := make([]int, count)
 	for i := range b {
-		b[i] = rand.Intn(total)
+		b[i] = rand.IntN(total)
 	}
 	// For each b[i], find the index such that sum[idx-1] <= b < sum[idx].
 	// Sorting b makes this easier: we can "merge" the sorted arrays b and sum.
@@ -151,7 +152,7 @@ func genBenchIOs(
 	for _, ioSize := range sizes {
 		for _, idx := range rIdx {
 			// Random ioSize aligned offset.
-			ofs := ioSize * rand.Intn(size[idx]*maxIOSize/ioSize)
+			ofs := ioSize * rand.IntN(size[idx]*maxIOSize/ioSize)
 
 			res = append(res, benchIO{
 				readableIdx: idx,
@@ -187,7 +188,7 @@ func (d *dbT) openBenchTables(db *pebble.DB) ([]objstorage.Readable, error) {
 	numsMap := make(map[base.DiskFileNum]struct{})
 	for l := startLevel; l < len(tables); l++ {
 		for _, t := range tables[l] {
-			n := t.BackingSSTNum.DiskFileNum()
+			n := t.BackingSSTNum
 			if _, ok := numsMap[n]; !ok {
 				nums = append(nums, n)
 				numsMap[n] = struct{}{}
@@ -247,7 +248,7 @@ func performIOs(readables []objstorage.Readable, ios []benchIO) error {
 	ctx := context.Background()
 	rh := make([]objstorage.ReadHandle, len(readables))
 	for i := range rh {
-		rh[i] = readables[i].NewReadHandle(ctx)
+		rh[i] = readables[i].NewReadHandle(objstorage.NoReadBefore)
 	}
 	defer func() {
 		for i := range rh {
@@ -279,7 +280,7 @@ func performIOs(readables []objstorage.Readable, ios []benchIO) error {
 
 // getStats calculates various statistics given a list of elapsed times.
 func getStats(d []time.Duration) string {
-	sort.Slice(d, func(i, j int) bool { return d[i] < d[j] })
+	slices.Sort(d)
 
 	factor := 1.0 / float64(len(d))
 	var mean float64

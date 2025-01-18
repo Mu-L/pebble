@@ -6,11 +6,10 @@ package base
 
 import (
 	"fmt"
-	"sort"
+	"math/rand/v2"
+	"slices"
 	"testing"
 	"time"
-
-	"golang.org/x/exp/rand"
 )
 
 func TestDefAppendSeparator(t *testing.T) {
@@ -55,8 +54,14 @@ func TestDefAppendSeparator(t *testing.T) {
 	}
 }
 
+func TestDefaultComparer(t *testing.T) {
+	if err := CheckComparer(DefaultComparer, [][]byte{{}, []byte("abc"), []byte("d"), []byte("ef")}, [][]byte{{}}); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestAbbreviatedKey(t *testing.T) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	randBytes := func(size int) []byte {
 		data := make([]byte, size)
 		for i := range data {
@@ -67,11 +72,9 @@ func TestAbbreviatedKey(t *testing.T) {
 
 	keys := make([][]byte, 10000)
 	for i := range keys {
-		keys[i] = randBytes(rng.Intn(16))
+		keys[i] = randBytes(rng.IntN(16))
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		return DefaultComparer.Compare(keys[i], keys[j]) < 0
-	})
+	slices.SortFunc(keys, DefaultComparer.Compare)
 
 	for i := 1; i < len(keys); i++ {
 		last := DefaultComparer.AbbreviatedKey(keys[i-1])
@@ -92,7 +95,7 @@ func TestAbbreviatedKey(t *testing.T) {
 }
 
 func BenchmarkAbbreviatedKey(b *testing.B) {
-	rng := rand.New(rand.NewSource(1449168817))
+	rng := rand.New(rand.NewPCG(0, 1449168817))
 	randBytes := func(size int) []byte {
 		data := make([]byte, size)
 		for i := range data {

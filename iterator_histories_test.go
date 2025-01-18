@@ -5,6 +5,7 @@ package pebble
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/testkeys"
@@ -34,78 +34,37 @@ func TestIterHistories(t *testing.T) {
 		}
 
 		var d *DB
+		var refedCache bool
+		var buf bytes.Buffer
 		iters := map[string]*Iterator{}
 		batches := map[string]*Batch{}
 		newIter := func(name string, reader Reader, o *IterOptions) *Iterator {
-			it := reader.NewIter(o)
+			it, _ := reader.NewIter(o)
 			iters[name] = it
 			return it
 		}
+		var opts *Options
 		parseOpts := func(td *datadriven.TestData) (*Options, error) {
-			opts := &Options{
+			opts = &Options{
 				FS:                 vfs.NewMem(),
 				Comparer:           testkeys.Comparer,
-				FormatMajorVersion: FormatRangeKeys,
+				FormatMajorVersion: FormatMinSupported,
 				BlockPropertyCollectors: []func() BlockPropertyCollector{
 					sstable.NewTestKeysBlockPropertyCollector,
 				},
+				Logger: testLogger{t},
 			}
+
 			opts.DisableAutomaticCompactions = true
 			opts.EnsureDefaults()
 			opts.WithFSDefaults()
-
-			for _, cmdArg := range td.CmdArgs {
-				switch cmdArg.Key {
-				case "format-major-version":
-					v, err := strconv.Atoi(cmdArg.Vals[0])
-					if err != nil {
-						return nil, err
-					}
-					// Override the DB version.
-					opts.FormatMajorVersion = FormatMajorVersion(v)
-				case "block-size":
-					v, err := strconv.Atoi(cmdArg.Vals[0])
-					if err != nil {
-						return nil, err
-					}
-					for i := range opts.Levels {
-						opts.Levels[i].BlockSize = v
-					}
-				case "index-block-size":
-					v, err := strconv.Atoi(cmdArg.Vals[0])
-					if err != nil {
-						return nil, err
-					}
-					for i := range opts.Levels {
-						opts.Levels[i].IndexBlockSize = v
-					}
-				case "target-file-size":
-					v, err := strconv.Atoi(cmdArg.Vals[0])
-					if err != nil {
-						return nil, err
-					}
-					for i := range opts.Levels {
-						opts.Levels[i].TargetFileSize = int64(v)
-					}
-				case "bloom-bits-per-key":
-					v, err := strconv.Atoi(cmdArg.Vals[0])
-					if err != nil {
-						return nil, err
-					}
-					fp := bloom.FilterPolicy(v)
-					opts.Filters = map[string]FilterPolicy{fp.Name(): fp}
-					for i := range opts.Levels {
-						opts.Levels[i].FilterPolicy = fp
-					}
-				case "merger":
-					switch cmdArg.Vals[0] {
-					case "appender":
-						opts.Merger = base.DefaultMerger
-					default:
-						return nil, errors.Newf("unrecognized Merger %q\n", cmdArg.Vals[0])
-					}
-				}
+			originalCache := opts.Cache
+			if err := parseDBOptionsArgs(opts, td.CmdArgs); err != nil {
+				return nil, err
 			}
+			// If the test replaced the cache, we'll need to unref the
+			// new cache later.
+			refedCache = opts.Cache != originalCache
 			return opts, nil
 		}
 		cleanup := func() (err error) {
@@ -117,21 +76,42 @@ func TestIterHistories(t *testing.T) {
 				err = firstError(err, iter.Close())
 				delete(iters, key)
 			}
+
 			if d != nil {
+				// Close all open snapshots.
+				d.mu.Lock()
+				var ss []*Snapshot
+				l := &d.mu.snapshots
+				for i := l.root.next; i != &l.root; i = i.next {
+					ss = append(ss, i)
+				}
+				d.mu.Unlock()
+				for i := range ss {
+					err = firstError(err, ss[i].Close())
+				}
+
 				err = firstError(err, d.Close())
 				d = nil
+			}
+
+			if refedCache {
+				opts.Cache.Unref()
+				opts.Cache = nil
+				refedCache = false
 			}
 			return err
 		}
 		defer cleanup()
 
 		datadriven.RunTest(t, path, func(t *testing.T, td *datadriven.TestData) string {
+			buf.Reset()
 			switch td.Cmd {
 			case "define":
+				var err error
 				if err := cleanup(); err != nil {
 					return err.Error()
 				}
-				opts, err := parseOpts(td)
+				opts, err = parseOpts(td)
 				if err != nil {
 					return err.Error()
 				}
@@ -140,12 +120,27 @@ func TestIterHistories(t *testing.T) {
 					return err.Error()
 				}
 				return runLSMCmd(td, d)
-
-			case "reset":
+			case "reopen":
+				var err error
 				if err := cleanup(); err != nil {
 					return err.Error()
 				}
-				opts, err := parseOpts(td)
+				originalCache := opts.Cache
+				if err := parseDBOptionsArgs(opts, td.CmdArgs); err != nil {
+					return err.Error()
+				}
+				// If the test replaced the cache, we'll need to unref the
+				// new cache later.
+				refedCache = originalCache != opts.Cache
+				d, err = Open("", opts)
+				require.NoError(t, err)
+				return ""
+			case "reset":
+				var err error
+				if err := cleanup(); err != nil {
+					return err.Error()
+				}
+				opts, err = parseOpts(td)
 				if err != nil {
 					return err.Error()
 				}
@@ -197,6 +192,16 @@ func TestIterHistories(t *testing.T) {
 					return err.Error()
 				}
 				return ""
+			case "disable-flushes":
+				d.mu.Lock()
+				d.mu.compact.flushing = true
+				d.mu.Unlock()
+				return ""
+			case "enable-flushes":
+				d.mu.Lock()
+				d.mu.compact.flushing = false
+				d.mu.Unlock()
+				return ""
 			case "get":
 				var reader Reader = d
 				if arg, ok := td.Arg("reader"); ok {
@@ -204,7 +209,6 @@ func TestIterHistories(t *testing.T) {
 						return fmt.Sprintf("unknown reader %q", arg.Vals[0])
 					}
 				}
-				var buf bytes.Buffer
 				for _, l := range strings.Split(td.Input, "\n") {
 					v, closer, err := reader.Get([]byte(l))
 					if err != nil {
@@ -217,6 +221,16 @@ func TestIterHistories(t *testing.T) {
 					}
 				}
 				return buf.String()
+			case "build":
+				if err := runBuildCmd(td, d, d.opts.FS); err != nil {
+					return err.Error()
+				}
+				return ""
+			case "ingest-existing":
+				if err := runIngestCmd(td, d, d.opts.FS); err != nil {
+					return err.Error()
+				}
+				return ""
 			case "ingest":
 				if err := runBuildCmd(td, d, d.opts.FS); err != nil {
 					return err.Error()
@@ -225,6 +239,29 @@ func TestIterHistories(t *testing.T) {
 					return err.Error()
 				}
 				return ""
+			case "layout":
+				var verbose bool
+				var filename string
+				td.ScanArgs(t, "filename", &filename)
+				td.MaybeScanArgs(t, "verbose", &verbose)
+				f, err := opts.FS.Open(filename)
+				if err != nil {
+					return err.Error()
+				}
+				readable, err := sstable.NewSimpleReadable(f)
+				if err != nil {
+					return err.Error()
+				}
+				r, err := sstable.NewReader(context.Background(), readable, opts.MakeReaderOptions())
+				if err != nil {
+					return err.Error()
+				}
+				defer r.Close()
+				l, err := r.Layout()
+				if err != nil {
+					return err.Error()
+				}
+				return l.Describe(verbose, r, nil)
 			case "lsm":
 				return runLSMCmd(td, d)
 			case "metrics":
@@ -309,11 +346,19 @@ func TestIterHistories(t *testing.T) {
 						o.PointKeyFilters = []sstable.BlockPropertyFilter{
 							sstable.NewTestKeysBlockPropertyFilter(min, max),
 						}
-					case "snapshot":
-						s, err := strconv.ParseUint(arg.Vals[0], 10, 64)
-						if err != nil {
-							return err.Error()
+						o.SkipPoint = func(k []byte) bool {
+							i := testkeys.Comparer.Split(k)
+							if i == len(k) {
+								return false
+							}
+							v, err := testkeys.ParseSuffix(k[i:])
+							if err != nil {
+								return false
+							}
+							return uint64(v) < min || uint64(v) >= max
 						}
+					case "snapshot":
+						s := base.ParseSeqNum(arg.Vals[0])
 						func() {
 							d.mu.Lock()
 							defer d.mu.Unlock()
@@ -355,7 +400,6 @@ func TestIterHistories(t *testing.T) {
 				iter := newIter(name, d, &IterOptions{KeyTypes: IterKeyTypeRangesOnly})
 				return runIterCmd(td, iter, name == "" /* close iter */)
 			case "scan-rangekeys":
-				var buf bytes.Buffer
 				iter := newIter(
 					pluckStringCmdArg(td, "name"),
 					d,

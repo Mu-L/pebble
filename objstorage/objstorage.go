@@ -10,8 +10,10 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/sharedcache"
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/redact"
 )
 
 // Readable is the handle for an object that is open for reading.
@@ -36,8 +38,37 @@ type Readable interface {
 	// The ReadHandle must be closed before the Readable is closed.
 	//
 	// Multiple separate ReadHandles can be used.
-	NewReadHandle(ctx context.Context) ReadHandle
+	NewReadHandle(readBeforeSize ReadBeforeSize) ReadHandle
 }
+
+// ReadBeforeSize specifies whether the first read should read additional
+// bytes before the offset, and how big the overall read should be. This is
+// just a suggestion that the callee can ignore (and does ignore in
+// fileReadable).
+//
+// When 0, the first read will only read what it is asked to read, say n
+// bytes. When it is a value b > 0, if b > n, then the read will be padded by
+// an additional b-n bytes to the left, resulting in an overall read size of
+// b. This behavior is akin to what the read-ahead implementation does -- when
+// the n bytes are not buffered, and there is read-ahead of b > n, the read
+// length is b bytes.
+type ReadBeforeSize int64
+
+const (
+	// NoReadBefore specifies no read-before.
+	NoReadBefore ReadBeforeSize = 0
+	// ReadBeforeForNewReader is used for a new Reader reading the footer,
+	// metaindex, properties. 32KB is unnecessarily large, but it is still small
+	// when considering remote object storage.
+	ReadBeforeForNewReader = 32 * 1024
+	// ReadBeforeForIndexAndFilter is used for an iterator reading the top-level
+	// index, filter and second-level index blocks.
+	//
+	// Consider a 128MB sstable with 32KB blocks, so 4K blocks. Say keys are
+	// ~100 bytes, then the size of the index blocks is ~400KB. 512KB is a bit
+	// bigger, and not too large to be a memory concern.
+	ReadBeforeForIndexAndFilter = 512 * 1024
+)
 
 // ReadHandle is used to perform reads that are related and might benefit from
 // optimizations like read-ahead.
@@ -139,11 +170,11 @@ func (meta *ObjectMetadata) AssertValid() {
 			panic(errors.AssertionFailedf("meta.Remote not empty: %#v", meta.Remote))
 		}
 	} else {
-		if meta.Remote.CustomObjectName != "" {
+		if meta.Remote.CustomObjectName == "" {
 			if meta.Remote.CreatorID == 0 {
 				panic(errors.AssertionFailedf("CreatorID not set"))
 			}
-			if meta.Remote.CreatorFileNum == base.FileNum(0).DiskFileNum() {
+			if meta.Remote.CreatorFileNum == 0 {
 				panic(errors.AssertionFailedf("CreatorFileNum not set"))
 			}
 		}
@@ -165,6 +196,11 @@ type CreatorID uint64
 func (c CreatorID) IsSet() bool { return c != 0 }
 
 func (c CreatorID) String() string { return fmt.Sprintf("%d", c) }
+
+// SafeFormat implements redact.SafeFormatter.
+func (c CreatorID) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("%d", redact.SafeUint(c))
+}
 
 // SharedCleanupMethod indicates the method for cleaning up unused shared objects.
 type SharedCleanupMethod uint8
@@ -195,6 +231,10 @@ type CreateOptions struct {
 	// SharedCleanupMethod is used for the object when it is created on shared storage.
 	// The default (zero) value is SharedRefTracking.
 	SharedCleanupMethod SharedCleanupMethod
+
+	// WriteCategory is used for the object when it is created on local storage
+	// to collect aggregated write metrics for each write source.
+	WriteCategory vfs.DiskWriteCategory
 }
 
 // Provider is a singleton object used to access and manage objects.
@@ -279,7 +319,14 @@ type Provider interface {
 	// Pebble and will never be removed by Pebble.
 	CreateExternalObjectBacking(locator remote.Locator, objName string) (RemoteObjectBacking, error)
 
+	// GetExternalObjects returns a list of DiskFileNums corresponding to all
+	// objects that are backed by the given external object.
+	GetExternalObjects(locator remote.Locator, objName string) []base.DiskFileNum
+
 	// AttachRemoteObjects registers existing remote objects with this provider.
+	//
+	// The objects are not guaranteed to be durable (accessible in case of
+	// crashes) until Sync is called.
 	AttachRemoteObjects(objs []RemoteObjectToAttach) ([]ObjectMetadata, error)
 
 	Close() error
@@ -287,6 +334,15 @@ type Provider interface {
 	// IsNotExistError indicates whether the error is known to report that a file or
 	// directory does not exist.
 	IsNotExistError(err error) bool
+
+	// CheckpointState saves any saved state on local disk to the specified
+	// directory on the specified VFS. A new Pebble instance instantiated at that
+	// path should be able to resolve references to the specified files.
+	CheckpointState(fs vfs.FS, dir string, fileType base.FileType, fileNums []base.DiskFileNum) error
+
+	// Metrics returns metrics about objstorage. Currently, it only returns metrics
+	// about the shared cache.
+	Metrics() sharedcache.Metrics
 }
 
 // RemoteObjectBacking encodes the metadata necessary to incorporate a shared
@@ -316,4 +372,39 @@ type RemoteObjectToAttach struct {
 	// generated from a different instance, but using the same Provider
 	// implementation).
 	Backing RemoteObjectBacking
+}
+
+// Copy copies the specified range from the input to the output.
+func Copy(ctx context.Context, r ReadHandle, out Writable, offset, length uint64) error {
+	buf := make([]byte, 256<<10)
+	end := offset + length
+	for offset < end {
+		n := min(end-offset, uint64(len(buf)))
+		if n == 0 {
+			break
+		}
+		readErr := r.ReadAt(ctx, buf[:n], int64(offset))
+		if readErr != nil {
+			return readErr
+		}
+		offset += n
+		if err := out.Write(buf[:n]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// IsLocalTable returns true if a table with the given fileNum exists and is
+// local.
+func IsLocalTable(provider Provider, fileNum base.DiskFileNum) bool {
+	meta, err := provider.Lookup(base.FileTypeTable, fileNum)
+	return err == nil && !meta.IsRemote()
+}
+
+// IsExternalTable returns true if a table with the given fileNum exists and is
+// external.
+func IsExternalTable(provider Provider, fileNum base.DiskFileNum) bool {
+	meta, err := provider.Lookup(base.FileTypeTable, fileNum)
+	return err == nil && meta.IsExternal()
 }

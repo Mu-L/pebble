@@ -7,8 +7,12 @@ package objstorageprovider
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/pebble/internal/base"
@@ -38,7 +42,9 @@ func TestProvider(t *testing.T) {
 		backings := make(map[string]objstorage.RemoteObjectBacking)
 		backingHandles := make(map[string]objstorage.RemoteObjectBackingHandle)
 		var curProvider objstorage.Provider
+		readaheadConfig := NewReadaheadConfig()
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
+			readaheadConfig.Set(defaultReadaheadInformed, defaultReadaheadSpeculative)
 			scanArgs := func(desc string, args ...interface{}) {
 				t.Helper()
 				if len(d.CmdArgs) != len(args) {
@@ -63,9 +69,10 @@ func TestProvider(t *testing.T) {
 				st := DefaultSettings(fs, fsDir)
 				if creatorID != 0 {
 					st.Remote.StorageFactory = sharedFactory
-					st.Remote.CreateOnShared = true
+					st.Remote.CreateOnShared = remote.CreateOnSharedAll
 					st.Remote.CreateOnSharedLocator = ""
 				}
+				st.Local.ReadaheadConfig = readaheadConfig
 				require.NoError(t, fs.MkdirAll(fsDir, 0755))
 				p, err := Open(st)
 				require.NoError(t, err)
@@ -107,7 +114,7 @@ func TestProvider(t *testing.T) {
 					d.CmdArgs = d.CmdArgs[:4]
 					opts.SharedCleanupMethod = objstorage.SharedNoCleanup
 				}
-				var fileNum base.FileNum
+				var fileNum base.DiskFileNum
 				var typ string
 				var salt, size int
 				scanArgs("<file-num> <local|shared> <salt> <size> [no-ref-tracking]", &fileNum, &typ, &salt, &size)
@@ -118,7 +125,7 @@ func TestProvider(t *testing.T) {
 				default:
 					d.Fatalf(t, "'%s' should be 'local' or 'shared'", typ)
 				}
-				w, _, err := curProvider.Create(ctx, base.FileTypeTable, fileNum.DiskFileNum(), opts)
+				w, _, err := curProvider.Create(ctx, base.FileTypeTable, fileNum, opts)
 				if err != nil {
 					return err.Error()
 				}
@@ -138,7 +145,7 @@ func TestProvider(t *testing.T) {
 					d.CmdArgs = d.CmdArgs[:4]
 					opts.SharedCleanupMethod = objstorage.SharedNoCleanup
 				}
-				var fileNum base.FileNum
+				var fileNum base.DiskFileNum
 				var typ string
 				var salt, size int
 				scanArgs("<file-num> <local|shared> <salt> <size> [no-ref-tracking]", &fileNum, &typ, &salt, &size)
@@ -152,7 +159,7 @@ func TestProvider(t *testing.T) {
 
 				tmpFileCounter++
 				tmpFilename := fmt.Sprintf("temp-file-%d", tmpFileCounter)
-				f, err := fs.Create(tmpFilename)
+				f, err := fs.Create(tmpFilename, vfs.WriteCategoryUnspecified)
 				require.NoError(t, err)
 				data := make([]byte, size)
 				genData(byte(salt), 0, data)
@@ -162,24 +169,47 @@ func TestProvider(t *testing.T) {
 				require.NoError(t, f.Close())
 
 				_, err = curProvider.LinkOrCopyFromLocal(
-					ctx, fs, tmpFilename, base.FileTypeTable, fileNum.DiskFileNum(), opts,
+					ctx, fs, tmpFilename, base.FileTypeTable, fileNum, opts,
 				)
 				require.NoError(t, err)
 				return log.String()
 
 			case "read":
-				forCompaction := false
-				if len(d.CmdArgs) == 2 && d.CmdArgs[1].Key == "for-compaction" {
-					d.CmdArgs = d.CmdArgs[:1]
-					forCompaction = true
+				forCompaction := d.HasArg("for-compaction")
+				if arg, ok := d.Arg("readahead"); ok {
+					var mode ReadaheadMode
+					switch arg.SingleVal(t) {
+					case "off":
+						mode = NoReadahead
+					case "sys-readahead":
+						mode = SysReadahead
+					case "fadvise-sequential":
+						mode = FadviseSequential
+					default:
+						d.Fatalf(t, "unknown readahead mode %s", arg.SingleVal(t))
+					}
+					if forCompaction {
+						readaheadConfig.Set(mode, defaultReadaheadSpeculative)
+					} else {
+						readaheadConfig.Set(defaultReadaheadInformed, mode)
+					}
 				}
-				var fileNum base.FileNum
-				scanArgs("<file-num> [for-compaction]", &fileNum)
-				r, err := curProvider.OpenForReading(ctx, base.FileTypeTable, fileNum.DiskFileNum(), objstorage.OpenOptions{})
+
+				d.CmdArgs = d.CmdArgs[:1]
+				var fileNum base.DiskFileNum
+				scanArgs("<file-num> [for-compaction] [readahead|speculative-overhead=off|sys-readahead|fadvise-sequential]", &fileNum)
+				r, err := curProvider.OpenForReading(ctx, base.FileTypeTable, fileNum, objstorage.OpenOptions{})
 				if err != nil {
 					return err.Error()
 				}
-				rh := r.NewReadHandle(ctx)
+				var rh objstorage.ReadHandle
+				// Test both ways of getting a handle.
+				if rand.IntN(2) == 0 {
+					rh = r.NewReadHandle(objstorage.NoReadBefore)
+				} else {
+					var prealloc PreallocatedReadHandle
+					rh = UsePreallocatedReadHandle(r, objstorage.NoReadBefore, &prealloc)
+				}
 				if forCompaction {
 					rh.SetupForCompaction()
 				}
@@ -201,9 +231,9 @@ func TestProvider(t *testing.T) {
 				return log.String()
 
 			case "remove":
-				var fileNum base.FileNum
+				var fileNum base.DiskFileNum
 				scanArgs("<file-num>", &fileNum)
-				if err := curProvider.Remove(base.FileTypeTable, fileNum.DiskFileNum()); err != nil {
+				if err := curProvider.Remove(base.FileTypeTable, fileNum); err != nil {
 					return err.Error()
 				}
 				return log.String()
@@ -216,12 +246,16 @@ func TestProvider(t *testing.T) {
 
 			case "save-backing":
 				var key string
-				var fileNum base.FileNum
+				var fileNum base.DiskFileNum
 				scanArgs("<key> <file-num>", &key, &fileNum)
-				meta, err := curProvider.Lookup(base.FileTypeTable, fileNum.DiskFileNum())
+				meta, err := curProvider.Lookup(base.FileTypeTable, fileNum)
 				require.NoError(t, err)
-				handle, err := curProvider.RemoteObjectBacking(&meta)
-				if err != nil {
+				var handle objstorage.RemoteObjectBackingHandle
+				if err := base.CatchErrorPanic(func() error {
+					var err error
+					handle, err = curProvider.RemoteObjectBacking(&meta)
+					return err
+				}); err != nil {
 					return err.Error()
 				}
 				backing, err := handle.Get()
@@ -244,7 +278,7 @@ func TestProvider(t *testing.T) {
 				var objs []objstorage.RemoteObjectToAttach
 				for _, l := range lines {
 					var key string
-					var fileNum base.FileNum
+					var fileNum base.DiskFileNum
 					_, err := fmt.Sscan(l, &key, &fileNum)
 					require.NoError(t, err)
 					b, ok := backings[key]
@@ -253,7 +287,7 @@ func TestProvider(t *testing.T) {
 					}
 					objs = append(objs, objstorage.RemoteObjectToAttach{
 						FileType: base.FileTypeTable,
-						FileNum:  fileNum.DiskFileNum(),
+						FileNum:  fileNum,
 						Backing:  b,
 					})
 				}
@@ -284,7 +318,7 @@ func TestSharedMultipleLocators(t *testing.T) {
 
 	st1 := DefaultSettings(vfs.NewMem(), "")
 	st1.Remote.StorageFactory = sharedFactory
-	st1.Remote.CreateOnShared = true
+	st1.Remote.CreateOnShared = remote.CreateOnSharedAll
 	st1.Remote.CreateOnSharedLocator = "foo"
 	p1, err := Open(st1)
 	require.NoError(t, err)
@@ -292,14 +326,14 @@ func TestSharedMultipleLocators(t *testing.T) {
 
 	st2 := DefaultSettings(vfs.NewMem(), "")
 	st2.Remote.StorageFactory = sharedFactory
-	st2.Remote.CreateOnShared = true
+	st2.Remote.CreateOnShared = remote.CreateOnSharedAll
 	st2.Remote.CreateOnSharedLocator = "bar"
 	p2, err := Open(st2)
 	require.NoError(t, err)
 	require.NoError(t, p2.SetCreatorID(2))
 
-	file1 := base.FileNum(1).DiskFileNum()
-	file2 := base.FileNum(2).DiskFileNum()
+	file1 := base.DiskFileNum(1)
+	file2 := base.DiskFileNum(2)
 
 	for i, provider := range []objstorage.Provider{p1, p2} {
 		w, _, err := provider.Create(ctx, base.FileTypeTable, file1, objstorage.CreateOptions{
@@ -382,7 +416,7 @@ func TestSharedMultipleLocators(t *testing.T) {
 	require.NoError(t, p3.Close())
 }
 
-func TestAttachCustomObject(t *testing.T) {
+func TestAttachExternalObject(t *testing.T) {
 	ctx := context.Background()
 	storage := remote.NewInMem()
 	sharedFactory := remote.MakeSimpleFactory(map[remote.Locator]remote.Storage{
@@ -408,14 +442,14 @@ func TestAttachCustomObject(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = p1.AttachRemoteObjects([]objstorage.RemoteObjectToAttach{{
-		FileNum:  base.FileNum(1).DiskFileNum(),
+		FileNum:  base.DiskFileNum(1),
 		FileType: base.FileTypeTable,
 		Backing:  backing,
 	}})
 	require.NoError(t, err)
 
 	// Verify the provider can read the object.
-	r, err := p1.OpenForReading(ctx, base.FileTypeTable, base.FileNum(1).DiskFileNum(), objstorage.OpenOptions{})
+	r, err := p1.OpenForReading(ctx, base.FileTypeTable, base.DiskFileNum(1), objstorage.OpenOptions{})
 	require.NoError(t, err)
 	require.Equal(t, int64(len(data)), r.Size())
 	buf := make([]byte, r.Size())
@@ -423,9 +457,11 @@ func TestAttachCustomObject(t *testing.T) {
 	require.Equal(t, byte(123), checkData(t, 0, buf))
 	require.NoError(t, r.Close())
 
+	require.Equal(t, []base.DiskFileNum{1}, p1.GetExternalObjects("foo", "some-obj-name"))
+
 	// Verify that we can extract a correct backing from this provider and attach
 	// the object to another provider.
-	meta, err := p1.Lookup(base.FileTypeTable, base.FileNum(1).DiskFileNum())
+	meta, err := p1.Lookup(base.FileTypeTable, base.DiskFileNum(1))
 	require.NoError(t, err)
 	handle, err := p1.RemoteObjectBacking(&meta)
 	require.NoError(t, err)
@@ -441,14 +477,14 @@ func TestAttachCustomObject(t *testing.T) {
 	require.NoError(t, p2.SetCreatorID(2))
 
 	_, err = p2.AttachRemoteObjects([]objstorage.RemoteObjectToAttach{{
-		FileNum:  base.FileNum(10).DiskFileNum(),
+		FileNum:  base.DiskFileNum(10),
 		FileType: base.FileTypeTable,
 		Backing:  backing,
 	}})
 	require.NoError(t, err)
 
 	// Verify the provider can read the object.
-	r, err = p2.OpenForReading(ctx, base.FileTypeTable, base.FileNum(10).DiskFileNum(), objstorage.OpenOptions{})
+	r, err = p2.OpenForReading(ctx, base.FileTypeTable, base.DiskFileNum(10), objstorage.OpenOptions{})
 	require.NoError(t, err)
 	require.Equal(t, int64(len(data)), r.Size())
 	buf = make([]byte, r.Size())
@@ -464,14 +500,14 @@ func TestNotExistError(t *testing.T) {
 	st.Remote.StorageFactory = remote.MakeSimpleFactory(map[remote.Locator]remote.Storage{
 		"": sharedStorage,
 	})
-	st.Remote.CreateOnShared = true
+	st.Remote.CreateOnShared = remote.CreateOnSharedAll
 	st.Remote.CreateOnSharedLocator = ""
 	provider, err := Open(st)
 	require.NoError(t, err)
 	require.NoError(t, provider.SetCreatorID(1))
 
 	for i, shared := range []bool{false, true} {
-		fileNum := base.FileNum(1 + i).DiskFileNum()
+		fileNum := base.DiskFileNum(1 + i)
 		name := "local"
 		if shared {
 			name = "remote"
@@ -536,4 +572,134 @@ func xor(n int) byte {
 	v ^= v >> 16
 	v ^= v >> 8
 	return byte(v)
+}
+
+// TestParallelSync checks that multiple goroutines can create and delete
+// objects and sync in parallel.
+func TestParallelSync(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		name := "local"
+		if shared {
+			name = "shared"
+		}
+		t.Run(name, func(t *testing.T) {
+			fs := vfs.NewCrashableMem()
+			st := DefaultSettings(fs, "")
+			st.Remote.StorageFactory = remote.MakeSimpleFactory(map[remote.Locator]remote.Storage{
+				"": remote.NewInMem(),
+			})
+
+			st.Remote.CreateOnShared = remote.CreateOnSharedAll
+			st.Remote.CreateOnSharedLocator = ""
+			p, err := Open(st)
+			require.NoError(t, err)
+			require.NoError(t, p.SetCreatorID(1))
+
+			const numGoroutines = 32
+			const numOps = 100
+			var wg sync.WaitGroup
+			wg.Add(numGoroutines + 1)
+
+			var mustExistMu struct {
+				sync.Mutex
+				m map[base.DiskFileNum]struct{}
+			}
+			mustExistMu.m = make(map[base.DiskFileNum]struct{})
+			setMustExist := func(num base.DiskFileNum, val bool) {
+				mustExistMu.Lock()
+				defer mustExistMu.Unlock()
+				if val {
+					mustExistMu.m[num] = struct{}{}
+				} else {
+					delete(mustExistMu.m, num)
+				}
+			}
+
+			var stop atomic.Bool
+			for n := 0; n < numGoroutines; n++ {
+				go func(startNum int, shared bool) {
+					defer wg.Done()
+					rng := rand.New(rand.NewPCG(0, uint64(startNum)))
+					for i := 0; i < numOps; i++ {
+						if stop.Load() {
+							return
+						}
+						num := base.DiskFileNum(startNum + i)
+						w, _, err := p.Create(context.Background(), base.FileTypeTable, num, objstorage.CreateOptions{
+							PreferSharedStorage: shared,
+						})
+						if err != nil {
+							panic(err)
+						}
+						if err := w.Finish(); err != nil {
+							panic(err)
+						}
+						if rng.IntN(2) == 0 {
+							if stop.Load() {
+								return
+							}
+							if err := p.Sync(); err != nil {
+								panic(err)
+							}
+							setMustExist(num, true)
+						}
+
+						if rng.IntN(4) == 0 {
+							setMustExist(num, false)
+							if err := p.Remove(base.FileTypeTable, num); err != nil {
+								panic(err)
+							}
+							if rng.IntN(2) == 0 {
+								if err := p.Sync(); err != nil {
+									panic(err)
+								}
+							}
+						}
+					}
+				}(numOps*(n+1), shared)
+			}
+			mustExist := make(map[base.DiskFileNum]struct{})
+			// "Crash" at a random time.
+			var crashFS *vfs.MemFS
+			time.AfterFunc(time.Duration(rand.Int64N(int64(10*time.Millisecond))), func() {
+				defer wg.Done()
+				if shared {
+					// TODO(radu): we cannot simulate a crash in shared mode because we
+					// have no way to restore the remote.Storage to the state at the time
+					// of the crash.
+					return
+				}
+				// Grab a consistent snapshot of the current mustExist map.
+				mustExistMu.Lock()
+				for n := range mustExistMu.m {
+					mustExist[n] = struct{}{}
+				}
+				crashFS = fs.CrashClone(vfs.CrashCloneCfg{})
+				mustExistMu.Unlock()
+				stop.Store(true)
+			})
+			// Wait until the timer function above and all the goroutines finish.
+			wg.Wait()
+			// Now close the provider, reset the filesystem, and check that all files
+			// we expect to exist are there.
+			require.NoError(t, p.Close())
+
+			if !shared {
+				st.FS = crashFS
+			}
+			p, err = Open(st)
+			require.NoError(t, err)
+			// Check that all objects exist and can be opened.
+			for num := range mustExist {
+				if _, err := p.Lookup(base.FileTypeTable, num); err != nil {
+					t.Fatalf("object %s not present after crash", num)
+				}
+				r, err := p.OpenForReading(context.Background(), base.FileTypeTable, num, objstorage.OpenOptions{})
+				if err != nil {
+					t.Fatalf("object %s cannot be opened after crash: %s", num, err)
+				}
+				require.NoError(t, r.Close())
+			}
+		})
+	}
 }

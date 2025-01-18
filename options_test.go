@@ -6,14 +6,17 @@ package pebble
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/wal"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,10 +31,16 @@ func (o *Options) testingRandomized(t testing.TB) *Options {
 	}
 	if o.FormatMajorVersion == FormatDefault {
 		// Pick a random format major version from the range
-		// [MostCompatible, FormatNewest].
-		o.FormatMajorVersion = FormatMajorVersion(rand.Intn(int(internalFormatNewest)) + 1)
+		// [FormatMinSupported, FormatNewest].
+		n := rand.IntN(int(internalFormatNewest - FormatMinSupported + 1))
+		o.FormatMajorVersion = FormatMinSupported + FormatMajorVersion(n)
 		t.Logf("Running %s with format major version %s", t.Name(), o.FormatMajorVersion.String())
 	}
+	// Enable columnar blocks if using a format major version that supports it.
+	if o.FormatMajorVersion >= FormatColumnarBlocks && o.Experimental.EnableColumnarBlocks == nil && rand.Int64N(4) > 0 {
+		o.Experimental.EnableColumnarBlocks = func() bool { return true }
+	}
+	o.EnsureDefaults()
 	return o
 }
 
@@ -82,30 +91,36 @@ func TestOptionsString(t *testing.T) {
   flush_delay_delete_range=0s
   flush_delay_range_key=0s
   flush_split_bytes=4194304
-  format_major_version=1
+  format_major_version=13
+  key_schema=DefaultKeySchema(leveldb.BytewiseComparator,16)
   l0_compaction_concurrency=10
   l0_compaction_file_threshold=500
   l0_compaction_threshold=4
   l0_stop_writes_threshold=12
   lbase_max_bytes=67108864
   max_concurrent_compactions=1
+  max_concurrent_downloads=1
   max_manifest_file_size=134217728
   max_open_files=1000
   mem_table_size=4194304
   mem_table_stop_writes_threshold=2
   min_deletion_rate=0
   merger=pebble.concatenate
+  multilevel_compaction_heuristic=wamp(0.00, false)
   read_compaction_rate=16000
   read_sampling_multiplier=16
+  num_deletions_threshold=100
+  deletion_size_ratio_threshold=0.500000
+  tombstone_dense_compaction_threshold=0.100000
   strict_wal_tail=true
   table_cache_shards=8
-  table_property_collectors=[]
   validate_on_ingest=false
   wal_dir=
   wal_bytes_per_sync=0
   max_writer_concurrency=0
   force_writer_parallelism=false
   secondary_cache_size_bytes=0
+  create_on_shared=0
 
 [Level "0"]
   block_restart_interval=16
@@ -120,25 +135,23 @@ func TestOptionsString(t *testing.T) {
 
 	var opts *Options
 	opts = opts.EnsureDefaults()
-	if v := opts.String(); expected != v {
-		t.Fatalf("expected\n%s\nbut found\n%s", expected, v)
-	}
+	require.Equal(t, expected, opts.String())
 }
 
-func TestOptionsCheck(t *testing.T) {
+func TestOptionsCheckCompatibility(t *testing.T) {
 	var opts *Options
 	opts = opts.EnsureDefaults()
 	s := opts.String()
-	require.NoError(t, opts.Check(s))
-	require.Regexp(t, `invalid key=value syntax`, opts.Check("foo\n"))
+	require.NoError(t, opts.CheckCompatibility(s))
+	require.Regexp(t, `invalid key=value syntax`, opts.CheckCompatibility("foo\n"))
 
 	tmp := *opts
 	tmp.Comparer = &Comparer{Name: "foo"}
-	require.Regexp(t, `comparer name from file.*!=.*`, tmp.Check(s))
+	require.Regexp(t, `comparer name from file.*!=.*`, tmp.CheckCompatibility(s))
 
 	tmp = *opts
 	tmp.Merger = &Merger{Name: "foo"}
-	require.Regexp(t, `merger name from file.*!=.*`, tmp.Check(s))
+	require.Regexp(t, `merger name from file.*!=.*`, tmp.CheckCompatibility(s))
 
 	// RocksDB uses a similar (INI-style) syntax for the OPTIONS file, but
 	// different section names and keys.
@@ -149,14 +162,14 @@ func TestOptionsCheck(t *testing.T) {
 `
 	tmp = *opts
 	tmp.Comparer = &Comparer{Name: "foo"}
-	require.Regexp(t, `comparer name from file.*!=.*`, tmp.Check(s))
+	require.Regexp(t, `comparer name from file.*!=.*`, tmp.CheckCompatibility(s))
 
 	tmp.Comparer = &Comparer{Name: "rocksdb-comparer"}
 	tmp.Merger = &Merger{Name: "foo"}
-	require.Regexp(t, `merger name from file.*!=.*`, tmp.Check(s))
+	require.Regexp(t, `merger name from file.*!=.*`, tmp.CheckCompatibility(s))
 
 	tmp.Merger = &Merger{Name: "rocksdb-merger"}
-	require.NoError(t, tmp.Check(s))
+	require.NoError(t, tmp.CheckCompatibility(s))
 
 	// RocksDB allows the merge operator to be unspecified, in which case it
 	// shows up as "nullptr".
@@ -165,7 +178,51 @@ func TestOptionsCheck(t *testing.T) {
   merge_operator=nullptr
 `
 	tmp = *opts
-	require.NoError(t, tmp.Check(s))
+	require.NoError(t, tmp.CheckCompatibility(s))
+
+	// Check that an OPTIONS file that configured an explicit WALDir that will
+	// no longer be used errors if it's not also present in WALRecoveryDirs.
+	require.Equal(t, ErrMissingWALRecoveryDir{Dir: "external-wal-dir"},
+		(&Options{}).EnsureDefaults().CheckCompatibility(`
+[Options]
+  wal_dir=external-wal-dir
+`))
+	// But not if it's configured as a WALRecoveryDir or current WALDir.
+	require.NoError(t,
+		(&Options{WALRecoveryDirs: []wal.Dir{{Dirname: "external-wal-dir"}}}).EnsureDefaults().CheckCompatibility(`
+[Options]
+  wal_dir=external-wal-dir
+`))
+	require.NoError(t,
+		(&Options{WALDir: "external-wal-dir"}).EnsureDefaults().CheckCompatibility(`
+[Options]
+  wal_dir=external-wal-dir
+`))
+
+	// Check that an OPTIONS file that configured a secondary failover WAL dir
+	// that will no longer be used errors if it's not also present in
+	// WALRecoveryDirs.
+	require.Equal(t, ErrMissingWALRecoveryDir{Dir: "failover-wal-dir"},
+		(&Options{}).EnsureDefaults().CheckCompatibility(`
+[Options]
+
+[WAL Failover]
+  secondary_dir=failover-wal-dir
+`))
+	// But not if it's configured as a WALRecoveryDir or current failover
+	// secondary dir.
+	require.NoError(t, (&Options{WALRecoveryDirs: []wal.Dir{{Dirname: "failover-wal-dir"}}}).EnsureDefaults().CheckCompatibility(`
+[Options]
+
+[WAL Failover]
+  secondary_dir=failover-wal-dir
+`))
+	require.NoError(t, (&Options{WALFailover: &WALFailoverOptions{Secondary: wal.Dir{Dirname: "failover-wal-dir"}}}).EnsureDefaults().CheckCompatibility(`
+[Options]
+
+[WAL Failover]
+  secondary_dir=failover-wal-dir
+`))
 }
 
 type testCleaner struct{}
@@ -234,9 +291,15 @@ func TestOptionsParse(t *testing.T) {
 			opts.FlushDelayRangeKey = 11 * time.Second
 			opts.Experimental.LevelMultiplier = 5
 			opts.TargetByteDeletionRate = 200
+			opts.WALFailover = &WALFailoverOptions{
+				Secondary: wal.Dir{Dirname: "wal_secondary", FS: vfs.Default},
+			}
 			opts.Experimental.ReadCompactionRate = 300
 			opts.Experimental.ReadSamplingMultiplier = 400
-			opts.Experimental.TableCacheShards = 500
+			opts.Experimental.NumDeletionsThreshold = 500
+			opts.Experimental.DeletionSizeRatioThreshold = 0.7
+			opts.Experimental.TombstoneDenseCompactionThreshold = 0.2
+			opts.Experimental.FileCacheShards = 500
 			opts.Experimental.MaxWriterConcurrency = 1
 			opts.Experimental.ForceWriterParallelism = true
 			opts.Experimental.SecondaryCacheSizeBytes = 1024
@@ -254,6 +317,16 @@ func TestOptionsParse(t *testing.T) {
 			require.NotEqual(t, newCacheSize, 0)
 		})
 	}
+}
+
+func TestOptionsParseComparerOverwrite(t *testing.T) {
+	// Test that an unrecognized comparer in the OPTIONS file does not nil out
+	// the Comparer field.
+	o := &Options{Comparer: testkeys.Comparer}
+	err := o.Parse(`[Options]
+comparer=unrecognized`, nil)
+	require.NoError(t, err)
+	require.Equal(t, testkeys.Comparer, o.Comparer)
 }
 
 func TestOptionsValidate(t *testing.T) {
@@ -279,7 +352,7 @@ func TestOptionsValidate(t *testing.T) {
 [Options]
   mem_table_size=4294967296
 `,
-			`MemTableSize \(4\.0GB\) must be < 4\.0GB`,
+			`MemTableSize \(4\.0GB\) must be < [2|4]\.0GB`,
 		},
 		{`
 [Options]
@@ -312,13 +385,75 @@ func TestOptionsValidateCache(t *testing.T) {
 	opts.EnsureDefaults()
 	opts.Cache = NewCache(8 << 20)
 	defer opts.Cache.Unref()
-	opts.TableCache = NewTableCache(NewCache(8<<20), 10, 1)
-	defer opts.TableCache.cache.Unref()
-	defer opts.TableCache.Unref()
+	opts.FileCache = NewFileCache(NewCache(8<<20), 10, 1)
+	defer opts.FileCache.cache.Unref()
+	defer opts.FileCache.Unref()
 
 	err := opts.Validate()
 	require.Error(t, err)
-	if fmt.Sprint(err) != "underlying cache in the TableCache and the Cache dont match" {
+	if fmt.Sprint(err) != "underlying cache in the FileCache and the Cache dont match" {
 		t.Errorf("Unexpected error message")
+	}
+}
+
+func TestKeyCategories(t *testing.T) {
+	kc := MakeUserKeyCategories(base.DefaultComparer.Compare, []UserKeyCategory{
+		{Name: "b", UpperBound: []byte("b")},
+		{Name: "dd", UpperBound: []byte("dd")},
+		{Name: "e", UpperBound: []byte("e")},
+		{Name: "h", UpperBound: []byte("h")},
+		{Name: "o", UpperBound: nil},
+	}...)
+
+	for _, tc := range []struct {
+		key      string
+		expected string
+	}{
+		{key: "a", expected: "b"},
+		{key: "a123", expected: "b"},
+		{key: "az", expected: "b"},
+		{key: "b", expected: "dd"},
+		{key: "b123", expected: "dd"},
+		{key: "c", expected: "dd"},
+		{key: "d", expected: "dd"},
+		{key: "dd", expected: "e"},
+		{key: "dd0", expected: "e"},
+		{key: "de", expected: "e"},
+		{key: "e", expected: "h"},
+		{key: "e1", expected: "h"},
+		{key: "f", expected: "h"},
+		{key: "h", expected: "o"},
+		{key: "h1", expected: "o"},
+		{key: "z", expected: "o"},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			res := kc.CategorizeKey([]byte(tc.key))
+			require.Equal(t, tc.expected, res)
+		})
+	}
+
+	for _, tc := range []struct {
+		rng      string
+		expected string
+	}{
+		{rng: "a-a", expected: "b"},
+		{rng: "a-a1", expected: "b"},
+		{rng: "a-b", expected: "b-dd"},
+		{rng: "b1-b5", expected: "dd"},
+		{rng: "b1-dd0", expected: "dd-e"},
+		{rng: "b1-g", expected: "dd-h"},
+		{rng: "b1-j", expected: "dd-o"},
+		{rng: "b1-z", expected: "dd-o"},
+		{rng: "dd-e", expected: "e-h"},
+		{rng: "h-i", expected: "o"},
+		{rng: "i-i", expected: "o"},
+		{rng: "i-j", expected: "o"},
+		{rng: "a-z", expected: "b-o"},
+	} {
+		t.Run(tc.rng, func(t *testing.T) {
+			keys := strings.SplitN(tc.rng, "-", 2)
+			res := kc.CategorizeKeyRange([]byte(keys[0]), []byte(keys[1]))
+			require.Equal(t, tc.expected, res)
+		})
 	}
 }

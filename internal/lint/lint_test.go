@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -22,9 +23,9 @@ import (
 
 const (
 	cmdGo       = "go"
-	golint      = "golang.org/x/lint/golint@6edffad5e6160f5949cdefc81710b2706fbcd4f6"
-	staticcheck = "honnef.co/go/tools/cmd/staticcheck@2023.1"
-	crlfmt      = "github.com/cockroachdb/crlfmt@44a36ec7"
+	staticcheck = "honnef.co/go/tools/cmd/staticcheck"
+	crlfmt      = "github.com/cockroachdb/crlfmt"
+	gcassert    = "github.com/jordanlewis/gcassert/cmd/gcassert"
 )
 
 func dirCmd(t *testing.T, dir string, name string, args ...string) stream.Filter {
@@ -45,9 +46,21 @@ func ignoreGoMod() stream.Filter {
 	return stream.GrepNot(`^go: (finding|extracting|downloading)`)
 }
 
+func installTool(t *testing.T, path string) {
+	cmd := exec.Command(cmdGo, "install", "-C", "../devtools", path)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("cannot install %q: %v\n%s\n", path, err, out)
+	}
+}
+
 func TestLint(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("lint checks skipped on Windows")
+	}
+	if runtime.GOARCH == "386" {
+		// GOARCH=386 messes with the installation of devtools.
+		t.Skip("lint checks skipped on GOARCH=386")
 	}
 	if invariants.RaceEnabled {
 		// We are not interested in race-testing the linters themselves.
@@ -70,19 +83,58 @@ func TestLint(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	t.Run("TestGolint", func(t *testing.T) {
-		t.Parallel()
-
-		args := []string{"run", golint}
-		args = append(args, pkgs...)
-
-		// This is overkill right now, but provides a structure for filtering out
-		// lint errors we don't care about.
+	// TestGoVet is the fastest check that verifies that all files build, so we
+	// want to run it first (and not in parallel).
+	t.Run("TestGoVet", func(t *testing.T) {
 		if err := stream.ForEach(
 			stream.Sequence(
-				dirCmd(t, pkg.Dir, cmdGo, args...),
-				stream.GrepNot("go: downloading"),
+				dirCmd(t, pkg.Dir, "go", "vet", "-all", "./..."),
+				stream.GrepNot(`^#`), // ignore comment lines
+				ignoreGoMod(),
 			), func(s string) {
+				t.Errorf("\n%s", s)
+			}); err != nil {
+			t.Error(err)
+		}
+	})
+
+	// In most cases, go vet fails because of a build error; running the rest of
+	// the checks would just result in a lot of noise.
+	if t.Failed() {
+		t.Fatal("go vet failed; skipping other lint checks")
+	}
+
+	t.Run("TestGCAssert", func(t *testing.T) {
+		installTool(t, gcassert)
+		t.Parallel()
+
+		// Build a list of all packages that contain a gcassert directive.
+		var packages []string
+		if err := stream.ForEach(
+			dirCmd(
+				t, pkg.Dir, "git", "grep", "-nE", `// ?gcassert`,
+			), func(s string) {
+				// s here is of the form
+				//   some/package/file.go:123:// gcassert:inline
+				// and we want to extract the package path.
+				filePath := s[:strings.Index(s, ":")]                  // up to the line number
+				pkgPath := filePath[:strings.LastIndex(filePath, "/")] // up to the file name
+				path := fmt.Sprintf("./%s", pkgPath)
+				if !slices.Contains(packages, path) {
+					packages = append(packages, path)
+				}
+			}); err != nil {
+			t.Error(err)
+		}
+		slices.Sort(packages)
+
+		if err := stream.ForEach(
+			dirCmd(t, pkg.Dir, "gcassert", packages...),
+			func(s string) {
+				if strings.HasPrefix(s, "See ") && strings.HasSuffix(s, " for full output.") {
+					t.Log(s)
+					return
+				}
 				t.Errorf("\n%s", s)
 			}); err != nil {
 			t.Error(err)
@@ -90,30 +142,13 @@ func TestLint(t *testing.T) {
 	})
 
 	t.Run("TestStaticcheck", func(t *testing.T) {
+		installTool(t, staticcheck)
 		t.Parallel()
-
-		args := []string{"run", staticcheck}
-		args = append(args, pkgs...)
 
 		if err := stream.ForEach(
 			stream.Sequence(
-				dirCmd(t, pkg.Dir, cmdGo, args...),
+				dirCmd(t, pkg.Dir, "staticcheck", pkgs...),
 				stream.GrepNot("go: downloading"),
-			), func(s string) {
-				t.Errorf("\n%s", s)
-			}); err != nil {
-			t.Error(err)
-		}
-	})
-
-	t.Run("TestGoVet", func(t *testing.T) {
-		t.Parallel()
-
-		if err := stream.ForEach(
-			stream.Sequence(
-				dirCmd(t, pkg.Dir, "go", "vet", "-all", "./..."),
-				stream.GrepNot(`^#`), // ignore comment lines
-				ignoreGoMod(),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {
@@ -152,7 +187,7 @@ func TestLint(t *testing.T) {
 			stream.Sequence(
 				dirCmd(t, pkg.Dir, "git", "grep", "-B1", "runtime\\.SetFinalizer("),
 				lintIgnore("lint:ignore SetFinalizer"),
-				stream.GrepNot(`^internal/invariants/finalizer_on.go`),
+				stream.GrepNot(`^internal/invariants/invariants.go`),
 			), func(s string) {
 				t.Errorf("\n%s <- please use the \"invariants.SetFinalizer\" equivalent instead", s)
 			}); err != nil {
@@ -180,8 +215,10 @@ func TestLint(t *testing.T) {
 
 		// Forbidden-import-pkg -> permitted-replacement-pkg
 		forbiddenImports := map[string]string{
-			"errors":     "github.com/cockroachdb/errors",
-			"pkg/errors": "github.com/cockroachdb/errors",
+			"errors":                  "github.com/cockroachdb/errors",
+			"pkg/errors":              "github.com/cockroachdb/errors",
+			"golang.org/x/exp/slices": "slices",
+			"golang.org/x/exp/rand":   "math/rand/v2",
 		}
 
 		// grepBuf creates a grep string that matches any forbidden import pkgs.
@@ -240,13 +277,14 @@ func TestLint(t *testing.T) {
 	})
 
 	t.Run("TestCrlfmt", func(t *testing.T) {
+		installTool(t, crlfmt)
 		t.Parallel()
 
-		args := []string{"run", crlfmt, "-fast", "-tab", "2", "."}
+		args := []string{"-fast", "-tab", "2", "."}
 		var buf bytes.Buffer
 		if err := stream.ForEach(
 			stream.Sequence(
-				dirCmd(t, pkg.Dir, cmdGo, args...),
+				dirCmd(t, pkg.Dir, "crlfmt", args...),
 				stream.GrepNot("go: downloading"),
 			),
 			func(s string) {
@@ -260,7 +298,7 @@ func TestLint(t *testing.T) {
 		}
 
 		if t.Failed() {
-			reWriteCmd := []string{crlfmt, "-w"}
+			reWriteCmd := []string{"crlfmt", "-w"}
 			reWriteCmd = append(reWriteCmd, args...)
 			t.Logf("run the following to fix your formatting:\n"+
 				"\n%s\n\n"+

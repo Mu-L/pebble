@@ -166,7 +166,7 @@ func (w *WorkloadCollector) onTableIngest(info pebble.TableIngestInfo) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, table := range info.Tables {
-		w.enqueueCopyLocked(table.FileNum.DiskFileNum())
+		w.enqueueCopyLocked(base.PhysicalTableDiskFileNum(table.FileNum))
 	}
 	w.copier.Broadcast()
 }
@@ -180,13 +180,13 @@ func (w *WorkloadCollector) onFlushEnd(info pebble.FlushInfo) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, table := range info.Output {
-		w.enqueueCopyLocked(table.FileNum.DiskFileNum())
+		w.enqueueCopyLocked(base.PhysicalTableDiskFileNum(table.FileNum))
 	}
 	w.copier.Broadcast()
 }
 
 // onManifestCreated is attached to a pebble.DB as an
-// EventListener.ManifestCreated func. It records the the new manifest so that
+// EventListener.ManifestCreated func. It records the new manifest so that
 // it's copied asynchronously in the background.
 func (w *WorkloadCollector) onManifestCreated(info pebble.ManifestCreateInfo) {
 	w.curManifest.Store(uint64(info.FileNum))
@@ -198,7 +198,7 @@ func (w *WorkloadCollector) onManifestCreated(info pebble.ManifestCreateInfo) {
 
 	// mark the manifest file as ready for processing to prevent it from being
 	// cleaned before we process it.
-	fileName := base.MakeFilename(base.FileTypeManifest, info.FileNum.DiskFileNum())
+	fileName := base.MakeFilename(base.FileTypeManifest, info.FileNum)
 	w.mu.fileState[fileName] |= readyForProcessing
 	w.mu.manifests = append(w.mu.manifests, &manifestDetails{
 		sourceFilepath: info.Path,
@@ -272,7 +272,7 @@ func (w *WorkloadCollector) copyManifests(startAtIndex int, manifests []*manifes
 			// goroutine that accesses the fields of the `manifestDetails`
 			// struct.
 			var err error
-			manifest.destFile, err = destFS.Create(w.destFilepath(destFS.PathBase(manifest.sourceFilepath)))
+			manifest.destFile, err = destFS.Create(w.destFilepath(destFS.PathBase(manifest.sourceFilepath)), vfs.WriteCategoryUnspecified)
 			if err != nil {
 				panic(err)
 			}
@@ -370,9 +370,8 @@ func (w *WorkloadCollector) Start(destFS vfs.FS, destPath string) {
 	//      still zero. Once the associated database is opened, it'll invoke
 	//      onManifestCreated which will handle enqueuing the manifest on
 	//      `w.mu.manifests`.
-	fileNum := base.FileNum(w.curManifest.Load())
-	if fileNum != 0 {
-		fileName := base.MakeFilename(base.FileTypeManifest, fileNum.DiskFileNum())
+	if fileNum := base.DiskFileNum(w.curManifest.Load()); fileNum != 0 {
+		fileName := base.MakeFilename(base.FileTypeManifest, fileNum)
 		w.mu.manifests = append(w.mu.manifests[:0], &manifestDetails{sourceFilepath: w.srcFilepath(fileName)})
 		w.mu.fileState[fileName] |= readyForProcessing
 	}
@@ -381,6 +380,18 @@ func (w *WorkloadCollector) Start(destFS vfs.FS, destPath string) {
 	w.copier.done = make(chan struct{})
 	w.copier.stop = false
 	go w.copyFiles()
+}
+
+// WaitAndStop waits for all enqueued sstables to be copied over, and then
+// calls Stop. Gracefully ensures that all sstables referenced in the collected
+// manifest's latest version edit will exist in the copy directory.
+func (w *WorkloadCollector) WaitAndStop() {
+	w.mu.Lock()
+	for w.mu.tablesEnqueued != w.mu.tablesCopied {
+		w.mu.copyCond.Wait()
+	}
+	w.mu.Unlock()
+	w.Stop()
 }
 
 // Stop stops collection of the workload.

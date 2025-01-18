@@ -5,15 +5,17 @@
 package vfs
 
 import (
+	"cmp"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/redact"
 )
 
@@ -101,8 +103,68 @@ func (o OpType) String() string {
 	}
 }
 
-// diskHealthCheckingFile is a File wrapper to detect slow disk operations, and
-// call onSlowDisk if a disk operation is seen to exceed diskSlowThreshold.
+// DiskWriteCategory is a user-understandable string used to identify and aggregate
+// stats for disk writes. The prefix "pebble-" is reserved for internal Pebble categories.
+//
+// Some examples include, pebble-wal, pebble-memtable-flush, pebble-manifest and in the
+// Cockroach context includes, sql-row-spill, range-snapshot, crdb-log.
+type DiskWriteCategory string
+
+// WriteCategoryUnspecified denotes a disk write without a significant category.
+const WriteCategoryUnspecified DiskWriteCategory = "unspecified"
+
+// DiskWriteStatsAggregate is an aggregate of the bytes written to disk for a given category.
+type DiskWriteStatsAggregate struct {
+	Category     DiskWriteCategory
+	BytesWritten uint64
+}
+
+// DiskWriteStatsCollector collects and aggregates disk write metrics per category.
+type DiskWriteStatsCollector struct {
+	mu       sync.Mutex
+	statsMap map[DiskWriteCategory]*atomic.Uint64
+}
+
+// NewDiskWriteStatsCollector instantiates a new DiskWriteStatsCollector.
+func NewDiskWriteStatsCollector() *DiskWriteStatsCollector {
+	return &DiskWriteStatsCollector{
+		statsMap: make(map[DiskWriteCategory]*atomic.Uint64),
+	}
+}
+
+// CreateStat inserts a new category to the statsMap if it doesn't already exist, otherwise
+// it returns a pointer to the current stats.
+func (d *DiskWriteStatsCollector) CreateStat(category DiskWriteCategory) *atomic.Uint64 {
+	var bytesWritten *atomic.Uint64
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if aggStats, ok := d.statsMap[category]; !ok {
+		bytesWritten = new(atomic.Uint64)
+		d.statsMap[category] = bytesWritten
+	} else {
+		bytesWritten = aggStats
+	}
+	return bytesWritten
+}
+
+// GetStats returns the aggregated metrics for all categories.
+func (d *DiskWriteStatsCollector) GetStats() []DiskWriteStatsAggregate {
+	var stats []DiskWriteStatsAggregate
+	d.mu.Lock()
+	for category, numBytes := range d.statsMap {
+		stats = append(stats, DiskWriteStatsAggregate{
+			Category:     category,
+			BytesWritten: numBytes.Load(),
+		})
+	}
+	d.mu.Unlock()
+	slices.SortFunc(stats, func(a, b DiskWriteStatsAggregate) int { return cmp.Compare(a.Category, b.Category) })
+	return stats
+}
+
+// diskHealthCheckingFile is a File wrapper to collect disk write stats,
+// detect slow disk operations, and call onSlowDisk if a disk operation
+// is seen to exceed diskSlowThreshold.
 //
 // This struct creates a goroutine (in startTicker()) that, at every tick
 // interval, sees if there's a disk operation taking longer than the specified
@@ -136,16 +198,33 @@ type diskHealthCheckingFile struct {
 	// NB: this packing scheme is not persisted, and is therefore safe to adjust
 	// across process boundaries.
 	lastWritePacked atomic.Uint64
-	createTime      time.Time
+	createTime      crtime.Mono
+
+	// aggBytesWritten points to an atomic that aggregates the bytes written for files
+	// that belong to a specific DiskWriteCategory. This pointer is also stored in the
+	// DiskWriteStatsCollector for metric collection.
+	aggBytesWritten *atomic.Uint64
+	category        DiskWriteCategory
 }
+
+// diskHealthCheckingFile implements File.
+var _ File = (*diskHealthCheckingFile)(nil)
 
 // newDiskHealthCheckingFile instantiates a new diskHealthCheckingFile, with the
 // specified time threshold and event listener.
 func newDiskHealthCheckingFile(
 	file File,
 	diskSlowThreshold time.Duration,
+	category DiskWriteCategory,
+	statsCollector *DiskWriteStatsCollector,
 	onSlowDisk func(OpType OpType, writeSizeInBytes int, duration time.Duration),
 ) *diskHealthCheckingFile {
+	var bytesWritten *atomic.Uint64
+	if statsCollector != nil {
+		bytesWritten = statsCollector.CreateStat(category)
+	} else {
+		bytesWritten = new(atomic.Uint64)
+	}
 	return &diskHealthCheckingFile{
 		file:              file,
 		onSlowDisk:        onSlowDisk,
@@ -153,7 +232,10 @@ func newDiskHealthCheckingFile(
 		tickInterval:      defaultTickInterval,
 
 		stopper:    make(chan struct{}),
-		createTime: time.Now(),
+		createTime: crtime.NowMono(),
+
+		aggBytesWritten: bytesWritten,
+		category:        category,
 	}
 }
 
@@ -179,12 +261,13 @@ func (d *diskHealthCheckingFile) startTicker() {
 					continue
 				}
 				delta, writeSize, op := unpack(packed)
-				lastWrite := d.createTime.Add(delta)
-				now := time.Now()
-				if lastWrite.Add(d.diskSlowThreshold).Before(now) {
+				now := crtime.NowMono()
+				// The last write started at d.createTime + delta and ended now.
+				lastWriteDuration := now.Sub(d.createTime) - delta
+				if lastWriteDuration > d.diskSlowThreshold {
 					// diskSlowThreshold was exceeded. Call the passed-in
 					// listener.
-					d.onSlowDisk(op, writeSize, now.Sub(lastWrite))
+					d.onSlowDisk(op, writeSize, lastWriteDuration)
 				}
 			}
 		}
@@ -215,15 +298,17 @@ func (d *diskHealthCheckingFile) ReadAt(p []byte, off int64) (int, error) {
 func (d *diskHealthCheckingFile) Write(p []byte) (n int, err error) {
 	d.timeDiskOp(OpTypeWrite, int64(len(p)), func() {
 		n, err = d.file.Write(p)
-	})
+	}, crtime.NowMono())
+	d.aggBytesWritten.Add(uint64(n))
 	return n, err
 }
 
-// Write implements the io.WriterAt interface.
+// WriteAt implements the io.WriterAt interface.
 func (d *diskHealthCheckingFile) WriteAt(p []byte, ofs int64) (n int, err error) {
 	d.timeDiskOp(OpTypeWrite, int64(len(p)), func() {
 		n, err = d.file.WriteAt(p, ofs)
-	})
+	}, crtime.NowMono())
+	d.aggBytesWritten.Add(uint64(n))
 	return n, err
 }
 
@@ -242,12 +327,12 @@ func (d *diskHealthCheckingFile) Prefetch(offset, length int64) error {
 func (d *diskHealthCheckingFile) Preallocate(off, n int64) (err error) {
 	d.timeDiskOp(OpTypePreallocate, n, func() {
 		err = d.file.Preallocate(off, n)
-	})
+	}, crtime.NowMono())
 	return err
 }
 
 // Stat implements (vfs.File).Stat.
-func (d *diskHealthCheckingFile) Stat() (os.FileInfo, error) {
+func (d *diskHealthCheckingFile) Stat() (FileInfo, error) {
 	return d.file.Stat()
 }
 
@@ -255,7 +340,7 @@ func (d *diskHealthCheckingFile) Stat() (os.FileInfo, error) {
 func (d *diskHealthCheckingFile) Sync() (err error) {
 	d.timeDiskOp(OpTypeSync, 0, func() {
 		err = d.file.Sync()
-	})
+	}, crtime.NowMono())
 	return err
 }
 
@@ -263,7 +348,7 @@ func (d *diskHealthCheckingFile) Sync() (err error) {
 func (d *diskHealthCheckingFile) SyncData() (err error) {
 	d.timeDiskOp(OpTypeSyncData, 0, func() {
 		err = d.file.SyncData()
-	})
+	}, crtime.NowMono())
 	return err
 }
 
@@ -271,7 +356,7 @@ func (d *diskHealthCheckingFile) SyncData() (err error) {
 func (d *diskHealthCheckingFile) SyncTo(length int64) (fullSync bool, err error) {
 	d.timeDiskOp(OpTypeSyncTo, length, func() {
 		fullSync, err = d.file.SyncTo(length)
-	})
+	}, crtime.NowMono())
 	return fullSync, err
 }
 
@@ -279,28 +364,26 @@ func (d *diskHealthCheckingFile) SyncTo(length int64) (fullSync bool, err error)
 // monitoring goroutine, in case it exceeds one of the slow disk durations.
 // opType should always be set. writeSizeInBytes should be set if the write
 // operation is sized. If not, it should be set to zero.
-func (d *diskHealthCheckingFile) timeDiskOp(opType OpType, writeSizeInBytes int64, op func()) {
-	if d == nil {
+//
+// The start time is taken as a parameter in the form of nanoseconds since the
+// unix epoch so that it appears in stack traces during crashes (if GOTRACEBACK
+// is set appropriately), aiding postmortem debugging.
+func (d *diskHealthCheckingFile) timeDiskOp(
+	opType OpType, writeSizeInBytes int64, op func(), start crtime.Mono,
+) {
+	if d == nil || d.diskSlowThreshold == 0 {
 		op()
 		return
 	}
 
-	delta := time.Since(d.createTime)
+	delta := start.Sub(d.createTime)
 	packed := pack(delta, writeSizeInBytes, opType)
-	if invariants.Enabled {
-		if !d.lastWritePacked.CompareAndSwap(0, packed) {
-			panic("concurrent write operations detected on file")
-		}
-	} else {
-		d.lastWritePacked.Store(packed)
+	if d.lastWritePacked.Swap(packed) != 0 {
+		panic("concurrent write operations detected on file")
 	}
 	defer func() {
-		if invariants.Enabled {
-			if !d.lastWritePacked.CompareAndSwap(packed, 0) {
-				panic("concurrent write operations detected on file")
-			}
-		} else {
-			d.lastWritePacked.Store(0)
+		if d.lastWritePacked.Swap(0) != packed {
+			panic("concurrent write operations detected on file")
 		}
 	}()
 	op()
@@ -361,7 +444,7 @@ type diskHealthCheckingDir struct {
 func (d *diskHealthCheckingDir) Sync() (err error) {
 	d.fs.timeFilesystemOp(d.name, OpTypeSync, func() {
 		err = d.File.Sync()
-	})
+	}, crtime.NowMono())
 	return err
 }
 
@@ -435,6 +518,7 @@ func (i DiskSlowInfo) SafeFormat(w redact.SafePrinter, _ rune) {
 type diskHealthCheckingFS struct {
 	tickInterval      time.Duration
 	diskSlowThreshold time.Duration
+	statsCollector    *DiskWriteStatsCollector
 	onSlowDisk        func(DiskSlowInfo)
 	fs                FS
 	mu                struct {
@@ -457,22 +541,25 @@ type diskHealthCheckingFS struct {
 }
 
 type slot struct {
-	name       string
-	opType     OpType
-	startNanos atomic.Int64
+	name      string
+	opType    OpType
+	startTime crtime.AtomicMono
 }
 
 // diskHealthCheckingFS implements FS.
 var _ FS = (*diskHealthCheckingFS)(nil)
 
 // WithDiskHealthChecks wraps an FS and ensures that all write-oriented
-// operations on the FS are wrapped with disk health detection checks. Disk
-// operations that are observed to take longer than diskSlowThreshold trigger an
-// onSlowDisk call.
+// operations on the FS are wrapped with disk health detection checks and
+// aggregated. Disk operations that are observed to take longer than
+// diskSlowThreshold trigger an onSlowDisk call.
 //
 // A threshold of zero disables disk-health checking.
 func WithDiskHealthChecks(
-	innerFS FS, diskSlowThreshold time.Duration, onSlowDisk func(info DiskSlowInfo),
+	innerFS FS,
+	diskSlowThreshold time.Duration,
+	statsCollector *DiskWriteStatsCollector,
+	onSlowDisk func(info DiskSlowInfo),
 ) (FS, io.Closer) {
 	if diskSlowThreshold == 0 {
 		return innerFS, noopCloser{}
@@ -482,6 +569,7 @@ func WithDiskHealthChecks(
 		fs:                innerFS,
 		tickInterval:      defaultTickInterval,
 		diskSlowThreshold: diskSlowThreshold,
+		statsCollector:    statsCollector,
 		onSlowDisk:        onSlowDisk,
 	}
 	fs.mu.stopper = make(chan struct{})
@@ -495,7 +583,22 @@ func WithDiskHealthChecks(
 	return fs, fs
 }
 
-func (d *diskHealthCheckingFS) timeFilesystemOp(name string, opType OpType, op func()) {
+// Unwrap is part of the FS interface.
+func (d *diskHealthCheckingFS) Unwrap() FS {
+	return d.fs
+}
+
+// timeFilesystemOp executes the provided closure, which should perform a
+// singular filesystem operation of a type matching opType on the named file. It
+// records the provided start time such that the long-lived disk-health checking
+// goroutine can observe if the operation is blocked for an inordinate time.
+//
+// The start time is taken as a parameter in the form of nanoseconds since the
+// unix epoch so that it appears in stack traces during crashes (if GOTRACEBACK
+// is set appropriately), aiding postmortem debugging.
+func (d *diskHealthCheckingFS) timeFilesystemOp(
+	name string, opType OpType, op func(), start crtime.Mono,
+) {
 	if d == nil {
 		op()
 		return
@@ -524,14 +627,13 @@ func (d *diskHealthCheckingFS) timeFilesystemOp(name string, opType OpType, op f
 			d.startTickerLocked()
 		}
 
-		startNanos := time.Now().UnixNano()
 		for i := 0; i < len(d.mu.inflight); i++ {
-			if d.mu.inflight[i].startNanos.Load() == 0 {
+			if d.mu.inflight[i].startTime.Load() == 0 {
 				// This slot is not in use. Claim it.
 				s = d.mu.inflight[i]
 				s.name = name
 				s.opType = opType
-				s.startNanos.Store(startNanos)
+				s.startTime.Store(start)
 				break
 			}
 		}
@@ -545,7 +647,7 @@ func (d *diskHealthCheckingFS) timeFilesystemOp(name string, opType OpType, op f
 				name:   name,
 				opType: opType,
 			}
-			s.startNanos.Store(startNanos)
+			s.startTime.Store(start)
 			d.mu.inflight = append(d.mu.inflight, s)
 		}
 	}()
@@ -553,7 +655,7 @@ func (d *diskHealthCheckingFS) timeFilesystemOp(name string, opType OpType, op f
 	op()
 
 	// Signal completion by zeroing the start time.
-	s.startNanos.Store(0)
+	s.startTime.Store(0)
 }
 
 // startTickerLocked starts a new goroutine with a ticker to monitor disk
@@ -565,9 +667,9 @@ func (d *diskHealthCheckingFS) startTickerLocked() {
 		ticker := time.NewTicker(d.tickInterval)
 		defer ticker.Stop()
 		type exceededSlot struct {
-			name       string
-			opType     OpType
-			startNanos int64
+			name      string
+			opType    OpType
+			startTime crtime.Mono
 		}
 		var exceededSlots []exceededSlot
 
@@ -578,16 +680,16 @@ func (d *diskHealthCheckingFS) startTickerLocked() {
 				// time older than the diskSlowThreshold.
 				exceededSlots = exceededSlots[:0]
 				d.mu.Lock()
-				now := time.Now()
+				now := crtime.NowMono()
 				for i := range d.mu.inflight {
-					nanos := d.mu.inflight[i].startNanos.Load()
-					if nanos != 0 && time.Unix(0, nanos).Add(d.diskSlowThreshold).Before(now) {
+					startTime := d.mu.inflight[i].startTime.Load()
+					if startTime != 0 && now.Sub(startTime) > d.diskSlowThreshold {
 						// diskSlowThreshold was exceeded. Copy this inflightOp into
 						// exceededSlots and call d.onSlowDisk after dropping the mutex.
 						inflightOp := exceededSlot{
-							name:       d.mu.inflight[i].name,
-							opType:     d.mu.inflight[i].opType,
-							startNanos: nanos,
+							name:      d.mu.inflight[i].name,
+							opType:    d.mu.inflight[i].opType,
+							startTime: startTime,
 						}
 						exceededSlots = append(exceededSlots, inflightOp)
 					}
@@ -599,7 +701,7 @@ func (d *diskHealthCheckingFS) startTickerLocked() {
 							Path:      exceededSlots[i].name,
 							OpType:    exceededSlots[i].opType,
 							WriteSize: 0, // writes at the fs level are not sized
-							Duration:  now.Sub(time.Unix(0, exceededSlots[i].startNanos)),
+							Duration:  now.Sub(exceededSlots[i].startTime),
 						})
 				}
 			case <-stopper:
@@ -639,27 +741,28 @@ func (d *diskHealthCheckingFS) Close() error {
 }
 
 // Create implements the FS interface.
-func (d *diskHealthCheckingFS) Create(name string) (File, error) {
+func (d *diskHealthCheckingFS) Create(name string, category DiskWriteCategory) (File, error) {
 	var f File
 	var err error
 	d.timeFilesystemOp(name, OpTypeCreate, func() {
-		f, err = d.fs.Create(name)
-	})
+		f, err = d.fs.Create(name, category)
+	}, crtime.NowMono())
 	if err != nil {
 		return f, err
 	}
 	if d.diskSlowThreshold == 0 {
 		return f, nil
 	}
-	checkingFile := newDiskHealthCheckingFile(f, d.diskSlowThreshold, func(opType OpType, writeSizeInBytes int, duration time.Duration) {
-		d.onSlowDisk(
-			DiskSlowInfo{
-				Path:      name,
-				OpType:    opType,
-				WriteSize: writeSizeInBytes,
-				Duration:  duration,
-			})
-	})
+	checkingFile := newDiskHealthCheckingFile(f, d.diskSlowThreshold, category, d.statsCollector,
+		func(opType OpType, writeSizeInBytes int, duration time.Duration) {
+			d.onSlowDisk(
+				DiskSlowInfo{
+					Path:      name,
+					OpType:    opType,
+					WriteSize: writeSizeInBytes,
+					Duration:  duration,
+				})
+		})
 	checkingFile.startTicker()
 	return checkingFile, nil
 }
@@ -674,7 +777,7 @@ func (d *diskHealthCheckingFS) Link(oldname, newname string) error {
 	var err error
 	d.timeFilesystemOp(newname, OpTypeLink, func() {
 		err = d.fs.Link(oldname, newname)
-	})
+	}, crtime.NowMono())
 	return err
 }
 
@@ -693,7 +796,7 @@ func (d *diskHealthCheckingFS) MkdirAll(dir string, perm os.FileMode) error {
 	var err error
 	d.timeFilesystemOp(dir, OpTypeMkdirAll, func() {
 		err = d.fs.MkdirAll(dir, perm)
-	})
+	}, crtime.NowMono())
 	return err
 }
 
@@ -703,8 +806,14 @@ func (d *diskHealthCheckingFS) Open(name string, opts ...OpenOption) (File, erro
 }
 
 // OpenReadWrite implements the FS interface.
-func (d *diskHealthCheckingFS) OpenReadWrite(name string, opts ...OpenOption) (File, error) {
-	return d.fs.OpenReadWrite(name, opts...)
+func (d *diskHealthCheckingFS) OpenReadWrite(
+	name string, category DiskWriteCategory, opts ...OpenOption,
+) (File, error) {
+	f, err := d.fs.OpenReadWrite(name, category, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return newDiskHealthCheckingFile(f, 0, category, d.statsCollector, func(opType OpType, writeSizeInBytes int, duration time.Duration) {}), nil
 }
 
 // OpenDir implements the FS interface.
@@ -742,7 +851,7 @@ func (d *diskHealthCheckingFS) Remove(name string) error {
 	var err error
 	d.timeFilesystemOp(name, OpTypeRemove, func() {
 		err = d.fs.Remove(name)
-	})
+	}, crtime.NowMono())
 	return err
 }
 
@@ -751,7 +860,7 @@ func (d *diskHealthCheckingFS) RemoveAll(name string) error {
 	var err error
 	d.timeFilesystemOp(name, OpTypeRemoveAll, func() {
 		err = d.fs.RemoveAll(name)
-	})
+	}, crtime.NowMono())
 	return err
 }
 
@@ -760,38 +869,41 @@ func (d *diskHealthCheckingFS) Rename(oldname, newname string) error {
 	var err error
 	d.timeFilesystemOp(newname, OpTypeRename, func() {
 		err = d.fs.Rename(oldname, newname)
-	})
+	}, crtime.NowMono())
 	return err
 }
 
 // ReuseForWrite implements the FS interface.
-func (d *diskHealthCheckingFS) ReuseForWrite(oldname, newname string) (File, error) {
+func (d *diskHealthCheckingFS) ReuseForWrite(
+	oldname, newname string, category DiskWriteCategory,
+) (File, error) {
 	var f File
 	var err error
 	d.timeFilesystemOp(newname, OpTypeReuseForWrite, func() {
-		f, err = d.fs.ReuseForWrite(oldname, newname)
-	})
+		f, err = d.fs.ReuseForWrite(oldname, newname, category)
+	}, crtime.NowMono())
 	if err != nil {
 		return f, err
 	}
 	if d.diskSlowThreshold == 0 {
 		return f, nil
 	}
-	checkingFile := newDiskHealthCheckingFile(f, d.diskSlowThreshold, func(opType OpType, writeSizeInBytes int, duration time.Duration) {
-		d.onSlowDisk(
-			DiskSlowInfo{
-				Path:      newname,
-				OpType:    opType,
-				WriteSize: writeSizeInBytes,
-				Duration:  duration,
-			})
-	})
+	checkingFile := newDiskHealthCheckingFile(f, d.diskSlowThreshold, category, d.statsCollector,
+		func(opType OpType, writeSizeInBytes int, duration time.Duration) {
+			d.onSlowDisk(
+				DiskSlowInfo{
+					Path:      newname,
+					OpType:    opType,
+					WriteSize: writeSizeInBytes,
+					Duration:  duration,
+				})
+		})
 	checkingFile.startTicker()
 	return checkingFile, nil
 }
 
 // Stat implements the FS interface.
-func (d *diskHealthCheckingFS) Stat(name string) (os.FileInfo, error) {
+func (d *diskHealthCheckingFS) Stat(name string) (FileInfo, error) {
 	return d.fs.Stat(name)
 }
 

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"runtime"
 	"sync"
 
 	"github.com/cockroachdb/pebble/internal/invariants"
@@ -19,6 +18,7 @@ import (
 // Logger defines an interface for writing log messages.
 type Logger interface {
 	Infof(format string, args ...interface{})
+	Errorf(format string, args ...interface{})
 	Fatalf(format string, args ...interface{})
 }
 type defaultLogger struct{}
@@ -30,6 +30,11 @@ var _ Logger = DefaultLogger
 
 // Infof implements the Logger.Infof interface.
 func (defaultLogger) Infof(format string, args ...interface{}) {
+	_ = log.Output(2, fmt.Sprintf(format, args...))
+}
+
+// Errorf implements the Logger.Errorf interface.
+func (defaultLogger) Errorf(format string, args ...interface{}) {
 	_ = log.Output(2, fmt.Sprintf(format, args...))
 }
 
@@ -75,21 +80,27 @@ func (b *InMemLogger) Infof(format string, args ...interface{}) {
 	}
 }
 
+// Errorf is part of the Logger interface.
+func (b *InMemLogger) Errorf(format string, args ...interface{}) {
+	b.Infof(format, args...)
+}
+
 // Fatalf is part of the Logger interface.
 func (b *InMemLogger) Fatalf(format string, args ...interface{}) {
-	b.Infof(format, args...)
-	runtime.Goexit()
+	b.Infof("FATAL: "+format, args...)
 }
 
 // LoggerAndTracer defines an interface for logging and tracing.
 type LoggerAndTracer interface {
 	Logger
 	// Eventf formats and emits a tracing log, if tracing is enabled in the
-	// current context.
+	// current context. It can also emit to a regular log, if expensive
+	// logging is enabled.
 	Eventf(ctx context.Context, format string, args ...interface{})
-	// IsTracingEnabled returns true if tracing is enabled. It can be used as an
-	// optimization to avoid calling Eventf (which will be a noop when tracing
-	// is not enabled) to avoid the overhead of boxing the args.
+	// IsTracingEnabled returns true if tracing is enabled for this context,
+	// or expensive logging is enabled. It can be used as an optimization to
+	// avoid calling Eventf (which will be a noop when tracing or expensive
+	// logging is not enabled) to avoid the overhead of boxing the args.
 	IsTracingEnabled(ctx context.Context) bool
 }
 
@@ -124,6 +135,9 @@ var _ LoggerAndTracer = NoopLoggerAndTracer{}
 
 // Infof implements LoggerAndTracer.
 func (l NoopLoggerAndTracer) Infof(format string, args ...interface{}) {}
+
+// Errorf implements LoggerAndTracer.
+func (l NoopLoggerAndTracer) Errorf(format string, args ...interface{}) {}
 
 // Fatalf implements LoggerAndTracer.
 func (l NoopLoggerAndTracer) Fatalf(format string, args ...interface{}) {}

@@ -7,13 +7,16 @@ package pebble
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,14 +24,15 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/bytealloc"
-	"github.com/cockroachdb/pebble/internal/keyspan"
+	"github.com/cockroachdb/pebble/internal/cache"
+	"github.com/cockroachdb/pebble/internal/invalidating"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
+	"golang.org/x/sync/errgroup"
 )
 
 var testKeyValuePairs = []string{
@@ -44,303 +48,6 @@ var testKeyValuePairs = []string{
 	"19:19",
 }
 
-type fakeIter struct {
-	lower    []byte
-	upper    []byte
-	keys     []InternalKey
-	vals     [][]byte
-	index    int
-	valid    bool
-	closeErr error
-}
-
-// fakeIter implements the base.InternalIterator interface.
-var _ base.InternalIterator = (*fakeIter)(nil)
-
-func fakeIkey(s string) InternalKey {
-	j := strings.Index(s, ":")
-	seqNum, err := strconv.Atoi(s[j+1:])
-	if err != nil {
-		panic(err)
-	}
-	return base.MakeInternalKey([]byte(s[:j]), uint64(seqNum), InternalKeyKindSet)
-}
-
-func newFakeIterator(closeErr error, keys ...string) *fakeIter {
-	ikeys := make([]InternalKey, len(keys))
-	for i, k := range keys {
-		ikeys[i] = fakeIkey(k)
-	}
-	return &fakeIter{
-		keys:     ikeys,
-		index:    0,
-		valid:    len(ikeys) > 0,
-		closeErr: closeErr,
-	}
-}
-
-func (f *fakeIter) String() string {
-	return "fake"
-}
-
-func (f *fakeIter) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, base.LazyValue) {
-	f.valid = false
-	for f.index = 0; f.index < len(f.keys); f.index++ {
-		if DefaultComparer.Compare(key, f.key().UserKey) <= 0 {
-			if f.upper != nil && DefaultComparer.Compare(f.upper, f.key().UserKey) <= 0 {
-				return nil, base.LazyValue{}
-			}
-			f.valid = true
-			return f.Key(), f.Value()
-		}
-	}
-	return nil, base.LazyValue{}
-}
-
-func (f *fakeIter) SeekPrefixGE(
-	prefix, key []byte, flags base.SeekGEFlags,
-) (*base.InternalKey, base.LazyValue) {
-	return f.SeekGE(key, flags)
-}
-
-func (f *fakeIter) SeekLT(key []byte, flags base.SeekLTFlags) (*InternalKey, base.LazyValue) {
-	f.valid = false
-	for f.index = len(f.keys) - 1; f.index >= 0; f.index-- {
-		if DefaultComparer.Compare(key, f.key().UserKey) > 0 {
-			if f.lower != nil && DefaultComparer.Compare(f.lower, f.key().UserKey) > 0 {
-				return nil, base.LazyValue{}
-			}
-			f.valid = true
-			return f.Key(), f.Value()
-		}
-	}
-	return nil, base.LazyValue{}
-}
-
-func (f *fakeIter) First() (*InternalKey, base.LazyValue) {
-	f.valid = false
-	f.index = -1
-	if key, _ := f.Next(); key == nil {
-		return nil, base.LazyValue{}
-	}
-	if f.upper != nil && DefaultComparer.Compare(f.upper, f.key().UserKey) <= 0 {
-		return nil, base.LazyValue{}
-	}
-	f.valid = true
-	return f.Key(), f.Value()
-}
-
-func (f *fakeIter) Last() (*InternalKey, base.LazyValue) {
-	f.valid = false
-	f.index = len(f.keys)
-	if key, _ := f.Prev(); key == nil {
-		return nil, base.LazyValue{}
-	}
-	if f.lower != nil && DefaultComparer.Compare(f.lower, f.key().UserKey) > 0 {
-		return nil, base.LazyValue{}
-	}
-	f.valid = true
-	return f.Key(), f.Value()
-}
-
-func (f *fakeIter) Next() (*InternalKey, base.LazyValue) {
-	f.valid = false
-	if f.index == len(f.keys) {
-		return nil, base.LazyValue{}
-	}
-	f.index++
-	if f.index == len(f.keys) {
-		return nil, base.LazyValue{}
-	}
-	if f.upper != nil && DefaultComparer.Compare(f.upper, f.key().UserKey) <= 0 {
-		return nil, base.LazyValue{}
-	}
-	f.valid = true
-	return f.Key(), f.Value()
-}
-
-func (f *fakeIter) Prev() (*InternalKey, base.LazyValue) {
-	f.valid = false
-	if f.index < 0 {
-		return nil, base.LazyValue{}
-	}
-	f.index--
-	if f.index < 0 {
-		return nil, base.LazyValue{}
-	}
-	if f.lower != nil && DefaultComparer.Compare(f.lower, f.key().UserKey) > 0 {
-		return nil, base.LazyValue{}
-	}
-	f.valid = true
-	return f.Key(), f.Value()
-}
-
-func (f *fakeIter) NextPrefix(succKey []byte) (*InternalKey, base.LazyValue) {
-	return f.SeekGE(succKey, base.SeekGEFlagsNone)
-}
-
-// key returns the current Key the iterator is positioned at regardless of the
-// value of f.valid.
-func (f *fakeIter) key() *InternalKey {
-	return &f.keys[f.index]
-}
-
-func (f *fakeIter) Key() *InternalKey {
-	if f.valid {
-		return &f.keys[f.index]
-	}
-	// It is invalid to call Key() when Valid() returns false. Rather than
-	// returning nil here which would technically be more correct, return a
-	// non-nil key which is the behavior of some InternalIterator
-	// implementations. This provides better testing of users of
-	// InternalIterators.
-	if f.index < 0 {
-		return &f.keys[0]
-	}
-	return &f.keys[len(f.keys)-1]
-}
-
-func (f *fakeIter) Value() base.LazyValue {
-	if f.index >= 0 && f.index < len(f.vals) {
-		return base.MakeInPlaceValue(f.vals[f.index])
-	}
-	return base.LazyValue{}
-}
-
-func (f *fakeIter) Valid() bool {
-	return f.index >= 0 && f.index < len(f.keys) && f.valid
-}
-
-func (f *fakeIter) Error() error {
-	return f.closeErr
-}
-
-func (f *fakeIter) Close() error {
-	return f.closeErr
-}
-
-func (f *fakeIter) SetBounds(lower, upper []byte) {
-	f.lower = lower
-	f.upper = upper
-}
-
-// invalidatingIter tests unsafe key/value slice reuse by modifying the last
-// returned key/value to all 1s.
-type invalidatingIter struct {
-	iter        internalIterator
-	lastKey     *InternalKey
-	lastValue   []byte
-	ignoreKinds [base.InternalKeyKindMax + 1]bool
-	err         error
-}
-
-func newInvalidatingIter(iter internalIterator) *invalidatingIter {
-	return &invalidatingIter{iter: iter}
-}
-
-func (i *invalidatingIter) ignoreKind(kind base.InternalKeyKind) {
-	i.ignoreKinds[kind] = true
-}
-
-func (i *invalidatingIter) update(
-	key *InternalKey, value base.LazyValue,
-) (*InternalKey, base.LazyValue) {
-	i.zeroLast()
-
-	v, _, err := value.Value(nil)
-	if err != nil {
-		i.err = err
-		key = nil
-	}
-	if key == nil {
-		i.lastKey = nil
-		i.lastValue = nil
-		return nil, LazyValue{}
-	}
-
-	i.lastKey = &InternalKey{}
-	*i.lastKey = key.Clone()
-	i.lastValue = make([]byte, len(v))
-	copy(i.lastValue, v)
-	return i.lastKey, base.MakeInPlaceValue(i.lastValue)
-}
-
-func (i *invalidatingIter) zeroLast() {
-	if i.lastKey == nil {
-		return
-	}
-	if i.ignoreKinds[i.lastKey.Kind()] {
-		return
-	}
-
-	if i.lastKey != nil {
-		for j := range i.lastKey.UserKey {
-			i.lastKey.UserKey[j] = 0xff
-		}
-		i.lastKey.Trailer = 0
-	}
-	for j := range i.lastValue {
-		i.lastValue[j] = 0xff
-	}
-}
-
-func (i *invalidatingIter) SeekGE(
-	key []byte, flags base.SeekGEFlags,
-) (*InternalKey, base.LazyValue) {
-	return i.update(i.iter.SeekGE(key, flags))
-}
-
-func (i *invalidatingIter) SeekPrefixGE(
-	prefix, key []byte, flags base.SeekGEFlags,
-) (*base.InternalKey, base.LazyValue) {
-	return i.update(i.iter.SeekPrefixGE(prefix, key, flags))
-}
-
-func (i *invalidatingIter) SeekLT(
-	key []byte, flags base.SeekLTFlags,
-) (*InternalKey, base.LazyValue) {
-	return i.update(i.iter.SeekLT(key, flags))
-}
-
-func (i *invalidatingIter) First() (*InternalKey, base.LazyValue) {
-	return i.update(i.iter.First())
-}
-
-func (i *invalidatingIter) Last() (*InternalKey, base.LazyValue) {
-	return i.update(i.iter.Last())
-}
-
-func (i *invalidatingIter) Next() (*InternalKey, base.LazyValue) {
-	return i.update(i.iter.Next())
-}
-
-func (i *invalidatingIter) Prev() (*InternalKey, base.LazyValue) {
-	return i.update(i.iter.Prev())
-}
-
-func (i *invalidatingIter) NextPrefix(succKey []byte) (*InternalKey, base.LazyValue) {
-	return i.update(i.iter.NextPrefix(succKey))
-}
-
-func (i *invalidatingIter) Error() error {
-	if err := i.iter.Error(); err != nil {
-		return err
-	}
-	return i.err
-}
-
-func (i *invalidatingIter) Close() error {
-	return i.iter.Close()
-}
-
-func (i *invalidatingIter) SetBounds(lower, upper []byte) {
-	i.iter.SetBounds(lower, upper)
-}
-
-func (i *invalidatingIter) String() string {
-	return i.iter.String()
-}
-
 // testIterator tests creating a combined iterator from a number of sub-
 // iterators. newFunc is a constructor function. splitFunc returns a random
 // split of the testKeyValuePairs slice such that walking a combined iterator
@@ -350,6 +57,11 @@ func testIterator(
 	newFunc func(...internalIterator) internalIterator,
 	splitFunc func(r *rand.Rand) [][]string,
 ) {
+	fakeIterWithCloseErr := func(kvs []base.InternalKV, errorMsg string) *base.FakeIter {
+		f := base.NewFakeIter(kvs)
+		f.SetCloseErr(errors.New(errorMsg))
+		return f
+	}
 	// Test pre-determined sub-iterators. The sub-iterators are designed
 	// so that the combined key/value pair order is the same whether the
 	// combined iterator is concatenating or merging.
@@ -361,42 +73,42 @@ func testIterator(
 		{
 			"one sub-iterator",
 			[]internalIterator{
-				newFakeIterator(nil, "e:1", "w:2"),
+				base.NewFakeIter(base.FakeKVs("e:1", "w:2")),
 			},
 			"<e:1><w:2>.",
 		},
 		{
 			"two sub-iterators",
 			[]internalIterator{
-				newFakeIterator(nil, "a0:0"),
-				newFakeIterator(nil, "b1:1", "b2:2"),
+				base.NewFakeIter(base.FakeKVs("a0:0")),
+				base.NewFakeIter(base.FakeKVs("b1:1", "b2:2")),
 			},
 			"<a0:0><b1:1><b2:2>.",
 		},
 		{
 			"empty sub-iterators",
 			[]internalIterator{
-				newFakeIterator(nil),
-				newFakeIterator(nil),
-				newFakeIterator(nil),
+				base.NewFakeIter(nil),
+				base.NewFakeIter(nil),
+				base.NewFakeIter(nil),
 			},
 			".",
 		},
 		{
 			"sub-iterator errors",
 			[]internalIterator{
-				newFakeIterator(nil, "a0:0", "a1:1"),
-				newFakeIterator(errors.New("the sky is falling"), "b2:2", "b3:3", "b4:4"),
-				newFakeIterator(errors.New("run for your lives"), "c5:5", "c6:6"),
+				base.NewFakeIter(base.FakeKVs("a0:0", "a1:1")),
+				fakeIterWithCloseErr(base.FakeKVs("b2:2", "b3:3", "b4:4"), "the sky is falling"),
+				fakeIterWithCloseErr(base.FakeKVs("c5:5", "c6:6"), "run for your lives"),
 			},
 			"<a0:0><a1:1><b2:2><b3:3><b4:4>err=the sky is falling",
 		},
 	}
 	for _, tc := range testCases {
 		var b bytes.Buffer
-		iter := newInvalidatingIter(newFunc(tc.iters...))
-		for key, _ := iter.First(); key != nil; key, _ = iter.Next() {
-			fmt.Fprintf(&b, "<%s:%d>", key.UserKey, key.SeqNum())
+		iter := invalidating.NewIter(newFunc(tc.iters...))
+		for kv := iter.First(); kv != nil; kv = iter.Next() {
+			fmt.Fprintf(&b, "<%s:%d>", kv.K.UserKey, kv.SeqNum())
 		}
 		if err := iter.Close(); err != nil {
 			fmt.Fprintf(&b, "err=%v", err)
@@ -409,29 +121,28 @@ func testIterator(
 	}
 
 	// Test randomly generated sub-iterators.
-	r := rand.New(rand.NewSource(0))
+	r := rand.New(rand.NewPCG(0, 0))
 	for i, nBad := 0, 0; i < 1000; i++ {
 		bad := false
 
 		splits := splitFunc(r)
 		iters := make([]internalIterator, len(splits))
 		for i, split := range splits {
-			iters[i] = newFakeIterator(nil, split...)
+			iters[i] = base.NewFakeIter(base.FakeKVs(split...))
 		}
-		iter := newInternalIterAdapter(newInvalidatingIter(newFunc(iters...)))
-		iter.First()
-
+		iter := invalidating.NewIter(newFunc(iters...))
+		kv := iter.First()
 		j := 0
-		for ; iter.Valid() && j < len(testKeyValuePairs); j++ {
-			got := fmt.Sprintf("%s:%d", iter.Key().UserKey, iter.Key().SeqNum())
+		for ; kv != nil && j < len(testKeyValuePairs); j++ {
+			got := fmt.Sprintf("%s:%d", kv.K.UserKey, kv.SeqNum())
 			want := testKeyValuePairs[j]
 			if got != want {
 				bad = true
 				t.Errorf("random splits: i=%d, j=%d: got %q, want %q", i, j, got, want)
 			}
-			iter.Next()
+			kv = iter.Next()
 		}
-		if iter.Valid() {
+		if kv != nil {
 			bad = true
 			t.Errorf("random splits: i=%d, j=%d: iter was not exhausted", i, j)
 		}
@@ -454,53 +165,11 @@ func testIterator(
 	}
 }
 
-// deletableSumValueMerger computes the sum of its arguments,
-// but transforms a zero sum into a non-existent entry.
-type deletableSumValueMerger struct {
-	sum int64
-}
-
-func newDeletableSumValueMerger(key, value []byte) (ValueMerger, error) {
-	m := &deletableSumValueMerger{}
-	return m, m.MergeNewer(value)
-}
-
-func (m *deletableSumValueMerger) parseAndCalculate(value []byte) error {
-	v, err := strconv.ParseInt(string(value), 10, 64)
-	if err == nil {
-		m.sum += v
-	}
-	return err
-}
-
-func (m *deletableSumValueMerger) MergeNewer(value []byte) error {
-	return m.parseAndCalculate(value)
-}
-
-func (m *deletableSumValueMerger) MergeOlder(value []byte) error {
-	return m.parseAndCalculate(value)
-}
-
-func (m *deletableSumValueMerger) Finish(includesBase bool) ([]byte, io.Closer, error) {
-	if m.sum == 0 {
-		return nil, nil, nil
-	}
-	return []byte(strconv.FormatInt(m.sum, 10)), nil, nil
-}
-
-func (m *deletableSumValueMerger) DeletableFinish(
-	includesBase bool,
-) ([]byte, bool, io.Closer, error) {
-	value, closer, err := m.Finish(includesBase)
-	return value, len(value) == 0, closer, err
-}
-
 func TestIterator(t *testing.T) {
 	var merge Merge
-	var keys []InternalKey
-	var vals [][]byte
+	var kvs []base.InternalKV
 
-	newIter := func(seqNum uint64, opts IterOptions) *Iterator {
+	newIter := func(seqNum base.SeqNum, opts IterOptions) *Iterator {
 		if merge == nil {
 			merge = DefaultMerger.Merge
 		}
@@ -516,16 +185,13 @@ func TestIterator(t *testing.T) {
 			merge:    wrappedMerge,
 		}
 		// NB: Use a mergingIter to filter entries newer than seqNum.
-		iter := newMergingIter(nil /* logger */, &it.stats.InternalStats, it.cmp, it.split, &fakeIter{
-			lower: opts.GetLowerBound(),
-			upper: opts.GetUpperBound(),
-			keys:  keys,
-			vals:  vals,
-		})
+		fakeIter := base.NewFakeIter(kvs)
+		fakeIter.SetBounds(opts.GetLowerBound(), opts.GetUpperBound())
+		iter := newMergingIter(nil /* logger */, &it.stats.InternalStats, it.cmp, it.comparer.Split, fakeIter)
 		iter.snapshot = seqNum
 		// NB: This Iterator cannot be cloned since it is not constructed
 		// with a readState. It suffices for this test.
-		it.iter = newInvalidatingIter(iter)
+		it.iter = invalidating.NewIter(iter)
 		return it
 	}
 
@@ -534,14 +200,12 @@ func TestIterator(t *testing.T) {
 		case "define":
 			merge = nil
 			if arg, ok := d.Arg("merger"); ok && len(arg.Vals[0]) > 0 && arg.Vals[0] == "deletable" {
-				merge = newDeletableSumValueMerger
+				merge = base.NewDeletableSumValueMerger
 			}
-			keys = keys[:0]
-			vals = vals[:0]
+			kvs = kvs[:0]
 			for _, key := range strings.Split(d.Input, "\n") {
 				j := strings.Index(key, ":")
-				keys = append(keys, base.ParseInternalKey(key[:j]))
-				vals = append(vals, []byte(key[j+1:]))
+				kvs = append(kvs, base.MakeInternalKV(base.ParseInternalKey(key[:j]), []byte(key[j+1:])))
 			}
 			return ""
 
@@ -557,7 +221,7 @@ func TestIterator(t *testing.T) {
 				opts.UpperBound = []byte(upper)
 			}
 
-			iter := newIter(seqNum, opts)
+			iter := newIter(base.SeqNum(seqNum), opts)
 			iterOutput := runIterCmd(d, iter, true)
 			stats := iter.Stats()
 			return fmt.Sprintf("%sstats: %s\n", iterOutput, stats.String())
@@ -569,23 +233,81 @@ func TestIterator(t *testing.T) {
 }
 
 type minSeqNumPropertyCollector struct {
-	minSeqNum uint64
+	minSeqNum base.SeqNum
 }
 
-func (c *minSeqNumPropertyCollector) Add(key InternalKey, value []byte) error {
+var _ BlockPropertyCollector = (*minSeqNumPropertyCollector)(nil)
+
+func (c *minSeqNumPropertyCollector) Name() string {
+	return "minSeqNumPropertyCollector"
+}
+
+func (c *minSeqNumPropertyCollector) AddPointKey(key InternalKey, value []byte) error {
 	if c.minSeqNum == 0 || c.minSeqNum > key.SeqNum() {
 		c.minSeqNum = key.SeqNum()
 	}
 	return nil
 }
 
-func (c *minSeqNumPropertyCollector) Finish(userProps map[string]string) error {
-	userProps["test.min-seq-num"] = fmt.Sprint(c.minSeqNum)
+func (c *minSeqNumPropertyCollector) AddRangeKeys(span sstable.Span) error {
+	for _, k := range span.Keys {
+		if c.minSeqNum == 0 || c.minSeqNum > k.SeqNum() {
+			c.minSeqNum = k.SeqNum()
+		}
+	}
 	return nil
 }
 
-func (c *minSeqNumPropertyCollector) Name() string {
-	return "minSeqNumPropertyCollector"
+func (c *minSeqNumPropertyCollector) FinishDataBlock(buf []byte) ([]byte, error) {
+	return nil, nil
+}
+
+func (c *minSeqNumPropertyCollector) AddPrevDataBlockToIndexBlock() {}
+
+func (c *minSeqNumPropertyCollector) FinishIndexBlock(buf []byte) ([]byte, error) {
+	return nil, nil
+}
+
+func (c *minSeqNumPropertyCollector) FinishTable(buf []byte) ([]byte, error) {
+	return binary.AppendUvarint(buf, uint64(c.minSeqNum)), nil
+}
+
+func (c *minSeqNumPropertyCollector) AddCollectedWithSuffixReplacement(
+	oldProp []byte, oldSuffix, newSuffix []byte,
+) error {
+	return errors.Errorf("not implemented")
+}
+
+func (c *minSeqNumPropertyCollector) SupportsSuffixReplacement() bool {
+	return false
+}
+
+// minSeqNumFilter is a BlockPropertyFilter that uses the
+// minSeqNumPropertyCollector data to filter out entire tables.
+type minSeqNumFilter struct {
+	seqNumUpperBound uint64
+}
+
+var _ BlockPropertyFilter = (*minSeqNumFilter)(nil)
+
+func (*minSeqNumFilter) Name() string {
+	return (&minSeqNumPropertyCollector{}).Name()
+}
+
+func (f *minSeqNumFilter) Intersects(prop []byte) (bool, error) {
+	// Blocks will have no data.
+	if len(prop) == 0 {
+		return true, nil
+	}
+	minSeqNum, n := binary.Uvarint(prop)
+	if n <= 0 {
+		return false, errors.Errorf("invalid block property data %v", prop)
+	}
+	return minSeqNum < f.seqNumUpperBound, nil
+}
+
+func (f *minSeqNumFilter) SyntheticSuffixIntersects(prop []byte, suffix []byte) (bool, error) {
+	panic("unimplemented")
 }
 
 func TestReadSampling(t *testing.T) {
@@ -618,10 +340,11 @@ func TestReadSampling(t *testing.T) {
 			}
 
 			opts := &Options{}
-			opts.TablePropertyCollectors = append(opts.TablePropertyCollectors,
-				func() TablePropertyCollector {
+			opts.BlockPropertyCollectors = []func() BlockPropertyCollector{
+				func() BlockPropertyCollector {
 					return &minSeqNumPropertyCollector{}
-				})
+				},
+			}
 
 			var err error
 			if d, err = runDBDefineCmd(td, opts); err != nil {
@@ -696,9 +419,9 @@ func TestReadSampling(t *testing.T) {
 				// sequence number, otherwise the DB appears empty.
 				snap := Snapshot{
 					db:     d,
-					seqNum: InternalKeySeqNumMax,
+					seqNum: base.SeqNumMax,
 				}
-				iter = snap.NewIter(nil)
+				iter, _ = snap.NewIter(nil)
 				iter.readSampling.forceReadSampling = true
 			}
 			return runIterCmd(td, iter, false)
@@ -767,10 +490,11 @@ func TestIteratorTableFilter(t *testing.T) {
 			}
 
 			opts := &Options{}
-			opts.TablePropertyCollectors = append(opts.TablePropertyCollectors,
-				func() TablePropertyCollector {
+			opts.BlockPropertyCollectors = []func() BlockPropertyCollector{
+				func() BlockPropertyCollector {
 					return &minSeqNumPropertyCollector{}
-				})
+				},
+			}
 
 			var err error
 			if d, err = runDBDefineCmd(td, opts); err != nil {
@@ -790,12 +514,8 @@ func TestIteratorTableFilter(t *testing.T) {
 			iterOpts := &IterOptions{}
 			var filterSeqNum uint64
 			if td.MaybeScanArgs(t, "filter", &filterSeqNum) {
-				iterOpts.TableFilter = func(userProps map[string]string) bool {
-					minSeqNum, err := strconv.ParseUint(userProps["test.min-seq-num"], 10, 64)
-					if err != nil {
-						return true
-					}
-					return minSeqNum < filterSeqNum
+				iterOpts.PointKeyFilters = []BlockPropertyFilter{
+					&minSeqNumFilter{seqNumUpperBound: filterSeqNum},
 				}
 			}
 
@@ -804,9 +524,9 @@ func TestIteratorTableFilter(t *testing.T) {
 			// sequence number, otherwise the DB appears empty.
 			snap := Snapshot{
 				db:     d,
-				seqNum: InternalKeySeqNumMax,
+				seqNum: base.SeqNumMax,
 			}
-			iter := snap.NewIter(iterOpts)
+			iter, _ := snap.NewIter(iterOpts)
 			return runIterCmd(td, iter, true)
 
 		default:
@@ -860,10 +580,14 @@ func TestIteratorNextPrev(t *testing.T) {
 		case "iter":
 			snap := Snapshot{
 				db:     d,
-				seqNum: InternalKeySeqNumMax,
+				seqNum: base.SeqNumMax,
 			}
-			td.MaybeScanArgs(t, "seq", &snap.seqNum)
-			iter := snap.NewIter(nil)
+			if td.HasArg("seq") {
+				var n uint64
+				td.ScanArgs(t, "seq", &n)
+				snap.seqNum = base.SeqNum(n)
+			}
+			iter, _ := snap.NewIter(nil)
 			return runIterCmd(td, iter, true)
 
 		default:
@@ -889,6 +613,7 @@ func TestIteratorStats(t *testing.T) {
 		opts := &Options{Comparer: testkeys.Comparer, FS: mem, FormatMajorVersion: internalFormatNewest}
 		// Automatic compactions may make some testcases non-deterministic.
 		opts.DisableAutomaticCompactions = true
+		opts.Experimental.EnableColumnarBlocks = func() bool { return true }
 		var err error
 		d, err = Open("", opts)
 		require.NoError(t, err)
@@ -916,10 +641,10 @@ func TestIteratorStats(t *testing.T) {
 		case "iter":
 			snap := Snapshot{
 				db:     d,
-				seqNum: InternalKeySeqNumMax,
+				seqNum: base.SeqNumMax,
 			}
 			td.MaybeScanArgs(t, "seq", &snap.seqNum)
-			iter := snap.NewIter(nil)
+			iter, _ := snap.NewIter(nil)
 			return runIterCmd(td, iter, true)
 
 		default:
@@ -934,9 +659,7 @@ type iterSeekOptWrapper struct {
 	seekGEUsingNext, seekPrefixGEUsingNext *int
 }
 
-func (i *iterSeekOptWrapper) SeekGE(
-	key []byte, flags base.SeekGEFlags,
-) (*InternalKey, base.LazyValue) {
+func (i *iterSeekOptWrapper) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV {
 	if flags.TrySeekUsingNext() {
 		*i.seekGEUsingNext++
 	}
@@ -945,7 +668,7 @@ func (i *iterSeekOptWrapper) SeekGE(
 
 func (i *iterSeekOptWrapper) SeekPrefixGE(
 	prefix, key []byte, flags base.SeekGEFlags,
-) (*InternalKey, base.LazyValue) {
+) *base.InternalKV {
 	if flags.TrySeekUsingNext() {
 		*i.seekPrefixGEUsingNext++
 	}
@@ -982,10 +705,11 @@ func TestIteratorSeekOpt(t *testing.T) {
 			seekPrefixGEUsingNext = 0
 
 			opts := &Options{}
-			opts.TablePropertyCollectors = append(opts.TablePropertyCollectors,
-				func() TablePropertyCollector {
+			opts.BlockPropertyCollectors = []func() BlockPropertyCollector{
+				func() BlockPropertyCollector {
 					return &minSeqNumPropertyCollector{}
-				})
+				},
+			}
 
 			var err error
 			if d, err = runDBDefineCmd(td, opts); err != nil {
@@ -998,15 +722,16 @@ func TestIteratorSeekOpt(t *testing.T) {
 			oldNewIters := d.newIters
 			d.newIters = func(
 				ctx context.Context, file *manifest.FileMetadata, opts *IterOptions,
-				internalOpts internalIterOpts) (internalIterator, keyspan.FragmentIterator, error) {
-				iter, rangeIter, err := oldNewIters(ctx, file, opts, internalOpts)
-				iterWrapped := &iterSeekOptWrapper{
-					internalIterator:      iter,
+				internalOpts internalIterOpts, kinds iterKinds) (iterSet, error) {
+				iters, err := oldNewIters(ctx, file, opts, internalOpts, kinds)
+				iters.point = &iterSeekOptWrapper{
+					internalIterator:      iters.point,
 					seekGEUsingNext:       &seekGEUsingNext,
 					seekPrefixGEUsingNext: &seekPrefixGEUsingNext,
 				}
-				return iterWrapped, rangeIter, err
+				return iters, err
 			}
+			d.opts.Comparer.Split = func(a []byte) int { return len(a) }
 			return s
 
 		case "iter":
@@ -1016,11 +741,11 @@ func TestIteratorSeekOpt(t *testing.T) {
 				// sequence number, otherwise the DB appears empty.
 				snap := Snapshot{
 					db:     d,
-					seqNum: InternalKeySeqNumMax,
+					seqNum: base.SeqNumMax,
 				}
-				iter = snap.NewIter(nil)
+				iter, _ = snap.NewIter(nil)
 				iter.readSampling.forceReadSampling = true
-				iter.comparer.Split = func(a []byte) int { return len(a) }
+				iter.comparer.Split = d.opts.Comparer.Split
 				iter.forceEnableSeekOpt = true
 				iter.merging.forceEnableSeekOpt = true
 			}
@@ -1049,29 +774,27 @@ type errorSeekIter struct {
 	err                   error
 }
 
-func (i *errorSeekIter) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, base.LazyValue) {
+func (i *errorSeekIter) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV {
 	if i.tryInjectError() {
-		return nil, base.LazyValue{}
+		return nil
 	}
 	i.err = nil
 	i.seekCount++
 	return i.internalIterator.SeekGE(key, flags)
 }
 
-func (i *errorSeekIter) SeekPrefixGE(
-	prefix, key []byte, flags base.SeekGEFlags,
-) (*InternalKey, base.LazyValue) {
+func (i *errorSeekIter) SeekPrefixGE(prefix, key []byte, flags base.SeekGEFlags) *base.InternalKV {
 	if i.tryInjectError() {
-		return nil, base.LazyValue{}
+		return nil
 	}
 	i.err = nil
 	i.seekCount++
 	return i.internalIterator.SeekPrefixGE(prefix, key, flags)
 }
 
-func (i *errorSeekIter) SeekLT(key []byte, flags base.SeekLTFlags) (*InternalKey, base.LazyValue) {
+func (i *errorSeekIter) SeekLT(key []byte, flags base.SeekLTFlags) *base.InternalKV {
 	if i.tryInjectError() {
-		return nil, base.LazyValue{}
+		return nil
 	}
 	i.err = nil
 	i.seekCount++
@@ -1088,26 +811,26 @@ func (i *errorSeekIter) tryInjectError() bool {
 	return false
 }
 
-func (i *errorSeekIter) First() (*InternalKey, base.LazyValue) {
+func (i *errorSeekIter) First() *base.InternalKV {
 	i.err = nil
 	return i.internalIterator.First()
 }
 
-func (i *errorSeekIter) Last() (*InternalKey, base.LazyValue) {
+func (i *errorSeekIter) Last() *base.InternalKV {
 	i.err = nil
 	return i.internalIterator.Last()
 }
 
-func (i *errorSeekIter) Next() (*InternalKey, base.LazyValue) {
+func (i *errorSeekIter) Next() *base.InternalKV {
 	if i.err != nil {
-		return nil, base.LazyValue{}
+		return nil
 	}
 	return i.internalIterator.Next()
 }
 
-func (i *errorSeekIter) Prev() (*InternalKey, base.LazyValue) {
+func (i *errorSeekIter) Prev() *base.InternalKV {
 	if i.err != nil {
-		return nil, base.LazyValue{}
+		return nil
 	}
 	return i.internalIterator.Prev()
 }
@@ -1120,18 +843,13 @@ func (i *errorSeekIter) Error() error {
 }
 
 func TestIteratorSeekOptErrors(t *testing.T) {
-	var keys []InternalKey
-	var vals [][]byte
+	var kvs []base.InternalKV
 
 	var errorIter errorSeekIter
 	newIter := func(opts IterOptions) *Iterator {
-		iter := &fakeIter{
-			lower: opts.GetLowerBound(),
-			upper: opts.GetUpperBound(),
-			keys:  keys,
-			vals:  vals,
-		}
-		errorIter = errorSeekIter{internalIterator: newInvalidatingIter(iter)}
+		iter := base.NewFakeIter(kvs)
+		iter.SetBounds(opts.GetLowerBound(), opts.GetUpperBound())
+		errorIter = errorSeekIter{internalIterator: invalidating.NewIter(iter)}
 		// NB: This Iterator cannot be cloned since it is not constructed
 		// with a readState. It suffices for this test.
 		return &Iterator{
@@ -1145,12 +863,10 @@ func TestIteratorSeekOptErrors(t *testing.T) {
 	datadriven.RunTest(t, "testdata/iterator_seek_opt_errors", func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "define":
-			keys = keys[:0]
-			vals = vals[:0]
+			kvs = kvs[:0]
 			for _, key := range strings.Split(d.Input, "\n") {
 				j := strings.Index(key, ":")
-				keys = append(keys, base.ParseInternalKey(key[:j]))
-				vals = append(vals, []byte(key[j+1:]))
+				kvs = append(kvs, base.MakeInternalKV(base.ParseInternalKey(key[:j]), []byte(key[j+1:])))
 			}
 			return ""
 
@@ -1189,48 +905,35 @@ func TestIteratorSeekOptErrors(t *testing.T) {
 	})
 }
 
-type testBlockIntervalCollector struct {
+type testBlockIntervalMapper struct {
 	numLength     int
 	offsetFromEnd int
-	initialized   bool
-	lower, upper  uint64
 }
 
-func (bi *testBlockIntervalCollector) Add(key InternalKey, value []byte) error {
+var _ sstable.IntervalMapper = (*testBlockIntervalMapper)(nil)
+
+func (bi *testBlockIntervalMapper) MapPointKey(
+	key InternalKey, value []byte,
+) (sstable.BlockInterval, error) {
 	k := key.UserKey
 	if len(k) < bi.numLength+bi.offsetFromEnd {
-		return nil
+		return sstable.BlockInterval{}, nil
 	}
 	n := len(k) - bi.offsetFromEnd - bi.numLength
 	val, err := strconv.Atoi(string(k[n : n+bi.numLength]))
 	if err != nil {
-		return err
+		return sstable.BlockInterval{}, err
 	}
 	if val < 0 {
-		panic("testBlockIntervalCollector expects values >= 0")
+		panic("testBlockIntervalMapper expects values >= 0")
 	}
 	uval := uint64(val)
-	if !bi.initialized {
-		bi.lower, bi.upper = uval, uval+1
-		bi.initialized = true
-		return nil
-	}
-	if bi.lower > uval {
-		bi.lower = uval
-	}
-	if uval >= bi.upper {
-		bi.upper = uval + 1
-	}
-	return nil
+	return sstable.BlockInterval{Lower: uval, Upper: uval + 1}, nil
 }
 
-func (bi *testBlockIntervalCollector) FinishDataBlock() (lower uint64, upper uint64, err error) {
-	bi.initialized = false
-	l, u := bi.lower, bi.upper
-	bi.lower, bi.upper = 0, 0
-	return l, u, nil
+func (bi *testBlockIntervalMapper) MapRangeKeys(span sstable.Span) (sstable.BlockInterval, error) {
+	return sstable.BlockInterval{}, nil
 }
-
 func TestIteratorBlockIntervalFilter(t *testing.T) {
 	var mem vfs.FS
 	var d *DB
@@ -1256,7 +959,7 @@ func TestIteratorBlockIntervalFilter(t *testing.T) {
 			bpCollectors = append(bpCollectors, func() BlockPropertyCollector {
 				return sstable.NewBlockIntervalCollector(
 					fmt.Sprintf("%d", coll.id),
-					&testBlockIntervalCollector{numLength: 2, offsetFromEnd: coll.offset},
+					&testBlockIntervalMapper{numLength: 2, offsetFromEnd: coll.offset},
 					nil, /* range key collector */
 				)
 			})
@@ -1334,8 +1037,7 @@ func TestIteratorBlockIntervalFilter(t *testing.T) {
 							return err.Error()
 						}
 						opts.PointKeyFilters = append(opts.PointKeyFilters,
-							sstable.NewBlockIntervalFilter(fmt.Sprintf("%d", id),
-								uint64(lower), uint64(upper)))
+							sstable.NewBlockIntervalFilter(fmt.Sprintf("%d", id), uint64(lower), uint64(upper), nil))
 					default:
 						return fmt.Sprintf("unknown key: %s", arg.Key)
 					}
@@ -1344,7 +1046,7 @@ func TestIteratorBlockIntervalFilter(t *testing.T) {
 					opts.PointKeyFilters[i], opts.PointKeyFilters[j] =
 						opts.PointKeyFilters[j], opts.PointKeyFilters[i]
 				})
-				iter := d.NewIter(&opts)
+				iter, _ := d.NewIter(&opts)
 				return runIterCmd(td, iter, true)
 
 			default:
@@ -1359,7 +1061,7 @@ func randStr(fill []byte, rng *rand.Rand) {
 	const letters = "abcdefghijklmnopqrstuvwxyz"
 	const lettersLen = len(letters)
 	for i := 0; i < len(fill); i++ {
-		fill[i] = letters[rng.Intn(lettersLen)]
+		fill[i] = letters[rng.IntN(lettersLen)]
 	}
 }
 
@@ -1371,7 +1073,7 @@ func randValue(n int, rng *rand.Rand) []byte {
 
 func randKey(n int, rng *rand.Rand) ([]byte, int) {
 	keyPrefix := randValue(n, rng)
-	suffix := rng.Intn(100)
+	suffix := rng.IntN(100)
 	return append(keyPrefix, []byte(fmt.Sprintf("%02d", suffix))...), suffix
 }
 
@@ -1383,7 +1085,7 @@ func TestIteratorRandomizedBlockIntervalFilter(t *testing.T) {
 		BlockPropertyCollectors: []func() BlockPropertyCollector{
 			func() BlockPropertyCollector {
 				return sstable.NewBlockIntervalCollector(
-					"0", &testBlockIntervalCollector{numLength: 2}, nil, /* range key collector */
+					"0", &testBlockIntervalMapper{numLength: 2}, nil, /* suffixReplacer */
 				)
 			},
 		},
@@ -1393,15 +1095,15 @@ func TestIteratorRandomizedBlockIntervalFilter(t *testing.T) {
 		seed = uint64(time.Now().UnixNano())
 		t.Logf("seed: %d", seed)
 	}
-	rng := rand.New(rand.NewSource(seed))
-	opts.FlushSplitBytes = 1 << rng.Intn(8)            // 1B - 256B
-	opts.L0CompactionThreshold = 1 << rng.Intn(2)      // 1-2
-	opts.L0CompactionFileThreshold = 1 << rng.Intn(11) // 1-1024
-	opts.LBaseMaxBytes = 1 << rng.Intn(11)             // 1B - 1KB
+	rng := rand.New(rand.NewPCG(seed, seed))
+	opts.FlushSplitBytes = 1 << rng.IntN(8)            // 1B - 256B
+	opts.L0CompactionThreshold = 1 << rng.IntN(2)      // 1-2
+	opts.L0CompactionFileThreshold = 1 << rng.IntN(11) // 1-1024
+	opts.LBaseMaxBytes = 1 << rng.IntN(11)             // 1B - 1KB
 	opts.MemTableSize = 2 << 10                        // 2KB
 	var lopts LevelOptions
-	lopts.BlockSize = 1 << rng.Intn(8)      // 1B - 256B
-	lopts.IndexBlockSize = 1 << rng.Intn(8) // 1B - 256B
+	lopts.BlockSize = 1 << rng.IntN(8)      // 1B - 256B
+	lopts.IndexBlockSize = 1 << rng.IntN(8) // 1B - 256B
 	opts.Levels = []LevelOptions{lopts}
 
 	d, err := Open("", opts)
@@ -1410,14 +1112,14 @@ func TestIteratorRandomizedBlockIntervalFilter(t *testing.T) {
 		require.NoError(t, d.Close())
 	}()
 	matchingKeyValues := make(map[string]string)
-	lower := rng.Intn(100)
-	upper := rng.Intn(100)
+	lower := rng.IntN(100)
+	upper := rng.IntN(100)
 	if lower > upper {
 		lower, upper = upper, lower
 	}
 	n := 2000
 	for i := 0; i < n; i++ {
-		key, suffix := randKey(20+rng.Intn(5), rng)
+		key, suffix := randKey(20+rng.IntN(5), rng)
 		value := randValue(50, rng)
 		if lower <= suffix && suffix < upper {
 			matchingKeyValues[string(key)] = string(value)
@@ -1427,10 +1129,9 @@ func TestIteratorRandomizedBlockIntervalFilter(t *testing.T) {
 
 	var iterOpts IterOptions
 	iterOpts.PointKeyFilters = []BlockPropertyFilter{
-		sstable.NewBlockIntervalFilter("0",
-			uint64(lower), uint64(upper)),
+		sstable.NewBlockIntervalFilter("0", uint64(lower), uint64(upper), nil),
 	}
-	iter := d.NewIter(&iterOpts)
+	iter, _ := d.NewIter(&iterOpts)
 	defer func() {
 		require.NoError(t, iter.Close())
 	}()
@@ -1466,7 +1167,7 @@ func TestIteratorGuaranteedDurable(t *testing.T) {
 			}
 			reader.Close()
 		}()
-		iter := reader.NewIter(&iterOptions)
+		iter, _ := reader.NewIter(&iterOptions)
 		defer iter.Close()
 	}
 	t.Run("snapshot", func(t *testing.T) {
@@ -1478,7 +1179,7 @@ func TestIteratorGuaranteedDurable(t *testing.T) {
 	t.Run("db", func(t *testing.T) {
 		d.Set([]byte("k"), []byte("v"), nil)
 		foundKV := func(o *IterOptions) bool {
-			iter := d.NewIter(o)
+			iter, _ := d.NewIter(o)
 			defer iter.Close()
 			iter.SeekGE([]byte("k"))
 			return iter.Valid()
@@ -1492,7 +1193,7 @@ func TestIteratorGuaranteedDurable(t *testing.T) {
 }
 
 func TestIteratorBoundsLifetimes(t *testing.T) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	d := newPointTestkeysDatabase(t, testkeys.Alpha(2))
 	defer func() { require.NoError(t, d.Close()) }()
 
@@ -1533,7 +1234,9 @@ func TestIteratorBoundsLifetimes(t *testing.T) {
 	}
 	trashBounds := func(bounds ...[]byte) {
 		for _, bound := range bounds {
-			rng.Read(bound[:])
+			for j := range bound {
+				bound[j] = byte(rng.Uint32())
+			}
 		}
 	}
 
@@ -1552,7 +1255,7 @@ func TestIteratorBoundsLifetimes(t *testing.T) {
 			var label string
 			td.ScanArgs(t, "label", &label)
 			lower, upper := parseBounds(td)
-			iterators[label] = d.NewIter(&IterOptions{
+			iterators[label], _ = d.NewIter(&IterOptions{
 				LowerBound: lower,
 				UpperBound: upper,
 			})
@@ -1595,13 +1298,9 @@ func TestIteratorBoundsLifetimes(t *testing.T) {
 			return buf.String()
 		case "set-options":
 			var label string
-			var tableFilter bool
 			td.ScanArgs(t, "label", &label)
 			opts := iterators[label].opts
 			for _, arg := range td.CmdArgs {
-				if arg.Key == "table-filter" {
-					tableFilter = true
-				}
 				if arg.Key == "key-types" {
 					switch arg.Vals[0] {
 					case "points-only":
@@ -1616,9 +1315,6 @@ func TestIteratorBoundsLifetimes(t *testing.T) {
 				}
 			}
 			opts.LowerBound, opts.UpperBound = parseBounds(td)
-			if tableFilter {
-				opts.TableFilter = func(userProps map[string]string) bool { return false }
-			}
 			iterators[label].SetOptions(&opts)
 			trashBounds(opts.LowerBound, opts.UpperBound)
 			buf.Reset()
@@ -1715,7 +1411,7 @@ func TestSetOptionsEquivalence(t *testing.T) {
 }
 
 func testSetOptionsEquivalence(t *testing.T, seed uint64) {
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(seed, seed))
 	ks := testkeys.Alpha(2)
 	d := newTestkeysDatabase(t, ks, rng)
 	defer func() { require.NoError(t, d.Close()) }()
@@ -1723,20 +1419,20 @@ func testSetOptionsEquivalence(t *testing.T, seed uint64) {
 	var o IterOptions
 	generateNewOptions := func() {
 		// TODO(jackson): Include test coverage for block property filters, etc.
-		if rng.Intn(2) == 1 {
-			o.KeyTypes = IterKeyType(rng.Intn(3))
+		if rng.IntN(2) == 1 {
+			o.KeyTypes = IterKeyType(rng.IntN(3))
 		}
-		if rng.Intn(2) == 1 {
-			if rng.Intn(2) == 1 {
+		if rng.IntN(2) == 1 {
+			if rng.IntN(2) == 1 {
 				o.LowerBound = nil
-				if rng.Intn(2) == 1 {
-					o.LowerBound = testkeys.KeyAt(ks, rng.Intn(ks.Count()), rng.Intn(ks.Count()))
+				if rng.IntN(2) == 1 {
+					o.LowerBound = testkeys.KeyAt(ks, rng.Int64N(ks.Count()), rng.Int64N(ks.Count()))
 				}
 			}
-			if rng.Intn(2) == 1 {
+			if rng.IntN(2) == 1 {
 				o.UpperBound = nil
-				if rng.Intn(2) == 1 {
-					o.UpperBound = testkeys.KeyAt(ks, rng.Intn(ks.Count()), rng.Intn(ks.Count()))
+				if rng.IntN(2) == 1 {
+					o.UpperBound = testkeys.KeyAt(ks, rng.Int64N(ks.Count()), rng.Int64N(ks.Count()))
 				}
 			}
 			if testkeys.Comparer.Compare(o.LowerBound, o.UpperBound) > 0 {
@@ -1744,8 +1440,8 @@ func testSetOptionsEquivalence(t *testing.T, seed uint64) {
 			}
 		}
 		o.RangeKeyMasking.Suffix = nil
-		if o.KeyTypes == IterKeyTypePointsAndRanges && rng.Intn(2) == 1 {
-			o.RangeKeyMasking.Suffix = testkeys.Suffix(rng.Intn(ks.Count()))
+		if o.KeyTypes == IterKeyTypePointsAndRanges && rng.IntN(2) == 1 {
+			o.RangeKeyMasking.Suffix = testkeys.Suffix(rng.Int64N(ks.Count()))
 		}
 	}
 
@@ -1773,7 +1469,7 @@ func testSetOptionsEquivalence(t *testing.T, seed uint64) {
 	positioningOps := []func() positioningOp{
 		// SeekGE
 		func() positioningOp {
-			k := testkeys.Key(ks, rng.Intn(ks.Count()))
+			k := testkeys.Key(ks, rng.Int64N(ks.Count()))
 			return positioningOp{
 				desc: fmt.Sprintf("SeekGE(%q)", k),
 				run: func(it *Iterator) IterValidityState {
@@ -1783,7 +1479,7 @@ func testSetOptionsEquivalence(t *testing.T, seed uint64) {
 		},
 		// SeekLT
 		func() positioningOp {
-			k := testkeys.Key(ks, rng.Intn(ks.Count()))
+			k := testkeys.Key(ks, rng.Int64N(ks.Count()))
 			return positioningOp{
 				desc: fmt.Sprintf("SeekLT(%q)", k),
 				run: func(it *Iterator) IterValidityState {
@@ -1793,7 +1489,7 @@ func testSetOptionsEquivalence(t *testing.T, seed uint64) {
 		},
 		// SeekPrefixGE
 		func() positioningOp {
-			k := testkeys.Key(ks, rng.Intn(ks.Count()))
+			k := testkeys.Key(ks, rng.Int64N(ks.Count()))
 			return positioningOp{
 				desc: fmt.Sprintf("SeekPrefixGE(%q)", k),
 				run: func(it *Iterator) IterValidityState {
@@ -1811,15 +1507,15 @@ func testSetOptionsEquivalence(t *testing.T, seed uint64) {
 		generateNewOptions()
 		fmt.Fprintf(&history, "new options: %s\n", iterOptionsString(&o))
 
-		newIter = d.NewIter(&o)
+		newIter, _ = d.NewIter(&o)
 		if longLivedIter == nil {
-			longLivedIter = d.NewIter(&o)
+			longLivedIter, _ = d.NewIter(&o)
 		} else {
 			longLivedIter.SetOptions(&o)
 		}
 
 		// Apply the same operation to both keys.
-		iterOp := positioningOps[rng.Intn(len(positioningOps))]()
+		iterOp := positioningOps[rng.IntN(len(positioningOps))]()
 		newIterValidity := iterOp.run(newIter)
 		longLivedValidity := iterOp.run(longLivedIter)
 
@@ -1845,9 +1541,6 @@ func iterOptionsString(o *IterOptions) string {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "key-types=%s, lower=%q, upper=%q",
 		o.KeyTypes, o.LowerBound, o.UpperBound)
-	if o.TableFilter != nil {
-		fmt.Fprintf(&buf, ", table-filter")
-	}
 	if o.OnlyReadGuaranteedDurable {
 		fmt.Fprintf(&buf, ", only-durable")
 	}
@@ -1865,34 +1558,34 @@ func iterOptionsString(o *IterOptions) string {
 
 func newTestkeysDatabase(t *testing.T, ks testkeys.Keyspace, rng *rand.Rand) *DB {
 	dbOpts := &Options{
-		Comparer:           testkeys.Comparer,
-		FS:                 vfs.NewMem(),
-		FormatMajorVersion: FormatRangeKeys,
-		Logger:             panicLogger{},
+		Comparer: testkeys.Comparer,
+		FS:       vfs.NewMem(),
+		Logger:   panicLogger{},
 	}
+	dbOpts.testingRandomized(t)
 	d, err := Open("", dbOpts)
 	require.NoError(t, err)
 
 	// Randomize the order in which we write keys.
-	order := rng.Perm(ks.Count())
+	order := rng.Perm(int(ks.Count()))
 	b := d.NewBatch()
 	keyBuf := make([]byte, ks.MaxLen()+testkeys.MaxSuffixLen)
 	keyBuf2 := make([]byte, ks.MaxLen()+testkeys.MaxSuffixLen)
 	for i := 0; i < len(order); i++ {
 		const maxVersionsPerKey = 10
 		keyIndex := order[i]
-		for versions := rng.Intn(maxVersionsPerKey); versions > 0; versions-- {
-			n := testkeys.WriteKeyAt(keyBuf, ks, keyIndex, rng.Intn(maxVersionsPerKey))
+		for versions := rng.IntN(maxVersionsPerKey); versions > 0; versions-- {
+			n := testkeys.WriteKeyAt(keyBuf, ks, int64(keyIndex), rng.Int64N(maxVersionsPerKey))
 			b.Set(keyBuf[:n], keyBuf[:n], nil)
 		}
 
 		// Sometimes add a range key too.
-		if rng.Intn(100) == 1 {
-			startIdx := rng.Intn(ks.Count())
-			endIdx := rng.Intn(ks.Count())
+		if rng.IntN(100) == 1 {
+			startIdx := rng.Int64N(ks.Count())
+			endIdx := rng.Int64N(ks.Count())
 			startLen := testkeys.WriteKey(keyBuf, ks, startIdx)
 			endLen := testkeys.WriteKey(keyBuf2, ks, endIdx)
-			suffixInt := rng.Intn(maxVersionsPerKey)
+			suffixInt := rng.Int64N(maxVersionsPerKey)
 			require.NoError(t, b.RangeKeySet(
 				keyBuf[:startLen],
 				keyBuf2[:endLen],
@@ -1902,7 +1595,7 @@ func newTestkeysDatabase(t *testing.T, ks testkeys.Keyspace, rng *rand.Rand) *DB
 		}
 
 		// Randomize the flush points.
-		if !b.Empty() && rng.Intn(10) == 1 {
+		if !b.Empty() && rng.IntN(10) == 1 {
 			require.NoError(t, b.Commit(nil))
 			require.NoError(t, d.Flush())
 			b = d.NewBatch()
@@ -1916,16 +1609,16 @@ func newTestkeysDatabase(t *testing.T, ks testkeys.Keyspace, rng *rand.Rand) *DB
 
 func newPointTestkeysDatabase(t *testing.T, ks testkeys.Keyspace) *DB {
 	dbOpts := &Options{
-		Comparer:           testkeys.Comparer,
-		FS:                 vfs.NewMem(),
-		FormatMajorVersion: FormatRangeKeys,
+		Comparer: testkeys.Comparer,
+		FS:       vfs.NewMem(),
 	}
+	dbOpts.testingRandomized(t)
 	d, err := Open("", dbOpts)
 	require.NoError(t, err)
 
 	b := d.NewBatch()
 	keyBuf := make([]byte, ks.MaxLen()+testkeys.MaxSuffixLen)
-	for i := 0; i < ks.Count(); i++ {
+	for i := int64(0); i < ks.Count(); i++ {
 		n := testkeys.WriteKeyAt(keyBuf, ks, i, i)
 		b.Set(keyBuf[:n], keyBuf[:n], nil)
 	}
@@ -1939,11 +1632,11 @@ func BenchmarkIteratorSeekGE(b *testing.B) {
 		comparer: *DefaultComparer,
 		iter:     m.newIter(nil),
 	}
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := keys[rng.Intn(len(keys))]
+		key := keys[rng.IntN(len(keys))]
 		iter.SeekGE(key)
 	}
 }
@@ -2204,7 +1897,7 @@ func BenchmarkIteratorSeqSeekGEWithBounds(b *testing.B) {
 						valid = iter.Next()
 					}
 					if iter.Error() != nil {
-						b.Fatalf(iter.Error().Error())
+						b.Fatal(iter.Error().Error())
 					}
 				}
 				iter.Close()
@@ -2260,7 +1953,7 @@ func BenchmarkIteratorSeekGENoop(b *testing.B) {
 }
 
 func BenchmarkBlockPropertyFilter(b *testing.B) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	for _, matchInterval := range []int{1, 10, 100, 1000} {
 		b.Run(fmt.Sprintf("match-interval=%d", matchInterval), func(b *testing.B) {
 			mem := vfs.NewMem()
@@ -2270,7 +1963,7 @@ func BenchmarkBlockPropertyFilter(b *testing.B) {
 				BlockPropertyCollectors: []func() BlockPropertyCollector{
 					func() BlockPropertyCollector {
 						return sstable.NewBlockIntervalCollector(
-							"0", &testBlockIntervalCollector{numLength: 3}, nil, /* range key collector */
+							"0", &testBlockIntervalMapper{numLength: 3}, nil, /* range key collector */
 						)
 					},
 				},
@@ -2297,11 +1990,10 @@ func BenchmarkBlockPropertyFilter(b *testing.B) {
 					var iterOpts IterOptions
 					if filter {
 						iterOpts.PointKeyFilters = []BlockPropertyFilter{
-							sstable.NewBlockIntervalFilter("0",
-								uint64(0), uint64(1)),
+							sstable.NewBlockIntervalFilter("0", uint64(0), uint64(1), nil),
 						}
 					}
-					iter := d.NewIter(&iterOpts)
+					iter, _ := d.NewIter(&iterOpts)
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
 						valid := iter.First()
@@ -2323,27 +2015,27 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 		seed = uint64(time.Now().UnixNano())
 		t.Logf("seed: %d", seed)
 	}
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(0, seed))
 
 	// Generate keyspace with point keys, and range keys which will
 	// mask the point keys.
-	var timestamps []int
+	var timestamps []int64
 	for i := 0; i <= 100; i++ {
-		timestamps = append(timestamps, rng.Intn(1000))
+		timestamps = append(timestamps, rng.Int64N(1000))
 	}
 
 	ks := testkeys.Alpha(5)
-	numKeys := 1000 + rng.Intn(9000)
+	numKeys := 1000 + rng.IntN(9000)
 	keys := make([][]byte, numKeys)
-	keyTimeStamps := make([]int, numKeys) // ts associated with the keys.
+	keyTimeStamps := make([]int64, numKeys) // ts associated with the keys.
 	for i := 0; i < numKeys; i++ {
 		keys[i] = make([]byte, 5+testkeys.MaxSuffixLen)
-		keyTimeStamps[i] = timestamps[rng.Intn(len(timestamps))]
-		n := testkeys.WriteKeyAt(keys[i], ks, rng.Intn(ks.Count()), keyTimeStamps[i])
+		keyTimeStamps[i] = timestamps[rng.IntN(len(timestamps))]
+		n := testkeys.WriteKeyAt(keys[i], ks, rng.Int64N(ks.Count()), keyTimeStamps[i])
 		keys[i] = keys[i][:n]
 	}
 
-	numRangeKeys := rng.Intn(20)
+	numRangeKeys := rng.IntN(20)
 	type rkey struct {
 		start  []byte
 		end    []byte
@@ -2355,19 +2047,19 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 		rkeys[i].start = make([]byte, 5)
 		rkeys[i].end = make([]byte, 5)
 
-		testkeys.WriteKey(rkeys[i].start[:5], ks, rng.Intn(ks.Count()))
-		testkeys.WriteKey(rkeys[i].end[:5], ks, rng.Intn(ks.Count()))
+		testkeys.WriteKey(rkeys[i].start[:5], ks, rng.Int64N(ks.Count()))
+		testkeys.WriteKey(rkeys[i].end[:5], ks, rng.Int64N(ks.Count()))
 
 		for bytes.Equal(rkeys[i].start[:5], rkeys[i].end[:5]) {
-			testkeys.WriteKey(rkeys[i].end[:5], ks, rng.Intn(ks.Count()))
+			testkeys.WriteKey(rkeys[i].end[:5], ks, rng.Int64N(ks.Count()))
 		}
 
 		if bytes.Compare(rkeys[i].start[:5], rkeys[i].end[:5]) > 0 {
 			rkeys[i].start, rkeys[i].end = rkeys[i].end, rkeys[i].start
 		}
 
-		rkeyTimestamp := timestamps[rng.Intn(len(timestamps))]
-		rkeys[i].suffix = []byte("@" + strconv.Itoa(rkeyTimestamp))
+		rkeyTimestamp := timestamps[rng.IntN(len(timestamps))]
+		rkeys[i].suffix = []byte("@" + strconv.FormatInt(rkeyTimestamp, 10))
 
 		// Each time we create a range key, check if the range key masks any
 		// point keys.
@@ -2405,12 +2097,12 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 	randomOpts := testOpts{
 		levelOpts: []LevelOptions{
 			{
-				TargetFileSize: int64(1 + rng.Intn(2<<20)), // Vary the L0 file size.
-				BlockSize:      1 + rng.Intn(32<<10),
+				TargetFileSize: int64(1 + rng.IntN(2<<20)), // Vary the L0 file size.
+				BlockSize:      1 + rng.IntN(32<<10),
 			},
 		},
 	}
-	if rng.Intn(2) == 0 {
+	if rng.IntN(2) == 0 {
 		randomOpts.filter = func() BlockPropertyFilterMask {
 			return sstable.NewTestKeysMaskingFilter()
 		}
@@ -2419,7 +2111,7 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 	maxProcs := runtime.GOMAXPROCS(0)
 
 	opts1 := &Options{
-		FS:                       vfs.NewStrictMem(),
+		FS:                       vfs.NewCrashableMem(),
 		Comparer:                 testkeys.Comparer,
 		FormatMajorVersion:       FormatNewest,
 		MaxConcurrentCompactions: func() int { return maxProcs/2 + 1 },
@@ -2432,7 +2124,7 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 	require.NoError(t, err)
 
 	opts2 := &Options{
-		FS:                       vfs.NewStrictMem(),
+		FS:                       vfs.NewCrashableMem(),
 		Comparer:                 testkeys.Comparer,
 		FormatMajorVersion:       FormatNewest,
 		MaxConcurrentCompactions: func() int { return maxProcs/2 + 1 },
@@ -2492,8 +2184,8 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 		},
 	}
 
-	iter1 := d1.NewIter(&iter1Opts)
-	iter2 := d2.NewIter(&iter2Opts)
+	iter1, _ := d1.NewIter(&iter1Opts)
+	iter2, _ := d2.NewIter(&iter2Opts)
 	defer func() {
 		if err := iter1.Close(); err != nil {
 			t.Fatal(err)
@@ -2515,17 +2207,17 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 			t.Fatalf("iteration didn't produce identical results")
 		}
 		if hasP1 && !bytes.Equal(iter1.Key(), iter2.Key()) {
-			t.Fatalf(fmt.Sprintf("iteration didn't produce identical point keys: %s, %s", iter1.Key(), iter2.Key()))
+			t.Fatalf("iteration didn't produce identical point keys: %s, %s", iter1.Key(), iter2.Key())
 		}
 		if hasR1 {
 			// Confirm that the range key is the same.
 			b1, e1 := iter1.RangeBounds()
 			b2, e2 := iter2.RangeBounds()
 			if !bytes.Equal(b1, b2) || !bytes.Equal(e1, e2) {
-				t.Fatalf(fmt.Sprintf(
+				t.Fatalf(
 					"iteration didn't produce identical range keys: [%s, %s], [%s, %s]",
 					b1, e1, b2, e2,
-				))
+				)
 			}
 
 		}
@@ -2533,8 +2225,42 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 		// Confirm that the returned point key wasn't hidden.
 		for j, pkey := range keys {
 			if bytes.Equal(iter1.Key(), pkey) && pointKeyHidden[j] {
-				t.Fatalf(fmt.Sprintf("hidden point key was exposed %s %d", pkey, keyTimeStamps[j]))
+				t.Fatalf("hidden point key was exposed %s %d", pkey, keyTimeStamps[j])
 			}
+		}
+	}
+}
+
+func TestIteratorSeekPrefixGERandomized(t *testing.T) {
+	seed := uint64(time.Now().UnixNano())
+	t.Logf("seed: %d", seed)
+	rng := rand.New(rand.NewPCG(seed, seed))
+	ks := testkeys.Alpha(2)
+	d := newTestkeysDatabase(t, ks, rng)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	// Scan through the keys and construct a map from unique prefix to the
+	// largest key with that prefix.
+	m := make(map[string]string) // prefix -> largest user key
+	iter, err := d.NewIter(nil)
+	require.NoError(t, err)
+	defer iter.Close()
+	for valid := iter.First(); valid; valid = iter.Next() {
+		prefix := string(d.opts.Comparer.Split.Prefix(iter.Key()))
+		if _, ok := m[prefix]; !ok {
+			m[string(prefix)] = string(iter.Key())
+		}
+	}
+	// Perform a few seeks for random prefixes and ensure that result matches
+	// the map constructed.
+	for i := 0; i < 100; i++ {
+		k := testkeys.Key(ks, rng.Int64N(ks.Count()))
+		t.Logf("SeekPrefixGE(%q)", k)
+		exists := iter.SeekPrefixGE(k)
+		expectedKey, expectedOk := m[string(k)]
+		require.Equal(t, expectedOk, exists)
+		if exists {
+			require.Equal(t, expectedKey, string(iter.Key()))
 		}
 	}
 }
@@ -2553,11 +2279,11 @@ func BenchmarkIterator_RangeKeyMasking(b *testing.B) {
 		keysPerBatch = 50
 	)
 	var alloc bytealloc.A
-	rng := rand.New(rand.NewSource(uint64(1658872515083979000)))
+	rng := rand.New(rand.NewPCG(0, 1658872515083979000))
 	keyBuf := make([]byte, prefixLen+testkeys.MaxSuffixLen)
 	valBuf := make([]byte, valueSize)
 
-	mem := vfs.NewStrictMem()
+	mem := vfs.NewMem()
 	maxProcs := runtime.GOMAXPROCS(0)
 	opts := &Options{
 		FS:                       mem,
@@ -2576,7 +2302,7 @@ func BenchmarkIterator_RangeKeyMasking(b *testing.B) {
 		batch := d.NewBatch()
 		for k := 0; k < keysPerBatch; k++ {
 			randStr(keyBuf[:prefixLen], rng)
-			suffix := rng.Intn(100)
+			suffix := rng.Int64N(100)
 			suffixLen := testkeys.WriteSuffix(keyBuf[prefixLen:], suffix)
 			randStr(valBuf[:], rng)
 
@@ -2597,14 +2323,17 @@ func BenchmarkIterator_RangeKeyMasking(b *testing.B) {
 	d.mu.Unlock()
 	b.Log(d.Metrics().String())
 	require.NoError(b, d.Close())
-	// Set ignore syncs to true so that each subbenchmark may mutate state and
-	// then revert back to the original state.
-	mem.SetIgnoreSyncs(true)
 
 	// TODO(jackson): Benchmark lazy-combined iteration versus not.
 	// TODO(jackson): Benchmark seeks.
 	for _, rkSuffix := range []string{"@10", "@50", "@75", "@100"} {
 		b.Run(fmt.Sprintf("range-keys-suffixes=%s", rkSuffix), func(b *testing.B) {
+			// Clone the filesystem so that each subbenchmark may mutate state.
+			opts := opts.Clone()
+			opts.FS = vfs.NewMem()
+			ok, err := vfs.Clone(mem, opts.FS, "", "")
+			require.NoError(b, err)
+			require.True(b, ok)
 			d, err := Open("", opts)
 			require.NoError(b, err)
 			require.NoError(b, d.RangeKeySet([]byte("b"), []byte("e"), []byte(rkSuffix), nil, nil))
@@ -2628,7 +2357,7 @@ func BenchmarkIterator_RangeKeyMasking(b *testing.B) {
 				b.Run("seekprefix", func(b *testing.B) {
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
-						iter := d.NewIter(&iterOpts)
+						iter, _ := d.NewIter(&iterOpts)
 						count := 0
 						for j := 0; j < len(keys); j++ {
 							if !iter.SeekPrefixGE(keys[j]) {
@@ -2646,7 +2375,7 @@ func BenchmarkIterator_RangeKeyMasking(b *testing.B) {
 				b.Run("next", func(b *testing.B) {
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
-						iter := d.NewIter(&iterOpts)
+						iter, _ := d.NewIter(&iterOpts)
 						count := 0
 						for valid := iter.First(); valid; valid = iter.Next() {
 							if hasPoint, _ := iter.HasPointAndRange(); hasPoint {
@@ -2662,7 +2391,7 @@ func BenchmarkIterator_RangeKeyMasking(b *testing.B) {
 			b.Run("backward", func(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					iter := d.NewIter(&iterOpts)
+					iter, _ := d.NewIter(&iterOpts)
 					count := 0
 					for valid := iter.Last(); valid; valid = iter.Prev() {
 						if hasPoint, _ := iter.HasPointAndRange(); hasPoint {
@@ -2679,18 +2408,16 @@ func BenchmarkIterator_RangeKeyMasking(b *testing.B) {
 			// range keys we wrote.
 			b.StopTimer()
 			require.NoError(b, d.Close())
-			mem.ResetToSyncedState()
 		})
 	}
-
 }
 
 func BenchmarkIteratorScan(b *testing.B) {
 	const maxPrefixLen = 8
 	keyBuf := make([]byte, maxPrefixLen+testkeys.MaxSuffixLen)
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 
-	for _, keyCount := range []int{100, 1000, 10000} {
+	for _, keyCount := range []int64{100, 1000, 10000} {
 		for _, readAmp := range []int{1, 3, 7, 10} {
 			func() {
 				opts := &Options{
@@ -2712,10 +2439,10 @@ func BenchmarkIteratorScan(b *testing.B) {
 				}
 
 				// Portion the keys into `readAmp` overlapping key sets.
-				for _, ks := range testkeys.Divvy(keys, readAmp) {
+				for _, ks := range testkeys.Divvy(keys, int64(readAmp)) {
 					batch := d.NewBatch()
-					for i := 0; i < ks.Count(); i++ {
-						n := testkeys.WriteKeyAt(keyBuf[:], ks, i, int(rng.Uint64n(100)))
+					for i := int64(0); i < ks.Count(); i++ {
+						n := testkeys.WriteKeyAt(keyBuf[:], ks, i, rng.Int64N(100))
 						batch.Set(keyBuf[:n], keyBuf[:n], nil)
 					}
 					require.NoError(b, batch.Commit(nil))
@@ -2730,7 +2457,7 @@ func BenchmarkIteratorScan(b *testing.B) {
 					b.Run(fmt.Sprintf("keys=%d,r-amp=%d,key-types=%s", keyCount, readAmp, keyTypes), func(b *testing.B) {
 						for i := 0; i < b.N; i++ {
 							b.StartTimer()
-							iter := d.NewIter(&iterOpts)
+							iter, _ := d.NewIter(&iterOpts)
 							valid := iter.First()
 							for valid {
 								valid = iter.Next()
@@ -2768,17 +2495,17 @@ func BenchmarkIteratorScanNextPrefix(b *testing.B) {
 		//
 		for l := readAmp; l > 0; l-- {
 			ks := testkeys.Alpha(l)
-			if step := ks.Count() / maxKeysPerLevel; step > 1 {
+			if step := ks.Count() / int64(maxKeysPerLevel); step > 1 {
 				ks = ks.EveryN(step)
 			}
-			if ks.Count() > maxKeysPerLevel {
-				ks = ks.Slice(0, maxKeysPerLevel)
+			if ks.Count() > int64(maxKeysPerLevel) {
+				ks = ks.Slice(0, int64(maxKeysPerLevel))
 			}
 
 			batch := d.NewBatch()
-			for i := 0; i < ks.Count(); i++ {
+			for i := int64(0); i < ks.Count(); i++ {
 				for v := 0; v < versCount; v++ {
-					n := testkeys.WriteKeyAt(keyBuf[:], ks, i, versCount-v+1)
+					n := testkeys.WriteKeyAt(keyBuf[:], ks, i, int64(versCount-v+1))
 					batch.Set(keyBuf[:n], keyBuf[:n], nil)
 				}
 			}
@@ -2806,7 +2533,7 @@ func BenchmarkIteratorScanNextPrefix(b *testing.B) {
 										IterKeyTypePointsOnly, IterKeyTypePointsAndRanges} {
 										b.Run(fmt.Sprintf("key-types=%s", keyTypes), func(b *testing.B) {
 											iterOpts := IterOptions{KeyTypes: keyTypes}
-											iter := d.NewIter(&iterOpts)
+											iter, _ := d.NewIter(&iterOpts)
 											var valid bool
 											b.ResetTimer()
 											for i := 0; i < b.N; i++ {
@@ -2836,7 +2563,7 @@ func BenchmarkIteratorScanNextPrefix(b *testing.B) {
 func BenchmarkCombinedIteratorSeek(b *testing.B) {
 	for _, withRangeKey := range []bool{false, true} {
 		b.Run(fmt.Sprintf("range-key=%t", withRangeKey), func(b *testing.B) {
-			rng := rand.New(rand.NewSource(uint64(1658872515083979000)))
+			rng := rand.New(rand.NewPCG(0, 1658872515083979000))
 			ks := testkeys.Alpha(1)
 			opts := &Options{
 				FS:                 vfs.NewMem(),
@@ -2848,10 +2575,12 @@ func BenchmarkCombinedIteratorSeek(b *testing.B) {
 			defer func() { require.NoError(b, d.Close()) }()
 
 			keys := make([][]byte, ks.Count())
-			for i := 0; i < ks.Count(); i++ {
+			for i := int64(0); i < ks.Count(); i++ {
 				keys[i] = testkeys.Key(ks, i)
 				var val [40]byte
-				rng.Read(val[:])
+				for j := range val {
+					val[j] = byte(rng.Uint32())
+				}
 				require.NoError(b, d.Set(keys[i], val[:], nil))
 			}
 			if withRangeKey {
@@ -2867,9 +2596,9 @@ func BenchmarkCombinedIteratorSeek(b *testing.B) {
 						iterOpts := IterOptions{KeyTypes: IterKeyTypePointsAndRanges}
 						var it *Iterator
 						if useBatch {
-							it = batch.NewIter(&iterOpts)
+							it, _ = batch.NewIter(&iterOpts)
 						} else {
-							it = d.NewIter(&iterOpts)
+							it, _ = d.NewIter(&iterOpts)
 						}
 						for j := 0; j < len(keys); j++ {
 							if !it.SeekGE(keys[j]) {
@@ -2889,7 +2618,7 @@ func BenchmarkCombinedIteratorSeek(b *testing.B) {
 // range key that's fragmented across hundreds of files. The iterator bounds
 // should prevent defragmenting beyond the iterator's bounds.
 func BenchmarkCombinedIteratorSeek_Bounded(b *testing.B) {
-	d, keys := buildFragmentedRangeKey(b, uint64(1658872515083979000))
+	d, keys := buildFragmentedRangeKey(b, 1658872515083979000)
 
 	var lower = len(keys) / 2
 	var upper = len(keys)/2 + len(keys)/20 // 5%
@@ -2900,7 +2629,7 @@ func BenchmarkCombinedIteratorSeek_Bounded(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		it := d.NewIter(&iterOpts)
+		it, _ := d.NewIter(&iterOpts)
 		for j := lower; j < upper; j++ {
 			if !it.SeekGE(keys[j]) {
 				b.Errorf("key %q missing", keys[j])
@@ -2915,7 +2644,7 @@ func BenchmarkCombinedIteratorSeek_Bounded(b *testing.B) {
 // range key that's fragmented across hundreds of files. The seek prefix should
 // avoid defragmenting beyond the seek prefixes.
 func BenchmarkCombinedIteratorSeekPrefix(b *testing.B) {
-	d, keys := buildFragmentedRangeKey(b, uint64(1658872515083979000))
+	d, keys := buildFragmentedRangeKey(b, 1658872515083979000)
 
 	var lower = len(keys) / 2
 	var upper = len(keys)/2 + len(keys)/20 // 5%
@@ -2924,7 +2653,7 @@ func BenchmarkCombinedIteratorSeekPrefix(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		it := d.NewIter(&iterOpts)
+		it, _ := d.NewIter(&iterOpts)
 		for j := lower; j < upper; j++ {
 			if !it.SeekPrefixGE(keys[j]) {
 				b.Errorf("key %q missing", keys[j])
@@ -2935,7 +2664,7 @@ func BenchmarkCombinedIteratorSeekPrefix(b *testing.B) {
 }
 
 func buildFragmentedRangeKey(b testing.TB, seed uint64) (d *DB, keys [][]byte) {
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(0, seed))
 	ks := testkeys.Alpha(2)
 	opts := &Options{
 		FS:                        vfs.NewMem(),
@@ -2952,12 +2681,14 @@ func buildFragmentedRangeKey(b testing.TB, seed uint64) (d *DB, keys [][]byte) {
 	require.NoError(b, err)
 
 	keys = make([][]byte, ks.Count())
-	for i := 0; i < ks.Count(); i++ {
+	for i := int64(0); i < ks.Count(); i++ {
 		keys[i] = testkeys.Key(ks, i)
 	}
 	for i := 0; i < len(keys); i++ {
 		var val [40]byte
-		rng.Read(val[:])
+		for j := range val {
+			val[j] = byte(rng.Uint32())
+		}
 		require.NoError(b, d.Set(keys[i], val[:], nil))
 		if i < len(keys)-1 {
 			require.NoError(b, d.RangeKeySet(keys[i], keys[i+1], []byte("@5"), nil, nil))
@@ -2989,10 +2720,10 @@ func BenchmarkSeekPrefixTombstones(b *testing.B) {
 		Comparer:           testkeys.Comparer,
 		FormatMajorVersion: FormatNewest,
 	}).EnsureDefaults()
-	wOpts := o.MakeWriterOptions(numLevels-1, FormatNewest.MaxTableFormat())
 	d, err := Open("", o)
 	require.NoError(b, err)
 	defer func() { require.NoError(b, d.Close()) }()
+	wOpts := o.MakeWriterOptions(numLevels-1, d.TableFormat())
 
 	// Keep a snapshot open for the duration of the test to prevent elision-only
 	// compactions from removing the ingested files containing exclusively
@@ -3000,15 +2731,15 @@ func BenchmarkSeekPrefixTombstones(b *testing.B) {
 	defer d.NewSnapshot().Close()
 
 	ks := testkeys.Alpha(2)
-	for i := 0; i < ks.Count()-1; i++ {
+	for i := int64(0); i < ks.Count()-1; i++ {
 		func() {
 			filename := fmt.Sprintf("ext%2d", i)
-			f, err := o.FS.Create(filename)
+			f, err := o.FS.Create(filename, vfs.WriteCategoryUnspecified)
 			require.NoError(b, err)
 			w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), wOpts)
 			require.NoError(b, w.DeleteRange(testkeys.Key(ks, i), testkeys.Key(ks, i+1)))
 			require.NoError(b, w.Close())
-			require.NoError(b, d.Ingest([]string{filename}))
+			require.NoError(b, d.Ingest(context.Background(), []string{filename}))
 		}()
 	}
 
@@ -3017,11 +2748,338 @@ func BenchmarkSeekPrefixTombstones(b *testing.B) {
 	d.mu.Unlock()
 
 	seekKey := testkeys.Key(ks, 1)
-	iter := d.NewIter(nil)
+	iter, _ := d.NewIter(nil)
 	defer iter.Close()
 	b.ResetTimer()
 	defer b.StopTimer()
 	for i := 0; i < b.N; i++ {
 		iter.SeekPrefixGE(seekKey)
+	}
+}
+
+func waitForCompactionsAndTableStats(d *DB) {
+	d.mu.Lock()
+	// NB: Wait for table stats because some compaction types rely
+	// on table stats to be collected.
+	d.waitTableStats()
+	for d.mu.compact.compactingCount > 0 {
+		d.mu.compact.cond.Wait()
+		d.waitTableStats()
+	}
+	d.mu.Unlock()
+}
+
+// BenchmarkPointDeletedSwath benchmarks iterator operations on large-ish
+// (hundreds of MBs) databases containing broad swaths of keys removed by point
+// tombstones.
+func BenchmarkPointDeletedSwath(b *testing.B) {
+	const maxKeyLen = 5
+	ks := testkeys.Alpha(maxKeyLen)
+
+	opts := func() *Options {
+		return (&Options{
+			FS:                 vfs.NewMem(),
+			Comparer:           testkeys.Comparer,
+			FormatMajorVersion: FormatNewest,
+		}).EnsureDefaults()
+	}
+	type iteratorOp struct {
+		name string
+		fn   func(*Iterator, testkeys.Keyspace, *rand.Rand)
+	}
+	var iterKeyBuf [maxKeyLen]byte
+
+	iterOps := []iteratorOp{
+		{
+			name: "seek-prefix-ge", fn: func(iter *Iterator, ks testkeys.Keyspace, rng *rand.Rand) {
+				n := testkeys.WriteKey(iterKeyBuf[:], ks, int64(rng.IntN(int(ks.Count()))))
+				_ = iter.SeekPrefixGE(iterKeyBuf[:n])
+			},
+		},
+		{
+			name: "seek-ge", fn: func(iter *Iterator, ks testkeys.Keyspace, rng *rand.Rand) {
+				n := testkeys.WriteKey(iterKeyBuf[:], ks, int64(rng.IntN(int(ks.Count()))))
+				_ = iter.SeekGE(iterKeyBuf[:n])
+			},
+		},
+		{
+			name: "iterate", fn: func(iter *Iterator, ks testkeys.Keyspace, rng *rand.Rand) {
+				valid := iter.Next()
+				if !valid {
+					iter.First()
+				}
+			},
+		},
+	}
+
+	// Populate an initial database with point keys at every key in the `ks`
+	// keyspace.
+	populated := withStateSetup(b, vfs.NewMem(), opts(), populateKeyspaceSetup(ks))
+	for _, gapLength := range []int{100, 1_000, 10_000, 100_000, 200_000, 400_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000} {
+		b.Run(fmt.Sprintf("gap=%d", gapLength), func(b *testing.B) {
+			// Extend the `populated` initial database with DELs deleting all
+			// the middle keys in the keyspace in a contiguous swath of
+			// `gapLength` keys.
+			gapDeleted := withStateSetup(b, populated, opts(), deleteGapSetup(ks, gapLength))
+
+			for _, op := range iterOps {
+				b.Run(op.name, func(b *testing.B) {
+					// Run each instance of the test in a fresh DB constructed
+					// from `compacted`. This ensures background compactions
+					// from one iterator operation don't affect another iterator
+					// option.
+					withStateSetup(b, gapDeleted, opts(), func(_ testing.TB, d *DB) {
+						rng := rand.New(rand.NewPCG(0, 1) /* fixed seed */)
+						iter, err := d.NewIter(nil)
+						require.NoError(b, err)
+						b.ResetTimer()
+						for i := 0; i < b.N; i++ {
+							op.fn(iter, ks, rng)
+						}
+						b.StopTimer()
+						require.NoError(b, iter.Close())
+					})
+				})
+			}
+		})
+	}
+}
+
+func withStateSetup(
+	t testing.TB, initial vfs.FS, opts *Options, setup func(testing.TB, *DB),
+) vfs.FS {
+	ok, err := vfs.Clone(initial, opts.FS, "", "", vfs.CloneSync)
+	require.NoError(t, err)
+	require.True(t, ok)
+	d, err := Open("", opts)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, d.Close()) }()
+	setup(t, d)
+	return opts.FS
+}
+
+func populateKeyspaceSetup(ks testkeys.Keyspace) func(testing.TB, *DB) {
+	const valSize = 256
+	return func(t testing.TB, d *DB) {
+		t.Logf("Populating keyspace with %d keys, each with %d-byte values", ks.Count(), valSize)
+		// Parallelize population by divvying up the keyspace.
+		var grp errgroup.Group
+		loadKeyspaces := testkeys.Divvy(ks, 20)
+		var progress atomic.Uint64
+		for l := 0; l < len(loadKeyspaces); l++ {
+			l := l
+			grp.Go(func() error {
+				rng := rand.New(rand.NewPCG(1, 1))
+				batch := d.NewBatch()
+				key := make([]byte, ks.MaxLen())
+				var val [valSize]byte
+				for i := int64(0); i < loadKeyspaces[l].Count(); i++ {
+					for j := range val {
+						val[j] = byte(rng.Uint32())
+					}
+					n := testkeys.WriteKey(key, loadKeyspaces[l], i)
+					if err := batch.Set(key[:n], val[:], nil); err != nil {
+						return err
+					}
+					if batch.Len() >= 10<<10 /* 10 kib */ {
+						count := batch.Count()
+						require.NoError(t, batch.Commit(NoSync))
+						if newTotal := progress.Add(uint64(count)); (newTotal / (uint64(ks.Count()) / 100)) != (newTotal-uint64(count))/uint64(ks.Count()/100) {
+							t.Logf("%.1f%% populated", 100.0*(float64(newTotal)/float64(ks.Count())))
+						}
+						batch = d.NewBatch()
+						d.AsyncFlush()
+					}
+				}
+				if !batch.Empty() {
+					return batch.Commit(NoSync)
+				}
+				return nil
+			})
+		}
+		require.NoError(t, grp.Wait())
+	}
+}
+
+func deleteGapSetup(ks testkeys.Keyspace, gapLength int) func(testing.TB, *DB) {
+	return func(t testing.TB, d *DB) {
+		midpoint := ks.Count() / 2
+		gapStart := midpoint - int64(gapLength/2)
+		gapEnd := midpoint + int64(gapLength/2+(gapLength%2))
+
+		batch := d.NewBatch()
+		key := make([]byte, ks.MaxLen())
+		for i := gapStart; i <= gapEnd; i++ {
+			n := testkeys.WriteKey(key, ks, i)
+			if err := batch.Delete(key[:n], nil); err != nil {
+				t.Fatal(err)
+			}
+			if batch.Len() >= 10<<10 /* 10 kib */ {
+				if err := batch.Commit(NoSync); err != nil {
+					t.Fatal(err)
+				}
+				batch = d.NewBatch()
+			}
+		}
+		if !batch.Empty() {
+			if err := batch.Commit(NoSync); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := d.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		waitForCompactionsAndTableStats(d)
+	}
+}
+
+func runBenchmarkQueueWorkload(b *testing.B, deleteRatio float32, initOps int, valueSize int) {
+	const queueCount = 8
+	// These should be large enough to assign a unique key to each item in the
+	// queue.
+	const maxQueueIDLen = 1
+	const maxItemLen = 7
+	const maxKeyLen = maxQueueIDLen + 1 + maxItemLen
+	queueIDKeyspace := testkeys.Alpha(maxQueueIDLen)
+	itemKeyspace := testkeys.Alpha(maxItemLen)
+	key := make([]byte, maxKeyLen)
+	val := make([]byte, valueSize)
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
+
+	getKey := func(q int, i int) []byte {
+		n := testkeys.WriteKey(key, queueIDKeyspace, int64(q))
+		key[n] = '/'
+		prefixLen := n + 1
+		n = testkeys.WriteKey(key[prefixLen:], itemKeyspace, int64(i))
+		return key[:prefixLen+n]
+	}
+
+	type Queue struct {
+		start int
+		end   int // exclusive
+	}
+	var queues = make([]*Queue, queueCount)
+	for i := 0; i < queueCount; i++ {
+		queues[i] = &Queue{}
+	}
+
+	o := (&Options{
+		Cache:              cache.New(0), // disable cache
+		DisableWAL:         true,
+		FS:                 vfs.NewMem(),
+		Comparer:           testkeys.Comparer,
+		FormatMajorVersion: FormatNewest,
+	}).EnsureDefaults()
+
+	d, err := Open("", o)
+	require.NoError(b, err)
+
+	processQueueOnce := func(batch *Batch) {
+		for {
+			// Randomly pick a queue to process.
+			q := rng.IntN(queueCount)
+			queue := queues[q]
+
+			isDelete := rng.Float32() < deleteRatio
+
+			if isDelete {
+				// Only process the queue if it's not empty. Otherwise, retry
+				// with a different queue.
+				if queue.start != queue.end {
+					require.NoError(b, batch.Delete(getKey(q, queue.start), nil))
+					queue.start = (queue.start + 1) % int(itemKeyspace.Count())
+					break
+				}
+			} else {
+				// Append to the queue.
+				require.NoError(b, batch.Set(getKey(q, queue.end), val, nil))
+				queue.end = (queue.end + 1) % int(itemKeyspace.Count())
+				break
+			}
+		}
+	}
+
+	// First, process queues initialOps times.
+	batch := d.NewBatch()
+	for i := 0; i < initOps; i++ {
+		processQueueOnce(batch)
+		// Use a large batch size to speed up initialization.
+		if batch.Len() >= 10<<24 /* 167 MiB */ {
+			require.NoError(b, batch.Commit(NoSync))
+			batch = d.NewBatch()
+		}
+	}
+	require.NoError(b, batch.Commit(NoSync))
+	// Manually flush in case the last batch was small.
+	_, err = d.AsyncFlush()
+	require.NoError(b, err)
+
+	waitForCompactionsAndTableStats(d)
+
+	// Log the number of tombstones and live keys in each level after
+	// background compactions are complete.
+	b.Log("LSM after compactions:")
+	firstIter, _ := d.NewIter(nil)
+	firstIter.First()
+	lastIter, _ := d.NewIter(nil)
+	lastIter.Last()
+	stats, _ := d.ScanStatistics(context.Background(), firstIter.Key(), lastIter.Key(), ScanStatisticsOptions{})
+	require.NoError(b, firstIter.Close())
+	require.NoError(b, lastIter.Close())
+	metrics := d.Metrics()
+	for i := 0; i < numLevels; i++ {
+		numTombstones := stats.Levels[i].KindsCount[base.InternalKeyKindDelete]
+		numSets := stats.Levels[i].KindsCount[base.InternalKeyKindSet]
+		numTables := metrics.Levels[i].NumFiles
+		if numSets > 0 {
+			b.Logf("L%d: %d tombstones, %d sets, %d sstables\n", i, numTombstones, numSets, numTables)
+		}
+	}
+
+	// Seek to the start of each queue.
+	b.Run("seek", func(b *testing.B) {
+		iter, _ := d.NewIter(nil)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			for q := 0; q < queueCount; q++ {
+				iter.SeekGE(getKey(q, 0))
+			}
+		}
+		b.StopTimer()
+		require.NoError(b, iter.Close())
+	})
+
+	require.NoError(b, d.Close())
+}
+
+// BenchmarkQueueWorkload benchmarks a workload consisting of multiple queues
+// that are all being processed at the same time. Processing a queue entails
+// either appending to the end of the queue (a Set operation) or deleting from
+// the start of the queue (a Delete operation). The goal is to detect cases
+// where we see a large buildup of point tombstones at the beginning of each
+// queue, which leads to the slowdown of SeekGE(<start of queue>). To that end,
+// the test subbenchmarks a series of configurations that each 1) process the
+// queues a certain number of times and then 2) benchmark both the queue
+// processing throughput and SeekGE performance. See
+// https://github.com/facebook/rocksdb/wiki/Implement-Queue-Service-Using-RocksDB
+// for more information.
+func BenchmarkQueueWorkload(b *testing.B) {
+	// The portion of processing ops that will be deletes for each subbenchmark.
+	var deleteRatios = []float32{0.1, 0.3, 0.5}
+	// The number of times queues will be processed before running each
+	// subbenchmark.
+	var initOps = []int{400_000, 800_000, 1_200_000, 2_000_000, 3_500_000, 5_000_000, 7_500_000}
+	// We vary the value size to identify how compaction behaves when the
+	// relative sizes of tombstones and the keys they delete are different.
+	var valueSizes = []int{128, 2048}
+
+	for _, deleteRatio := range deleteRatios {
+		for _, valueSize := range valueSizes {
+			for _, numInitOps := range initOps {
+				b.Run(fmt.Sprintf("initial_ops=%d/deleteRatio=%.2f/valueSize=%d", numInitOps, deleteRatio, valueSize), func(b *testing.B) {
+					runBenchmarkQueueWorkload(b, deleteRatio, numInitOps, valueSize)
+				})
+			}
+		}
 	}
 }

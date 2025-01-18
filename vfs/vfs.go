@@ -5,6 +5,7 @@
 package vfs
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -35,7 +36,7 @@ type File interface {
 	// Preallocate optionally preallocates storage for `length` at `offset`
 	// within the file. Implementations may choose to do nothing.
 	Preallocate(offset, length int64) error
-	Stat() (os.FileInfo, error)
+	Stat() (FileInfo, error)
 	Sync() error
 
 	// SyncTo requests that a prefix of the file's data be synced to stable
@@ -93,7 +94,7 @@ type FS interface {
 	// Create creates the named file for reading and writing. If a file
 	// already exists at the provided name, it's removed first ensuring the
 	// resulting file descriptor points to a new inode.
-	Create(name string) (File, error)
+	Create(name string, category DiskWriteCategory) (File, error)
 
 	// Link creates newname as a hard link to the oldname file.
 	Link(oldname, newname string) error
@@ -103,7 +104,7 @@ type FS interface {
 
 	// OpenReadWrite opens the named file for reading and writing. If the file
 	// does not exist, it is created.
-	OpenReadWrite(name string, opts ...OpenOption) (File, error)
+	OpenReadWrite(name string, category DiskWriteCategory, opts ...OpenOption) (File, error)
 
 	// OpenDir opens the named directory for syncing.
 	OpenDir(name string) (File, error)
@@ -125,7 +126,7 @@ type FS interface {
 	// to reuse oldname, and simply create the file with newname -- in this case the implementation
 	// should delete oldname. If the caller calls this function with an oldname that does not exist,
 	// the implementation may return an error.
-	ReuseForWrite(oldname, newname string) (File, error)
+	ReuseForWrite(oldname, newname string, category DiskWriteCategory) (File, error)
 
 	// MkdirAll creates a directory and all necessary parents. The permission
 	// bits perm have the same semantics as in os.MkdirAll. If the directory
@@ -156,8 +157,8 @@ type FS interface {
 	// relative to dir.
 	List(dir string) ([]string, error)
 
-	// Stat returns an os.FileInfo describing the named file.
-	Stat(name string) (os.FileInfo, error)
+	// Stat returns an FileInfo describing the named file.
+	Stat(name string) (FileInfo, error)
 
 	// PathBase returns the last element of path. Trailing path separators are
 	// removed before extracting the last element. If the path is empty, PathBase
@@ -175,6 +176,48 @@ type FS interface {
 	// GetDiskUsage returns disk space statistics for the filesystem where
 	// path is any file or directory within that filesystem.
 	GetDiskUsage(path string) (DiskUsage, error)
+
+	// Unwrap is implemented by "wrapping" filesystems (those that add some
+	// functionality on top of an underlying FS); it returns the wrapped FS.
+	// It is used by vfs.Root.
+	//
+	// Returns nil if this is not a wrapping filesystem.
+	Unwrap() FS
+}
+
+// A DeviceID uniquely identifies a block device on which filesystem data is
+// persisted.
+type DeviceID struct {
+	major uint32
+	minor uint32
+}
+
+// String returns the string representation of the device ID.
+func (d DeviceID) String() string {
+	return fmt.Sprintf("%d:%d", d.major, d.minor)
+}
+
+// FileInfo describes a file.
+type FileInfo interface {
+	os.FileInfo
+	// DeviceID returns the ID of the device on which the file resides.
+	DeviceID() DeviceID
+}
+
+func maybeWrapFileInfo(fi os.FileInfo, err error) (FileInfo, error) {
+	if err != nil {
+		return nil, err
+	}
+	return defaultFileInfo{FileInfo: fi}, nil
+}
+
+type defaultFileInfo struct {
+	os.FileInfo
+}
+
+// DeviceID returns the ID of the device on which the file resides.
+func (fi defaultFileInfo) DeviceID() DeviceID {
+	return deviceIDFromFileInfo(fi.FileInfo)
 }
 
 // DiskUsage summarizes disk space usage on a filesystem.
@@ -201,7 +244,7 @@ func wrapOSFile(f *os.File) File {
 	return wrapOSFileImpl(f)
 }
 
-func (defaultFS) Create(name string) (File, error) {
+func (defaultFS) Create(name string, category DiskWriteCategory) (File, error) {
 	const openFlags = os.O_RDWR | os.O_CREATE | os.O_EXCL | syscall.O_CLOEXEC
 
 	osFile, err := os.OpenFile(name, openFlags, 0666)
@@ -238,7 +281,9 @@ func (defaultFS) Open(name string, opts ...OpenOption) (File, error) {
 	return file, nil
 }
 
-func (defaultFS) OpenReadWrite(name string, opts ...OpenOption) (File, error) {
+func (defaultFS) OpenReadWrite(
+	name string, category DiskWriteCategory, opts ...OpenOption,
+) (File, error) {
 	osFile, err := os.OpenFile(name, os.O_RDWR|syscall.O_CLOEXEC|os.O_CREATE, 0666)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -262,7 +307,9 @@ func (defaultFS) Rename(oldname, newname string) error {
 	return errors.WithStack(os.Rename(oldname, newname))
 }
 
-func (fs defaultFS) ReuseForWrite(oldname, newname string) (File, error) {
+func (fs defaultFS) ReuseForWrite(
+	oldname, newname string, category DiskWriteCategory,
+) (File, error) {
 	if err := fs.Rename(oldname, newname); err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -284,9 +331,12 @@ func (defaultFS) List(dir string) ([]string, error) {
 	return dirnames, errors.WithStack(err)
 }
 
-func (defaultFS) Stat(name string) (os.FileInfo, error) {
+func (defaultFS) Stat(name string) (FileInfo, error) {
 	finfo, err := os.Stat(name)
-	return finfo, errors.WithStack(err)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return defaultFileInfo{finfo}, nil
 }
 
 func (defaultFS) PathBase(path string) string {
@@ -300,6 +350,8 @@ func (defaultFS) PathJoin(elem ...string) string {
 func (defaultFS) PathDir(path string) string {
 	return filepath.Dir(path)
 }
+
+func (defaultFS) Unwrap() FS { return nil }
 
 type randomReadsOption struct{}
 
@@ -344,7 +396,7 @@ func CopyAcrossFS(srcFS FS, oldname string, dstFS FS, newname string) error {
 	}
 	defer src.Close()
 
-	dst, err := dstFS.Create(newname)
+	dst, err := dstFS.Create(newname, WriteCategoryUnspecified)
 	if err != nil {
 		return err
 	}
@@ -365,7 +417,7 @@ func LimitedCopy(fs FS, oldname, newname string, maxBytes int64) error {
 	}
 	defer src.Close()
 
-	dst, err := fs.Create(newname)
+	dst, err := fs.Create(newname, WriteCategoryUnspecified)
 	if err != nil {
 		return err
 	}
@@ -401,18 +453,13 @@ func LinkOrCopy(fs FS, oldname, newname string) error {
 // Root returns the base FS implementation, unwrapping all nested FSs that
 // expose an Unwrap method.
 func Root(fs FS) FS {
-	type unwrapper interface {
-		Unwrap() FS
-	}
-
 	for {
-		u, ok := fs.(unwrapper)
-		if !ok {
-			break
+		n := fs.Unwrap()
+		if n == nil {
+			return fs
 		}
-		fs = u.Unwrap()
+		fs = n
 	}
-	return fs
 }
 
 // ErrUnsupported may be returned a FS when it does not support an operation.

@@ -6,11 +6,14 @@ package pebble
 
 import (
 	"bytes"
+	"context"
 	crand "crypto/rand"
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,40 +21,33 @@ import (
 
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/internal/keyspan"
-	"github.com/cockroachdb/pebble/internal/rangedel"
 	"github.com/cockroachdb/pebble/internal/rangekey"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/vfs/errorfs"
+	"github.com/cockroachdb/pebble/wal"
+	"github.com/ghemawat/stream"
 	"github.com/stretchr/testify/require"
 )
-
-type iterCmdOpts struct {
-	verboseKey bool
-	stats      *base.InternalIteratorStats
-}
-
-type iterCmdOpt func(*iterCmdOpts)
-
-func iterCmdVerboseKey(opts *iterCmdOpts) { opts.verboseKey = true }
-
-func iterCmdStats(stats *base.InternalIteratorStats) iterCmdOpt {
-	return func(opts *iterCmdOpts) {
-		opts.stats = stats
-	}
-}
 
 func runGetCmd(t testing.TB, td *datadriven.TestData, d *DB) string {
 	snap := Snapshot{
 		db:     d,
-		seqNum: InternalKeySeqNumMax,
+		seqNum: base.SeqNumMax,
 	}
-	td.MaybeScanArgs(t, "seq", &snap.seqNum)
+	if td.HasArg("seq") {
+		var n uint64
+		td.ScanArgs(t, "seq", &n)
+		snap.seqNum = base.SeqNum(n)
+	}
 
 	var buf bytes.Buffer
 	for _, data := range strings.Split(td.Input, "\n") {
@@ -130,8 +126,6 @@ func runIterCmd(d *datadriven.TestData, iter *Iterator, closeIter bool) string {
 					op = "seekge"
 				case seekLTLastPositioningOp:
 					op = "seeklt"
-				case invalidatedLastPositionOp:
-					op = "invalidate"
 				}
 				fmt.Fprintf(&b, "%s=%q\n", field, op)
 			default:
@@ -144,6 +138,27 @@ func runIterCmd(d *datadriven.TestData, iter *Iterator, closeIter bool) string {
 			}
 			validityState = iter.NextWithLimit([]byte(parts[1]))
 			printValidityState = true
+		case "internal-next":
+			validity, keyKind := iter.internalNext()
+			switch validity {
+			case internalNextError:
+				fmt.Fprintf(&b, "err: %s\n", iter.Error())
+			case internalNextExhausted:
+				fmt.Fprint(&b, ".\n")
+			case internalNextValid:
+				fmt.Fprintf(&b, "%s\n", keyKind)
+			default:
+				panic("unreachable")
+			}
+			continue
+		case "can-deterministically-single-delete":
+			ok, err := CanDeterministicallySingleDelete(iter)
+			if err != nil {
+				fmt.Fprintf(&b, "err: %s\n", err)
+			} else {
+				fmt.Fprintf(&b, "%t\n", ok)
+			}
+			continue
 		case "prev-limit":
 			if len(parts) != 2 {
 				return "prev-limit <limit>\n"
@@ -254,7 +269,7 @@ func runIterCmd(d *datadriven.TestData, iter *Iterator, closeIter bool) string {
 func parseIterOptions(
 	opts *IterOptions, ref *IterOptions, parts []string,
 ) (foundAny bool, err error) {
-	const usageString = "[lower=<lower>] [upper=<upper>] [key-types=point|range|both] [mask-suffix=<suffix>] [mask-filter=<bool>] [only-durable=<bool>] [table-filter=reuse|none] [point-filters=reuse|none]\n"
+	const usageString = "[lower=<lower>] [upper=<upper>] [key-types=point|range|both] [mask-suffix=<suffix>] [mask-filter=<bool>] [only-durable=<bool>] point-filters=reuse|none]\n"
 	for _, part := range parts {
 		arg := strings.SplitN(part, "=", 2)
 		if len(arg) != 2 {
@@ -291,15 +306,6 @@ func parseIterOptions(
 			opts.RangeKeyMasking.Filter = func() BlockPropertyFilterMask {
 				return sstable.NewTestKeysMaskingFilter()
 			}
-		case "table-filter":
-			switch arg[1] {
-			case "reuse":
-				opts.TableFilter = ref.TableFilter
-			case "none":
-				opts.TableFilter = nil
-			default:
-				return false, errors.Newf("unknown arg table-filter=%q:\n%s", arg[1], usageString)
-			}
 		case "only-durable":
 			var err error
 			opts.OnlyReadGuaranteedDurable, err = strconv.ParseBool(arg[1])
@@ -328,15 +334,13 @@ func printIterState(
 			validityStateStr = " at-limit"
 		}
 	}
-	if err := iter.Error(); err != nil {
-		fmt.Fprintf(b, "err=%v\n", err)
-	} else if validity == IterValid {
+	if validity == IterValid {
 		switch {
 		case iter.opts.pointKeys():
 			hasPoint, hasRange := iter.HasPointAndRange()
 			fmt.Fprintf(b, "%s:%s (", iter.Key(), validityStateStr)
 			if hasPoint {
-				fmt.Fprintf(b, "%s, ", iter.Value())
+				fmt.Fprintf(b, "%s, ", formatASCIIValue(iter.Value()))
 			} else {
 				fmt.Fprint(b, "., ")
 			}
@@ -369,7 +373,11 @@ func printIterState(
 		}
 		fmt.Fprintln(b)
 	} else {
-		fmt.Fprintf(b, ".%s\n", validityStateStr)
+		if err := iter.Error(); err != nil {
+			fmt.Fprintf(b, "err=%v\n", err)
+		} else {
+			fmt.Fprintf(b, ".%s\n", validityStateStr)
+		}
 	}
 }
 
@@ -381,130 +389,43 @@ func formatASCIIKey(b []byte) string {
 	return string(b)
 }
 
+func formatASCIIValue(b []byte) string {
+	if len(b) > 1<<10 {
+		return fmt.Sprintf("[LARGE VALUE len=%d]", len(b))
+	}
+	if bytes.IndexFunc(b, func(r rune) bool { return r < '!' || r > 'z' }) != -1 {
+		// This key is not just legible ASCII characters. Quote it.
+		return fmt.Sprintf("%q", b)
+	}
+	return string(b)
+}
+
 func writeRangeKeys(b io.Writer, iter *Iterator) {
 	rangeKeys := iter.RangeKeys()
 	for j := 0; j < len(rangeKeys); j++ {
 		if j > 0 {
 			fmt.Fprint(b, ",")
 		}
-		fmt.Fprintf(b, " %s=%s", rangeKeys[j].Suffix, rangeKeys[j].Value)
+		fmt.Fprintf(b, " %s=%s", rangeKeys[j].Suffix, formatASCIIValue(rangeKeys[j].Value))
 	}
 }
 
-func runInternalIterCmd(
-	t *testing.T, d *datadriven.TestData, iter internalIterator, opts ...iterCmdOpt,
-) string {
-	var o iterCmdOpts
-	for _, opt := range opts {
-		opt(&o)
-	}
-
-	getKV := func(key *InternalKey, val LazyValue) (*InternalKey, []byte) {
-		v, _, err := val.Value(nil)
-		require.NoError(t, err)
-		return key, v
-	}
-	var b bytes.Buffer
-	var prefix []byte
-	for _, line := range strings.Split(d.Input, "\n") {
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
-			continue
+func parseValue(s string) []byte {
+	if strings.HasPrefix(s, "<rand-bytes=") {
+		s = strings.TrimPrefix(s, "<rand-bytes=")
+		s = strings.TrimSuffix(s, ">")
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			panic(err)
 		}
-		var key *InternalKey
-		var value []byte
-		switch parts[0] {
-		case "seek-ge":
-			if len(parts) < 2 || len(parts) > 3 {
-				return "seek-ge <key> [<try-seek-using-next>]\n"
-			}
-			prefix = nil
-			var flags base.SeekGEFlags
-			if len(parts) == 3 {
-				if trySeekUsingNext, err := strconv.ParseBool(parts[2]); err != nil {
-					return err.Error()
-				} else if trySeekUsingNext {
-					flags = flags.EnableTrySeekUsingNext()
-				}
-			}
-			key, value = getKV(iter.SeekGE([]byte(strings.TrimSpace(parts[1])), flags))
-		case "seek-prefix-ge":
-			if len(parts) != 2 && len(parts) != 3 {
-				return "seek-prefix-ge <key> [<try-seek-using-next>]\n"
-			}
-			prefix = []byte(strings.TrimSpace(parts[1]))
-			var flags base.SeekGEFlags
-			if len(parts) == 3 {
-				if trySeekUsingNext, err := strconv.ParseBool(parts[2]); err != nil {
-					return err.Error()
-				} else if trySeekUsingNext {
-					flags = flags.EnableTrySeekUsingNext()
-				}
-			}
-			key, value = getKV(iter.SeekPrefixGE(prefix, prefix /* key */, flags))
-		case "seek-lt":
-			if len(parts) != 2 {
-				return "seek-lt <key>\n"
-			}
-			prefix = nil
-			key, value = getKV(iter.SeekLT([]byte(strings.TrimSpace(parts[1])), base.SeekLTFlagsNone))
-		case "first":
-			prefix = nil
-			key, value = getKV(iter.First())
-		case "last":
-			prefix = nil
-			key, value = getKV(iter.Last())
-		case "next":
-			key, value = getKV(iter.Next())
-		case "prev":
-			key, value = getKV(iter.Prev())
-		case "set-bounds":
-			if len(parts) <= 1 || len(parts) > 3 {
-				return "set-bounds lower=<lower> upper=<upper>\n"
-			}
-			var lower []byte
-			var upper []byte
-			for _, part := range parts[1:] {
-				arg := strings.Split(strings.TrimSpace(part), "=")
-				switch arg[0] {
-				case "lower":
-					lower = []byte(arg[1])
-				case "upper":
-					upper = []byte(arg[1])
-				default:
-					return fmt.Sprintf("set-bounds: unknown arg: %s", arg)
-				}
-			}
-			iter.SetBounds(lower, upper)
-			continue
-		case "stats":
-			if o.stats != nil {
-				// The timing is non-deterministic, so set to 0.
-				o.stats.BlockReadDuration = 0
-				fmt.Fprintf(&b, "%+v\n", *o.stats)
-			}
-			continue
-		case "reset-stats":
-			if o.stats != nil {
-				*o.stats = base.InternalIteratorStats{}
-			}
-			continue
-		default:
-			return fmt.Sprintf("unknown op: %s", parts[0])
+		b := make([]byte, n)
+		rnd := rand.New(rand.NewPCG(0, uint64(n)))
+		for i := range b {
+			b[i] = byte(rnd.Uint32())
 		}
-		if key != nil {
-			if o.verboseKey {
-				fmt.Fprintf(&b, "%s:%s\n", key, value)
-			} else {
-				fmt.Fprintf(&b, "%s:%s\n", key.UserKey, value)
-			}
-		} else if err := iter.Error(); err != nil {
-			fmt.Fprintf(&b, "err=%v\n", err)
-		} else {
-			fmt.Fprintf(&b, ".\n")
-		}
+		return b
 	}
-	return b.String()
+	return []byte(s)
 }
 
 func runBatchDefineCmd(d *datadriven.TestData, b *Batch) error {
@@ -522,7 +443,24 @@ func runBatchDefineCmd(d *datadriven.TestData, b *Batch) error {
 			if len(parts) != 3 {
 				return errors.Errorf("%s expects 2 arguments", parts[0])
 			}
-			err = b.Set([]byte(parts[1]), []byte(parts[2]), nil)
+			err = b.Set([]byte(parts[1]), parseValue(parts[2]), nil)
+
+		case "set-multiple":
+			if len(parts) != 3 {
+				return errors.Errorf("%s expects 2 arguments (n and prefix)", parts[0])
+			}
+			n, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				return err
+			}
+			for i := uint64(0); i < n; i++ {
+				key := fmt.Sprintf("%s-%05d", parts[2], i)
+				val := fmt.Sprintf("val-%05d", i)
+				if err := b.Set([]byte(key), []byte(val), nil); err != nil {
+					return err
+				}
+			}
+
 		case "del":
 			if len(parts) != 2 {
 				return errors.Errorf("%s expects 1 argument", parts[0])
@@ -530,7 +468,7 @@ func runBatchDefineCmd(d *datadriven.TestData, b *Batch) error {
 			err = b.Delete([]byte(parts[1]), nil)
 		case "del-sized":
 			if len(parts) != 3 {
-				return errors.Errorf("%s expects 1 argument", parts[0])
+				return errors.Errorf("%s expects 2 arguments", parts[0])
 			}
 			var valSize uint64
 			valSize, err = strconv.ParseUint(parts[2], 10, 32)
@@ -552,16 +490,20 @@ func runBatchDefineCmd(d *datadriven.TestData, b *Batch) error {
 			if len(parts) != 3 {
 				return errors.Errorf("%s expects 2 arguments", parts[0])
 			}
-			err = b.Merge([]byte(parts[1]), []byte(parts[2]), nil)
+			err = b.Merge([]byte(parts[1]), parseValue(parts[2]), nil)
 		case "range-key-set":
-			if len(parts) != 5 {
-				return errors.Errorf("%s expects 4 arguments", parts[0])
+			if len(parts) < 4 || len(parts) > 5 {
+				return errors.Errorf("%s expects 3 or 4 arguments", parts[0])
+			}
+			var val []byte
+			if len(parts) == 5 {
+				val = parseValue(parts[4])
 			}
 			err = b.RangeKeySet(
 				[]byte(parts[1]),
 				[]byte(parts[2]),
 				[]byte(parts[3]),
-				[]byte(parts[4]),
+				val,
 				nil)
 		case "range-key-unset":
 			if len(parts) != 4 {
@@ -602,15 +544,12 @@ func runBuildRemoteCmd(td *datadriven.TestData, d *DB, storage remote.Storage) e
 	path := td.CmdArgs[0].String()
 
 	// Override table format, if provided.
-	tableFormat := d.opts.FormatMajorVersion.MaxTableFormat()
+	tableFormat := d.TableFormat()
+	var blockSize int64
 	for _, cmdArg := range td.CmdArgs[1:] {
 		switch cmdArg.Key {
 		case "format":
 			switch cmdArg.Vals[0] {
-			case "leveldb":
-				tableFormat = sstable.TableFormatLevelDB
-			case "rocksdbv2":
-				tableFormat = sstable.TableFormatRocksDBv2
 			case "pebblev1":
 				tableFormat = sstable.TableFormatPebblev1
 			case "pebblev2":
@@ -622,10 +561,22 @@ func runBuildRemoteCmd(td *datadriven.TestData, d *DB, storage remote.Storage) e
 			default:
 				return errors.Errorf("unknown format string %s", cmdArg.Vals[0])
 			}
+		case "block-size":
+			var err error
+			blockSize, err = strconv.ParseInt(cmdArg.Vals[0], 10, 64)
+			if err != nil {
+				return errors.Wrap(err, td.Pos)
+			}
 		}
 	}
 
 	writeOpts := d.opts.MakeWriterOptions(0 /* level */, tableFormat)
+	if blockSize == 0 && rand.IntN(4) == 0 {
+		// Force two-level indexes if not already forced on or off.
+		blockSize = 5
+	}
+	writeOpts.BlockSize = int(blockSize)
+	writeOpts.IndexBlockSize = int(blockSize)
 
 	f, err := storage.CreateObject(path)
 	if err != nil {
@@ -633,10 +584,10 @@ func runBuildRemoteCmd(td *datadriven.TestData, d *DB, storage remote.Storage) e
 	}
 	w := sstable.NewWriter(objstorageprovider.NewRemoteWritable(f), writeOpts)
 	iter := b.newInternalIter(nil)
-	for key, val := iter.First(); key != nil; key, val = iter.Next() {
-		tmp := *key
+	for kv := iter.First(); kv != nil; kv = iter.Next() {
+		tmp := kv.K
 		tmp.SetSeqNum(0)
-		if err := w.Add(tmp, val.InPlaceValue()); err != nil {
+		if err := w.Raw().AddWithForceObsolete(tmp, kv.InPlaceValue(), false); err != nil {
 			return err
 		}
 	}
@@ -645,19 +596,20 @@ func runBuildRemoteCmd(td *datadriven.TestData, d *DB, storage remote.Storage) e
 	}
 
 	if rdi := b.newRangeDelIter(nil, math.MaxUint64); rdi != nil {
-		for s := rdi.First(); s != nil; s = rdi.Next() {
-			err := rangedel.Encode(s, func(k base.InternalKey, v []byte) error {
-				k.SetSeqNum(0)
-				return w.Add(k, v)
-			})
-			if err != nil {
+		s, err := rdi.First()
+		for ; s != nil && err == nil; s, err = rdi.Next() {
+			if err = w.DeleteRange(s.Start, s.End); err != nil {
 				return err
 			}
+		}
+		if err != nil {
+			return err
 		}
 	}
 
 	if rki := b.newRangeKeyIter(nil, math.MaxUint64); rki != nil {
-		for s := rki.First(); s != nil; s = rki.Next() {
+		s, err := rki.First()
+		for ; s != nil; s, err = rki.Next() {
 			for _, k := range s.Keys {
 				var err error
 				switch k.Kind() {
@@ -675,13 +627,16 @@ func runBuildRemoteCmd(td *datadriven.TestData, d *DB, storage remote.Storage) e
 				}
 			}
 		}
+		if err != nil {
+			return err
+		}
 	}
 
 	return w.Close()
 }
 
 func runBuildCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
-	b := d.NewIndexedBatch()
+	b := newIndexedBatch(nil, d.opts.Comparer)
 	if err := runBatchDefineCmd(td, b); err != nil {
 		return err
 	}
@@ -692,15 +647,11 @@ func runBuildCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
 	path := td.CmdArgs[0].String()
 
 	// Override table format, if provided.
-	tableFormat := d.opts.FormatMajorVersion.MaxTableFormat()
+	tableFormat := d.TableFormat()
 	for _, cmdArg := range td.CmdArgs[1:] {
 		switch cmdArg.Key {
 		case "format":
 			switch cmdArg.Vals[0] {
-			case "leveldb":
-				tableFormat = sstable.TableFormatLevelDB
-			case "rocksdbv2":
-				tableFormat = sstable.TableFormatRocksDBv2
 			case "pebblev1":
 				tableFormat = sstable.TableFormatPebblev1
 			case "pebblev2":
@@ -717,16 +668,16 @@ func runBuildCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
 
 	writeOpts := d.opts.MakeWriterOptions(0 /* level */, tableFormat)
 
-	f, err := fs.Create(path)
+	f, err := fs.Create(path, vfs.WriteCategoryUnspecified)
 	if err != nil {
 		return err
 	}
 	w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), writeOpts)
 	iter := b.newInternalIter(nil)
-	for key, val := iter.First(); key != nil; key, val = iter.Next() {
-		tmp := *key
+	for kv := iter.First(); kv != nil; kv = iter.Next() {
+		tmp := kv.K
 		tmp.SetSeqNum(0)
-		if err := w.Add(tmp, val.InPlaceValue()); err != nil {
+		if err := w.Raw().AddWithForceObsolete(tmp, kv.InPlaceValue(), false); err != nil {
 			return err
 		}
 	}
@@ -735,19 +686,21 @@ func runBuildCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
 	}
 
 	if rdi := b.newRangeDelIter(nil, math.MaxUint64); rdi != nil {
-		for s := rdi.First(); s != nil; s = rdi.Next() {
-			err := rangedel.Encode(s, func(k base.InternalKey, v []byte) error {
-				k.SetSeqNum(0)
-				return w.Add(k, v)
-			})
+		s, err := rdi.First()
+		for ; s != nil && err == nil; s, err = rdi.Next() {
+			err = w.DeleteRange(s.Start, s.End)
 			if err != nil {
 				return err
 			}
 		}
+		if err != nil {
+			return err
+		}
 	}
 
 	if rki := b.newRangeKeyIter(nil, math.MaxUint64); rki != nil {
-		for s := rki.First(); s != nil; s = rki.Next() {
+		s, err := rki.First()
+		for ; s != nil; s, err = rki.Next() {
 			for _, k := range s.Keys {
 				var err error
 				switch k.Kind() {
@@ -764,6 +717,9 @@ func runBuildCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
 					return err
 				}
 			}
+		}
+		if err != nil {
+			return err
 		}
 	}
 
@@ -781,7 +737,7 @@ func runCompactCmd(td *datadriven.TestData, d *DB) error {
 	parallelize := td.HasArg("parallel")
 	if len(td.CmdArgs) >= 2 && strings.HasPrefix(td.CmdArgs[1].Key, "L") {
 		levelString := td.CmdArgs[1].String()
-		iStart := base.MakeInternalKey([]byte(parts[0]), InternalKeySeqNumMax, InternalKeyKindMax)
+		iStart := base.MakeInternalKey([]byte(parts[0]), base.SeqNumMax, InternalKeyKindMax)
 		iEnd := base.MakeInternalKey([]byte(parts[1]), 0, 0)
 		if levelString[0] != 'L' {
 			return errors.Errorf("expected L<n>: %s", levelString)
@@ -830,47 +786,29 @@ func runCompactCmd(td *datadriven.TestData, d *DB) error {
 func runDBDefineCmd(td *datadriven.TestData, opts *Options) (*DB, error) {
 	opts = opts.EnsureDefaults()
 	opts.FS = vfs.NewMem()
+	return runDBDefineCmdReuseFS(td, opts)
+}
 
-	if td.Input == "" {
-		// Empty LSM.
-		d, err := Open("", opts)
-		if err != nil {
-			return nil, err
-		}
-		return d, nil
+// runDBDefineCmdReuseFS is like runDBDefineCmd, but does not set opts.FS, expecting
+// the caller to have set an appropriate FS already.
+func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) {
+	opts = opts.EnsureDefaults()
+	if err := parseDBOptionsArgs(opts, td.CmdArgs); err != nil {
+		return nil, err
 	}
 
-	var snapshots []uint64
+	var snapshots []base.SeqNum
 	var levelMaxBytes map[int]int64
 	for _, arg := range td.CmdArgs {
 		switch arg.Key {
-		case "target-file-sizes":
-			opts.Levels = make([]LevelOptions, len(arg.Vals))
-			for i := range arg.Vals {
-				size, err := strconv.ParseInt(arg.Vals[i], 10, 64)
-				if err != nil {
-					return nil, err
-				}
-				opts.Levels[i].TargetFileSize = size
-			}
 		case "snapshots":
-			snapshots = make([]uint64, len(arg.Vals))
+			snapshots = make([]base.SeqNum, len(arg.Vals))
 			for i := range arg.Vals {
-				seqNum, err := strconv.ParseUint(arg.Vals[i], 10, 64)
-				if err != nil {
-					return nil, err
-				}
-				snapshots[i] = seqNum
+				snapshots[i] = base.ParseSeqNum(arg.Vals[i])
 				if i > 0 && snapshots[i] < snapshots[i-1] {
 					return nil, errors.New("Snapshots must be in ascending order")
 				}
 			}
-		case "lbase-max-bytes":
-			lbaseMaxBytes, err := strconv.ParseInt(arg.Vals[0], 10, 64)
-			if err != nil {
-				return nil, err
-			}
-			opts.LBaseMaxBytes = lbaseMaxBytes
 		case "level-max-bytes":
 			levelMaxBytes = map[int]int64{}
 			for i := range arg.Vals {
@@ -886,49 +824,32 @@ func runDBDefineCmd(td *datadriven.TestData, opts *Options) (*DB, error) {
 				}
 				levelMaxBytes[level] = size
 			}
-		case "auto-compactions":
-			switch arg.Vals[0] {
-			case "off":
-				opts.DisableAutomaticCompactions = true
-			case "on":
-				opts.DisableAutomaticCompactions = false
-			default:
-				return nil, errors.Errorf("Unrecognized %q %q arg value: %q", td.Cmd, arg.Key, arg.Vals[0])
-			}
-		case "enable-table-stats":
-			enable, err := strconv.ParseBool(arg.Vals[0])
-			if err != nil {
-				return nil, errors.Errorf("%s: could not parse %q as bool: %s", td.Cmd, arg.Vals[0], err)
-			}
-			opts.private.disableTableStats = !enable
-		case "block-size":
-			size, err := strconv.Atoi(arg.Vals[0])
-			if err != nil {
-				return nil, err
-			}
-			for _, levelOpts := range opts.Levels {
-				levelOpts.BlockSize = size
-			}
-		case "format-major-version":
-			fmv, err := strconv.Atoi(arg.Vals[0])
-			if err != nil {
-				return nil, err
-			}
-			opts.FormatMajorVersion = FormatMajorVersion(fmv)
 		}
 	}
+
 	d, err := Open("", opts)
 	if err != nil {
 		return nil, err
 	}
 	d.mu.Lock()
-	d.mu.versions.dynamicBaseLevel = false
+	defer d.mu.Unlock()
 	for i := range snapshots {
 		s := &Snapshot{db: d}
 		s.seqNum = snapshots[i]
 		d.mu.snapshots.pushBack(s)
 	}
-	defer d.mu.Unlock()
+	// Set the level max bytes only right before we exit; the body of this
+	// function expects it to be unset.
+	defer func() {
+		for l, maxBytes := range levelMaxBytes {
+			d.mu.versions.picker.(*compactionPickerByScore).levelMaxBytes[l] = maxBytes
+		}
+	}()
+	if td.Input == "" {
+		// Empty LSM.
+		return d, nil
+	}
+	d.mu.versions.dynamicBaseLevel = false
 
 	var mem *memTable
 	var start, end *base.InternalKey
@@ -944,9 +865,11 @@ func runDBDefineCmd(td *datadriven.TestData, opts *Options) (*DB, error) {
 			flushable: mem,
 			flushed:   make(chan struct{}),
 		}}
-		c := newFlush(d.opts, d.mu.versions.currentVersion(),
+		c, err := newFlush(d.opts, d.mu.versions.currentVersion(),
 			d.mu.versions.picker.getBaseLevel(), toFlush, time.Now())
-		c.disableSpanElision = true
+		if err != nil {
+			return err
+		}
 		// NB: define allows the test to exactly specify which keys go
 		// into which sstables. If the test has a small target file
 		// size to test grandparent limits, etc, the maxOutputFileSize
@@ -955,7 +878,7 @@ func runDBDefineCmd(td *datadriven.TestData, opts *Options) (*DB, error) {
 		// to the user-defined boundaries.
 		c.maxOutputFileSize = math.MaxUint64
 
-		newVE, _, _, err := d.runCompaction(0, c)
+		newVE, _, err := d.runCompaction(0, c)
 		if err != nil {
 			return err
 		}
@@ -1088,7 +1011,7 @@ func runDBDefineCmd(td *datadriven.TestData, opts *Options) (*DB, error) {
 			}
 			if data[:i] == "rangekey" {
 				span := keyspan.ParseSpan(data[i:])
-				err := rangekey.Encode(&span, func(k base.InternalKey, v []byte) error {
+				err := rangekey.Encode(span, func(k base.InternalKey, v []byte) error {
 					return mem.set(k, v)
 				})
 				if err != nil {
@@ -1102,9 +1025,9 @@ func runDBDefineCmd(td *datadriven.TestData, opts *Options) (*DB, error) {
 			var randBytes int
 			if n, err := fmt.Sscanf(valueStr, "<rand-bytes=%d>", &randBytes); err == nil && n == 1 {
 				value = make([]byte, randBytes)
-				rnd := rand.New(rand.NewSource(int64(key.SeqNum())))
-				if _, err := rnd.Read(value[:]); err != nil {
-					return nil, err
+				rnd := rand.New(rand.NewPCG(0, uint64(key.SeqNum())))
+				for j := range value {
+					value[j] = byte(rnd.Uint32())
 				}
 			}
 			if err := mem.set(key, value); err != nil {
@@ -1118,8 +1041,7 @@ func runDBDefineCmd(td *datadriven.TestData, opts *Options) (*DB, error) {
 	}
 
 	if len(ve.NewFiles) > 0 {
-		jobID := d.mu.nextJobID
-		d.mu.nextJobID++
+		jobID := d.newJobIDLocked()
 		d.mu.versions.logLock()
 		if err := d.mu.versions.logAndApply(jobID, ve, newFileMetrics(ve.NewFiles), false, func() []compactionInfo {
 			return nil
@@ -1128,10 +1050,6 @@ func runDBDefineCmd(td *datadriven.TestData, opts *Options) (*DB, error) {
 		}
 		d.updateReadStateLocked(nil)
 		d.updateTableStatsLocked(ve.NewFiles)
-	}
-
-	for l, maxBytes := range levelMaxBytes {
-		d.mu.versions.picker.(*compactionPickerByScore).levelMaxBytes[l] = maxBytes
 	}
 
 	return d, nil
@@ -1195,10 +1113,59 @@ func runVersionFileSizes(v *version) string {
 	return buf.String()
 }
 
-func runSSTablePropertiesCmd(t *testing.T, td *datadriven.TestData, d *DB) string {
-	var file string
+// Prints some metadata about some sstable which is currently in the latest
+// version.
+func runMetadataCommand(t *testing.T, td *datadriven.TestData, d *DB) string {
+	var file int
 	td.ScanArgs(t, "file", &file)
-	f, err := d.opts.FS.Open(file + ".sst")
+	var m *fileMetadata
+	d.mu.Lock()
+	currVersion := d.mu.versions.currentVersion()
+	for _, level := range currVersion.Levels {
+		lIter := level.Iter()
+		for f := lIter.First(); f != nil; f = lIter.Next() {
+			if f.FileNum == base.FileNum(uint64(file)) {
+				m = f
+				break
+			}
+		}
+	}
+	d.mu.Unlock()
+	var buf bytes.Buffer
+	// Add more metadata as needed.
+	fmt.Fprintf(&buf, "size: %d\n", m.Size)
+	return buf.String()
+}
+
+func runSSTablePropertiesCmd(t *testing.T, td *datadriven.TestData, d *DB) string {
+	var file int
+	td.ScanArgs(t, "file", &file)
+
+	// See if we can grab the FileMetadata associated with the file. This is needed
+	// to easily construct virtual sstable properties.
+	var m *fileMetadata
+	d.mu.Lock()
+	currVersion := d.mu.versions.currentVersion()
+	for _, level := range currVersion.Levels {
+		lIter := level.Iter()
+		for f := lIter.First(); f != nil; f = lIter.Next() {
+			if f.FileNum == base.FileNum(uint64(file)) {
+				m = f
+				break
+			}
+		}
+	}
+	d.mu.Unlock()
+
+	// Note that m can be nil here if the sstable exists in the file system, but
+	// not in the lsm. If m is nil just assume that file is not virtual.
+
+	backingFileNum := base.DiskFileNum(file)
+	if m != nil {
+		backingFileNum = m.FileBacking.DiskFileNum
+	}
+	fileName := base.MakeFilename(fileTypeTable, backingFileNum)
+	f, err := d.opts.FS.Open(fileName)
 	if err != nil {
 		return err.Error()
 	}
@@ -1206,17 +1173,35 @@ func runSSTablePropertiesCmd(t *testing.T, td *datadriven.TestData, d *DB) strin
 	if err != nil {
 		return err.Error()
 	}
-	r, err := sstable.NewReader(readable, d.opts.MakeReaderOptions())
+	readerOpts := d.opts.MakeReaderOptions()
+	// TODO(bananabrick): cacheOpts is used to set the file number on a Reader,
+	// and virtual sstables expect this file number to be set. Split out the
+	// opts into fileNum opts, and cache opts.
+	readerOpts.CacheOpts = sstableinternal.CacheOptions{
+		Cache:   d.opts.Cache,
+		CacheID: 0,
+		FileNum: backingFileNum,
+	}
+	r, err := sstable.NewReader(context.Background(), readable, readerOpts)
 	if err != nil {
 		return err.Error()
 	}
 	defer r.Close()
 
-	props := strings.Split(r.Properties.String(), "\n")
+	var v sstable.VirtualReader
+	props := r.Properties.String()
+	if m != nil && m.Virtual {
+		v = sstable.MakeVirtualReader(r, m.VirtualMeta().VirtualReaderParams(false /* isShared */))
+		props = v.Properties.String()
+	}
+	if len(td.Input) == 0 {
+		return props
+	}
 	var buf bytes.Buffer
+	propsSlice := strings.Split(props, "\n")
 	for _, requestedProp := range strings.Split(td.Input, "\n") {
 		fmt.Fprintf(&buf, "%s:\n", requestedProp)
-		for _, prop := range props {
+		for _, prop := range propsSlice {
 			if strings.Contains(prop, requestedProp) {
 				fmt.Fprintf(&buf, "  %s\n", prop)
 			}
@@ -1239,9 +1224,9 @@ func runPopulateCmd(t *testing.T, td *datadriven.TestData, b *Batch) {
 	ks := testkeys.Alpha(maxKeyLength)
 	buf := make([]byte, ks.MaxLen()+testkeys.MaxSuffixLen)
 	vbuf := make([]byte, valLength)
-	for i := 0; i < ks.Count(); i++ {
+	for i := int64(0); i < ks.Count(); i++ {
 		for _, ts := range timestamps {
-			n := testkeys.WriteKeyAt(buf, ks, i, ts)
+			n := testkeys.WriteKeyAt(buf, ks, i, int64(ts))
 
 			// Default to using the key as the value, but if the user provided
 			// the vallen argument, generate a random value of the specified
@@ -1280,12 +1265,14 @@ func runIngestAndExciseCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
 			}
 			exciseSpan.Start = []byte(fields[0])
 			exciseSpan.End = []byte(fields[1])
+		case "no-wait":
+			// Handled by callers.
 		default:
 			paths = append(paths, arg.String())
 		}
 	}
 
-	if _, err := d.IngestAndExcise(paths, nil /* shared */, exciseSpan); err != nil {
+	if _, err := d.IngestAndExcise(context.Background(), paths, nil /* shared */, nil /* external */, exciseSpan); err != nil {
 		return err
 	}
 	return nil
@@ -1294,77 +1281,248 @@ func runIngestAndExciseCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
 func runIngestCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
 	paths := make([]string, 0, len(td.CmdArgs))
 	for _, arg := range td.CmdArgs {
+		if arg.Key == "no-wait" {
+			// Handled by callers.
+			continue
+		}
 		paths = append(paths, arg.String())
 	}
 
-	if err := d.Ingest(paths); err != nil {
+	if err := d.Ingest(context.Background(), paths); err != nil {
 		return err
 	}
 	return nil
 }
 
-func runIngestExternalCmd(td *datadriven.TestData, d *DB, locator string) error {
-	external := make([]ExternalFile, 0)
-	for _, arg := range strings.Split(td.Input, "\n") {
-		fields := strings.Split(arg, ",")
-		if len(fields) != 4 {
-			return errors.New("usage: path,size,smallest,largest")
+func runIngestExternalCmd(
+	t testing.TB, td *datadriven.TestData, d *DB, st remote.Storage, locator string,
+) error {
+	var external []ExternalFile
+	for _, line := range strings.Split(td.Input, "\n") {
+		usageErr := func(info interface{}) {
+			t.Helper()
+			td.Fatalf(t, "error parsing %q: %v; "+
+				"usage: obj bounds=(smallest,largest) [size=x] [synthetic-prefix=prefix] [synthetic-suffix=suffix] [no-point-keys] [has-range-keys]",
+				line, info,
+			)
 		}
-		ef := ExternalFile{}
-		ef.Locator = remote.Locator(locator)
-		ef.ObjName = fields[0]
-		sizeInt, err := strconv.Atoi(fields[1])
+		objName, args, err := datadriven.ParseLine(line)
 		if err != nil {
-			return err
+			usageErr(err)
 		}
-		ef.Size = uint64(sizeInt)
-		ef.SmallestUserKey = []byte(fields[2])
-		ef.LargestUserKey = []byte(fields[3])
-		ef.HasPointKey = true
+		sz, err := st.Size(objName)
+		if err != nil {
+			return errors.Wrapf(err, "sizeof %s", objName)
+		}
+		ef := ExternalFile{
+			Locator:     remote.Locator(locator),
+			ObjName:     objName,
+			HasPointKey: true,
+			Size:        uint64(sz),
+		}
+		for _, arg := range args {
+			nArgs := func(n int) {
+				if len(arg.Vals) != n {
+					usageErr(fmt.Sprintf("%s must have %d arguments", arg.Key, n))
+				}
+			}
+			switch arg.Key {
+			case "bounds":
+				nArgs(2)
+				ef.StartKey = []byte(arg.Vals[0])
+				ef.EndKey = []byte(arg.Vals[1])
+			case "bounds-are-inclusive":
+				nArgs(1)
+				b, err := strconv.ParseBool(arg.Vals[0])
+				if err != nil {
+					usageErr(fmt.Sprintf("%s should have boolean argument: %v",
+						arg.Key, err))
+				}
+				ef.EndKeyIsInclusive = b
+			case "size":
+				nArgs(1)
+				arg.Scan(t, 0, &ef.Size)
+
+			case "synthetic-prefix":
+				nArgs(1)
+				ef.SyntheticPrefix = []byte(arg.Vals[0])
+
+			case "synthetic-suffix":
+				nArgs(1)
+				ef.SyntheticSuffix = []byte(arg.Vals[0])
+
+			case "no-point-keys":
+				ef.HasPointKey = false
+
+			case "has-range-keys":
+				ef.HasRangeKey = true
+
+			default:
+				usageErr(fmt.Sprintf("unknown argument %v", arg.Key))
+			}
+		}
+		if ef.StartKey == nil {
+			usageErr("no bounds specified")
+		}
+
 		external = append(external, ef)
 	}
 
-	if _, err := d.IngestExternalFiles(external); err != nil {
+	if _, err := d.IngestExternalFiles(context.Background(), external); err != nil {
 		return err
 	}
 	return nil
-}
-
-func runForceIngestCmd(td *datadriven.TestData, d *DB) error {
-	var paths []string
-	var level int
-	for _, arg := range td.CmdArgs {
-		switch arg.Key {
-		case "paths":
-			paths = append(paths, arg.Vals...)
-		case "level":
-			var err error
-			level, err = strconv.Atoi(arg.Vals[0])
-			if err != nil {
-				return err
-			}
-		}
-	}
-	_, err := d.ingest(paths, func(
-		tableNewIters,
-		keyspan.TableNewSpanIter,
-		IterOptions,
-		Compare,
-		*version,
-		int,
-		map[*compaction]struct{},
-		*fileMetadata,
-	) (int, error) {
-		return level, nil
-	}, nil /* shared */, KeyRange{}, nil /* external */)
-	return err
 }
 
 func runLSMCmd(td *datadriven.TestData, d *DB) string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if td.HasArg("verbose") {
-		return d.mu.versions.currentVersion().DebugString(d.opts.Comparer.FormatKey)
+		return d.mu.versions.currentVersion().DebugString()
 	}
 	return d.mu.versions.currentVersion().String()
+}
+
+func parseDBOptionsArgs(opts *Options, args []datadriven.CmdArg) error {
+	for _, cmdArg := range args {
+		switch cmdArg.Key {
+		case "auto-compactions":
+			switch cmdArg.Vals[0] {
+			case "off":
+				opts.DisableAutomaticCompactions = true
+			case "on":
+				opts.DisableAutomaticCompactions = false
+			default:
+				return errors.Errorf("Unrecognized %q arg value: %q", cmdArg.Key, cmdArg.Vals[0])
+			}
+		case "block-size":
+			v, err := strconv.Atoi(cmdArg.Vals[0])
+			if err != nil {
+				return err
+			}
+			for i := range opts.Levels {
+				opts.Levels[i].BlockSize = v
+			}
+		case "bloom-bits-per-key":
+			v, err := strconv.Atoi(cmdArg.Vals[0])
+			if err != nil {
+				return err
+			}
+			fp := bloom.FilterPolicy(v)
+			opts.Filters = map[string]FilterPolicy{fp.Name(): fp}
+			for i := range opts.Levels {
+				opts.Levels[i].FilterPolicy = fp
+			}
+		case "cache-size":
+			if opts.Cache != nil {
+				opts.Cache.Unref()
+				opts.Cache = nil
+			}
+			size, err := strconv.ParseInt(cmdArg.Vals[0], 10, 64)
+			if err != nil {
+				return err
+			}
+			opts.Cache = NewCache(size)
+		case "disable-multi-level":
+			opts.Experimental.MultiLevelCompactionHeuristic = NoMultiLevel{}
+		case "enable-table-stats":
+			enable, err := strconv.ParseBool(cmdArg.Vals[0])
+			if err != nil {
+				return errors.Errorf("%s: could not parse %q as bool: %s", cmdArg.Key, cmdArg.Vals[0], err)
+			}
+			opts.DisableTableStats = !enable
+		case "format-major-version":
+			v, err := strconv.Atoi(cmdArg.Vals[0])
+			if err != nil {
+				return err
+			}
+			opts.FormatMajorVersion = FormatMajorVersion(v)
+		case "index-block-size":
+			v, err := strconv.Atoi(cmdArg.Vals[0])
+			if err != nil {
+				return err
+			}
+			for i := range opts.Levels {
+				opts.Levels[i].IndexBlockSize = v
+			}
+		case "inject-errors":
+			injs := make([]errorfs.Injector, len(cmdArg.Vals))
+			for i := 0; i < len(cmdArg.Vals); i++ {
+				inj, err := errorfs.ParseDSL(cmdArg.Vals[i])
+				if err != nil {
+					return err
+				}
+				injs[i] = inj
+			}
+			opts.FS = errorfs.Wrap(opts.FS, errorfs.Any(injs...))
+		case "lbase-max-bytes":
+			lbaseMaxBytes, err := strconv.ParseInt(cmdArg.Vals[0], 10, 64)
+			if err != nil {
+				return err
+			}
+			opts.LBaseMaxBytes = lbaseMaxBytes
+		case "memtable-size":
+			memTableSize, err := strconv.ParseUint(cmdArg.Vals[0], 10, 64)
+			if err != nil {
+				return err
+			}
+			opts.MemTableSize = memTableSize
+		case "merger":
+			switch cmdArg.Vals[0] {
+			case "appender":
+				opts.Merger = base.DefaultMerger
+			default:
+				return errors.Newf("unrecognized Merger %q\n", cmdArg.Vals[0])
+			}
+		case "readonly":
+			opts.ReadOnly = true
+		case "target-file-sizes":
+			if len(opts.Levels) < len(cmdArg.Vals) {
+				opts.Levels = slices.Grow(opts.Levels, len(cmdArg.Vals)-len(opts.Levels))[0:len(cmdArg.Vals)]
+			}
+			for i := range cmdArg.Vals {
+				size, err := strconv.ParseInt(cmdArg.Vals[i], 10, 64)
+				if err != nil {
+					return err
+				}
+				opts.Levels[i].TargetFileSize = size
+			}
+		case "wal-failover":
+			if v := cmdArg.Vals[0]; v == "off" || v == "disabled" {
+				opts.WALFailover = nil
+				continue
+			}
+			opts.WALFailover = &WALFailoverOptions{
+				Secondary: wal.Dir{FS: opts.FS, Dirname: cmdArg.Vals[0]},
+			}
+			opts.WALFailover.EnsureDefaults()
+		}
+	}
+	return nil
+}
+
+func streamFilterBetweenGrep(start, end string) stream.Filter {
+	startRegexp, err := regexp.Compile(start)
+	if err != nil {
+		return stream.FilterFunc(func(stream.Arg) error { return err })
+	}
+	endRegexp, err := regexp.Compile(end)
+	if err != nil {
+		return stream.FilterFunc(func(stream.Arg) error { return err })
+	}
+	var passedStart bool
+	return stream.FilterFunc(func(arg stream.Arg) error {
+		for s := range arg.In {
+			if passedStart {
+				if endRegexp.MatchString(s) {
+					break
+				}
+				arg.Out <- s
+				continue
+			} else {
+				passedStart = startRegexp.MatchString(s)
+			}
+		}
+		return nil
+	})
 }

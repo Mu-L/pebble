@@ -6,6 +6,7 @@ package base
 
 import (
 	"bytes"
+	"context"
 	"testing"
 	"unsafe"
 
@@ -16,7 +17,7 @@ type valueFetcherFunc func(
 	handle []byte, valLen int32, buf []byte) (val []byte, callerOwned bool, err error)
 
 func (v valueFetcherFunc) Fetch(
-	handle []byte, valLen int32, buf []byte,
+	ctx context.Context, handle []byte, valLen int32, buf []byte,
 ) (val []byte, callerOwned bool, err error) {
 	return v(handle, valLen, buf)
 }
@@ -25,7 +26,7 @@ func TestLazyValue(t *testing.T) {
 	// Both 40 and 48 bytes makes iteration benchmarks like
 	// BenchmarkIteratorScan/keys=1000,r-amp=1,key-types=points-only 75%
 	// slower.
-	require.Equal(t, 32, int(unsafe.Sizeof(LazyValue{})))
+	require.True(t, unsafe.Sizeof(LazyValue{}) <= 32)
 
 	fooBytes1 := []byte("foo")
 	fooLV1 := MakeInPlaceValue(fooBytes1)

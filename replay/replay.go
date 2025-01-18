@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/rangekey"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 	"golang.org/x/perf/benchfmt"
 	"golang.org/x/sync/errgroup"
@@ -97,14 +98,16 @@ func (pra PaceByFixedReadAmp) pace(r *Runner, _ workloadStep) time.Duration {
 // Metrics holds the various statistics on a replay run and its performance.
 type Metrics struct {
 	CompactionCounts struct {
-		Total       int64
-		Default     int64
-		DeleteOnly  int64
-		ElisionOnly int64
-		Move        int64
-		Read        int64
-		Rewrite     int64
-		MultiLevel  int64
+		Total            int64
+		Default          int64
+		DeleteOnly       int64
+		ElisionOnly      int64
+		Move             int64
+		Read             int64
+		TombstoneDensity int64
+		Rewrite          int64
+		Copy             int64
+		MultiLevel       int64
 	}
 	EstimatedDebt SampledMetric
 	Final         *pebble.Metrics
@@ -169,6 +172,7 @@ func (m *Metrics) WriteBenchmarkString(name string, w io.Writer) error {
 			{Value: float64(m.CompactionCounts.Move), Unit: "move"},
 			{Value: float64(m.CompactionCounts.Read), Unit: "read"},
 			{Value: float64(m.CompactionCounts.Rewrite), Unit: "rewrite"},
+			{Value: float64(m.CompactionCounts.Copy), Unit: "copy"},
 			{Value: float64(m.CompactionCounts.MultiLevel), Unit: "multilevel"},
 		}},
 		// Total database sizes sampled after every workload step and
@@ -554,7 +558,9 @@ func (r *Runner) Wait() (Metrics, error) {
 	m.CompactionCounts.ElisionOnly = pm.Compact.ElisionOnlyCount
 	m.CompactionCounts.Move = pm.Compact.MoveCount
 	m.CompactionCounts.Read = pm.Compact.ReadCount
+	m.CompactionCounts.TombstoneDensity = pm.Compact.TombstoneDensityCount
 	m.CompactionCounts.Rewrite = pm.Compact.RewriteCount
+	m.CompactionCounts.Copy = pm.Compact.CopyCount
 	m.CompactionCounts.MultiLevel = pm.Compact.MultiLevelCount
 	m.Ingest.BytesIntoL0 = pm.Levels[0].BytesIngested
 	m.Ingest.BytesWeightedByLevel = ingestBytesWeighted
@@ -680,7 +686,7 @@ func (r *Runner) applyWorkloadSteps(ctx context.Context) error {
 			r.metrics.writeBytes.Store(step.cumulativeWriteBytes)
 			r.stepsApplied <- step
 		case ingestStepKind:
-			if err := r.d.Ingest(step.tablesToIngest); err != nil {
+			if err := r.d.Ingest(context.Background(), step.tablesToIngest); err != nil {
 				return err
 			}
 			r.metrics.writeBytes.Store(step.cumulativeWriteBytes)
@@ -714,11 +720,9 @@ func (r *Runner) prepareWorkloadSteps(ctx context.Context) error {
 	currentVersion := func() (*manifest.Version, error) {
 		var err error
 		v, err = bve.Apply(v,
-			r.Opts.Comparer.Compare,
-			r.Opts.Comparer.FormatKey,
+			r.Opts.Comparer,
 			r.Opts.FlushSplitBytes,
-			r.Opts.Experimental.ReadCompactionRate,
-			nil /* zombies */)
+			r.Opts.Experimental.ReadCompactionRate)
 		bve = manifest.BulkVersionEdit{AddedByFileNum: bve.AddedByFileNum}
 		return v, err
 	}
@@ -822,7 +826,7 @@ func (r *Runner) prepareWorkloadSteps(ctx context.Context) error {
 				// corresponding sstables before being terminated.
 				if s.kind == flushStepKind || s.kind == ingestStepKind {
 					for _, fileNum := range newFiles {
-						if _, ok := r.workload.sstables[fileNum.FileNum()]; !ok {
+						if _, ok := r.workload.sstables[base.PhysicalTableFileNum(fileNum)]; !ok {
 							// TODO(jackson,leon): This isn't exactly an error
 							// condition. Give this more thought; do we want to
 							// require graceful exiting of workload collection,
@@ -907,7 +911,7 @@ func findWorkloadFiles(
 		case base.FileTypeManifest:
 			manifests = append(manifests, dirent)
 		case base.FileTypeTable:
-			sstables[fileNum.FileNum()] = struct{}{}
+			sstables[base.PhysicalTableFileNum(fileNum)] = struct{}{}
 		}
 	}
 	if len(manifests) == 0 {
@@ -992,23 +996,23 @@ func loadFlushedSSTableKeys(
 				f.Close()
 				return err
 			}
-			r, err := sstable.NewReader(readable, readOpts)
+			r, err := sstable.NewReader(context.Background(), readable, readOpts)
 			if err != nil {
 				return err
 			}
 			defer r.Close()
 
 			// Load all the point keys.
-			iter, err := r.NewIter(nil, nil)
+			iter, err := r.NewIter(sstable.NoTransforms, nil, nil)
 			if err != nil {
 				return err
 			}
 			defer iter.Close()
-			for k, lv := iter.First(); k != nil; k, lv = iter.Next() {
+			for kv := iter.First(); kv != nil; kv = iter.Next() {
 				var key flushedKey
-				key.Trailer = k.Trailer
-				bufs.alloc, key.UserKey = bufs.alloc.Copy(k.UserKey)
-				if v, callerOwned, err := lv.Value(nil); err != nil {
+				key.Trailer = kv.K.Trailer
+				bufs.alloc, key.UserKey = bufs.alloc.Copy(kv.K.UserKey)
+				if v, callerOwned, err := kv.Value(nil); err != nil {
 					return err
 				} else if callerOwned {
 					key.value = v
@@ -1019,12 +1023,13 @@ func loadFlushedSSTableKeys(
 			}
 
 			// Load all the range tombstones.
-			if iter, err := r.NewRawRangeDelIter(); err != nil {
+			if iter, err := r.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, block.NoReadEnv); err != nil {
 				return err
 			} else if iter != nil {
 				defer iter.Close()
-				for s := iter.First(); s != nil; s = iter.Next() {
-					if err := rangedel.Encode(s, func(k base.InternalKey, v []byte) error {
+				s, err := iter.First()
+				for ; s != nil; s, err = iter.Next() {
+					if err := rangedel.Encode(*s, func(k base.InternalKey, v []byte) error {
 						var key flushedKey
 						key.Trailer = k.Trailer
 						bufs.alloc, key.UserKey = bufs.alloc.Copy(k.UserKey)
@@ -1035,15 +1040,19 @@ func loadFlushedSSTableKeys(
 						return err
 					}
 				}
+				if err != nil {
+					return err
+				}
 			}
 
 			// Load all the range keys.
-			if iter, err := r.NewRawRangeKeyIter(); err != nil {
+			if iter, err := r.NewRawRangeKeyIter(context.Background(), sstable.NoFragmentTransforms, block.NoReadEnv); err != nil {
 				return err
 			} else if iter != nil {
 				defer iter.Close()
-				for s := iter.First(); s != nil; s = iter.Next() {
-					if err := rangekey.Encode(s, func(k base.InternalKey, v []byte) error {
+				s, err := iter.First()
+				for ; s != nil; s, err = iter.Next() {
+					if err := rangekey.Encode(*s, func(k base.InternalKey, v []byte) error {
 						var key flushedKey
 						key.Trailer = k.Trailer
 						bufs.alloc, key.UserKey = bufs.alloc.Copy(k.UserKey)
@@ -1053,6 +1062,9 @@ func loadFlushedSSTableKeys(
 					}); err != nil {
 						return err
 					}
+				}
+				if err != nil {
+					return err
 				}
 			}
 			return nil

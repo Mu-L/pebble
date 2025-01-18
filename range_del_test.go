@@ -6,7 +6,9 @@ package pebble
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"math/rand/v2"
 	"runtime"
 	"strings"
 	"sync"
@@ -20,7 +22,6 @@ import (
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 func TestRangeDel(t *testing.T) {
@@ -78,10 +79,14 @@ func TestRangeDel(t *testing.T) {
 		case "iter":
 			snap := Snapshot{
 				db:     d,
-				seqNum: InternalKeySeqNumMax,
+				seqNum: base.SeqNumMax,
 			}
-			td.MaybeScanArgs(t, "seq", &snap.seqNum)
-			iter := snap.NewIter(nil)
+			if td.HasArg("seq") {
+				var n uint64
+				td.ScanArgs(t, "seq", &n)
+				snap.seqNum = base.SeqNum(n)
+			}
+			iter, _ := snap.NewIter(nil)
 			return runIterCmd(td, iter, true)
 
 		default:
@@ -97,6 +102,7 @@ func TestFlushDelay(t *testing.T) {
 		FlushDelayDeleteRange: 10 * time.Millisecond,
 		FlushDelayRangeKey:    10 * time.Millisecond,
 		FormatMajorVersion:    internalFormatNewest,
+		Logger:                testLogger{t: t},
 	}
 	d, err := Open("", opts)
 	require.NoError(t, err)
@@ -189,14 +195,15 @@ func TestFlushDelay(t *testing.T) {
 }
 
 func TestFlushDelayStress(t *testing.T) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	opts := &Options{
 		FS:                    vfs.NewMem(),
 		Comparer:              testkeys.Comparer,
-		FlushDelayDeleteRange: time.Duration(rng.Intn(10)+1) * time.Millisecond,
-		FlushDelayRangeKey:    time.Duration(rng.Intn(10)+1) * time.Millisecond,
+		FlushDelayDeleteRange: time.Duration(rng.IntN(10)+1) * time.Millisecond,
+		FlushDelayRangeKey:    time.Duration(rng.IntN(10)+1) * time.Millisecond,
 		FormatMajorVersion:    internalFormatNewest,
 		MemTableSize:          8192,
+		Logger:                testLogger{t: t},
 	}
 
 	const runs = 100
@@ -209,14 +216,14 @@ func TestFlushDelayStress(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(writers)
 		for i := 0; i < writers; i++ {
-			rng := rand.New(rand.NewSource(uint64(now) + uint64(i)))
+			rng := rand.New(rand.NewPCG(0, uint64(now)+uint64(i)))
 			go func() {
 				const ops = 100
 				defer wg.Done()
 
 				var k1, k2 [32]byte
 				for j := 0; j < ops; j++ {
-					switch rng.Intn(3) {
+					switch rng.IntN(3) {
 					case 0:
 						randStr(k1[:], rng)
 						randStr(k2[:], rng)
@@ -236,7 +243,7 @@ func TestFlushDelayStress(t *testing.T) {
 			}()
 		}
 		wg.Wait()
-		time.Sleep(time.Duration(rng.Intn(10)+1) * time.Millisecond)
+		time.Sleep(time.Duration(rng.IntN(10)+1) * time.Millisecond)
 		require.NoError(t, d.Close())
 	}
 }
@@ -296,7 +303,7 @@ func TestRangeDelCompactionTruncation(t *testing.T) {
 		// Compact to produce the L1 tables.
 		require.NoError(t, d.Compact([]byte("c"), []byte("c\x00"), false))
 		expectLSM(`
-1:
+L1:
   000008:[a#12,RANGEDEL-b#inf,RANGEDEL]
   000009:[b#12,RANGEDEL-d#inf,RANGEDEL]
 `)
@@ -304,9 +311,9 @@ func TestRangeDelCompactionTruncation(t *testing.T) {
 		// Compact again to move one of the tables to L2.
 		require.NoError(t, d.Compact([]byte("c"), []byte("c\x00"), false))
 		expectLSM(`
-1:
+L1:
   000008:[a#12,RANGEDEL-b#inf,RANGEDEL]
-2:
+L2:
   000009:[b#12,RANGEDEL-d#inf,RANGEDEL]
 `)
 
@@ -315,11 +322,11 @@ func TestRangeDelCompactionTruncation(t *testing.T) {
 		require.NoError(t, d.Set([]byte("c"), []byte("e"), nil))
 		require.NoError(t, d.Flush())
 		expectLSM(`
-0.0:
+L0.0:
   000011:[b#13,SET-c#14,SET]
-1:
+L1:
   000008:[a#12,RANGEDEL-b#inf,RANGEDEL]
-2:
+L2:
   000009:[b#12,RANGEDEL-d#inf,RANGEDEL]
 `)
 
@@ -331,7 +338,7 @@ func TestRangeDelCompactionTruncation(t *testing.T) {
 		}
 
 		keys := func() string {
-			iter := d.NewIter(nil)
+			iter, _ := d.NewIter(nil)
 			defer iter.Close()
 			var buf bytes.Buffer
 			var sep string
@@ -352,25 +359,14 @@ func TestRangeDelCompactionTruncation(t *testing.T) {
 		// tables in L2. Lastly, the L2 table containing "c" will be compacted
 		// creating the L3 table.
 		require.NoError(t, d.Compact([]byte("c"), []byte("c\x00"), false))
-		if formatVersion < FormatSetWithDelete {
-			expectLSM(`
-1:
+		expectLSM(`
+L1:
   000008:[a#12,RANGEDEL-b#inf,RANGEDEL]
-2:
+L2:
   000012:[b#13,SET-c#inf,RANGEDEL]
-3:
+L3:
   000013:[c#14,SET-d#inf,RANGEDEL]
 `)
-		} else {
-			expectLSM(`
-1:
-  000008:[a#12,RANGEDEL-b#inf,RANGEDEL]
-2:
-  000012:[b#13,SETWITHDEL-c#inf,RANGEDEL]
-3:
-  000013:[c#14,SET-d#inf,RANGEDEL]
-`)
-		}
 
 		// The L1 table still contains a tombstone from [a,d) which will improperly
 		// delete the newer version of "b" in L2.
@@ -386,9 +382,7 @@ func TestRangeDelCompactionTruncation(t *testing.T) {
 	}
 
 	versions := []FormatMajorVersion{
-		FormatMostCompatible,
-		FormatSetWithDelete - 1,
-		FormatSetWithDelete,
+		FormatMinSupported,
 		FormatNewest,
 	}
 	for _, version := range versions {
@@ -446,14 +440,14 @@ func TestRangeDelCompactionTruncation2(t *testing.T) {
 	// Compact to produce the L1 tables.
 	require.NoError(t, d.Compact([]byte("b"), []byte("b\x00"), false))
 	expectLSM(`
-6:
+L6:
   000009:[a#12,RANGEDEL-d#inf,RANGEDEL]
 `)
 
 	require.NoError(t, d.Set([]byte("c"), bytes.Repeat([]byte("d"), 100), nil))
 	require.NoError(t, d.Compact([]byte("c"), []byte("c\x00"), false))
 	expectLSM(`
-6:
+L6:
   000012:[a#12,RANGEDEL-c#inf,RANGEDEL]
   000013:[c#13,SET-d#inf,RANGEDEL]
 `)
@@ -520,7 +514,7 @@ func TestRangeDelCompactionTruncation3(t *testing.T) {
 		require.NoError(t, d.Compact([]byte("b"), []byte("b\x00"), false))
 	}
 	expectLSM(`
-3:
+L3:
   000009:[a#12,RANGEDEL-d#inf,RANGEDEL]
 `)
 
@@ -528,18 +522,20 @@ func TestRangeDelCompactionTruncation3(t *testing.T) {
 
 	require.NoError(t, d.Compact([]byte("c"), []byte("c\x00"), false))
 	expectLSM(`
-3:
-  000013:[a#12,RANGEDEL-c#inf,RANGEDEL]
-4:
-  000014:[c#13,SET-d#inf,RANGEDEL]
+L3:
+  000013:[a#12,RANGEDEL-b#inf,RANGEDEL]
+  000014:[b#12,RANGEDEL-c#inf,RANGEDEL]
+L4:
+  000015:[c#13,SET-d#inf,RANGEDEL]
 `)
 
 	require.NoError(t, d.Compact([]byte("c"), []byte("c\x00"), false))
 	expectLSM(`
-3:
-  000013:[a#12,RANGEDEL-c#inf,RANGEDEL]
-5:
-  000014:[c#13,SET-d#inf,RANGEDEL]
+L3:
+  000013:[a#12,RANGEDEL-b#inf,RANGEDEL]
+  000014:[b#12,RANGEDEL-c#inf,RANGEDEL]
+L5:
+  000015:[c#13,SET-d#inf,RANGEDEL]
 `)
 
 	if _, _, err := d.Get([]byte("b")); err != ErrNotFound {
@@ -548,10 +544,12 @@ func TestRangeDelCompactionTruncation3(t *testing.T) {
 
 	require.NoError(t, d.Compact([]byte("a"), []byte("a\x00"), false))
 	expectLSM(`
-4:
-  000013:[a#12,RANGEDEL-c#inf,RANGEDEL]
-5:
-  000014:[c#13,SET-d#inf,RANGEDEL]
+L3:
+  000014:[b#12,RANGEDEL-c#inf,RANGEDEL]
+L4:
+  000013:[a#12,RANGEDEL-b#inf,RANGEDEL]
+L5:
+  000015:[c#13,SET-d#inf,RANGEDEL]
 `)
 
 	if v, _, err := d.Get([]byte("b")); err != ErrNotFound {
@@ -596,23 +594,23 @@ func benchmarkRangeDelIterate(b *testing.B, entries, deleted int, snapshotCompac
 
 	// Create an sstable with N entries and ingest it. This is a fast way
 	// to get a lot of entries into pebble.
-	f, err := mem.Create("ext")
+	f, err := mem.Create("ext", vfs.WriteCategoryUnspecified)
 	if err != nil {
 		b.Fatal(err)
 	}
-	w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
+	w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
 		BlockSize: 32 << 10, // 32 KB
 	})
 	for i := 0; i < entries; i++ {
 		key := base.MakeInternalKey(makeKey(i), 0, InternalKeyKindSet)
-		if err := w.Add(key, nil); err != nil {
+		if err := w.AddWithForceObsolete(key, nil, false /* forceObsolete */); err != nil {
 			b.Fatal(err)
 		}
 	}
 	if err := w.Close(); err != nil {
 		b.Fatal(err)
 	}
-	if err := d.Ingest([]string{"ext"}); err != nil {
+	if err := d.Ingest(context.Background(), []string{"ext"}); err != nil {
 		b.Fatal(err)
 	}
 
@@ -637,7 +635,7 @@ func benchmarkRangeDelIterate(b *testing.B, entries, deleted int, snapshotCompac
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		iter := d.NewIter(nil)
+		iter, _ := d.NewIter(nil)
 		iter.SeekGE(from)
 		if deleted < entries {
 			if !iter.Valid() {

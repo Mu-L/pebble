@@ -9,23 +9,32 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"path/filepath"
-	"sort"
+	"regexp"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/crlib/fifo"
+	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
-	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/internal/testkeys"
+	"github.com/cockroachdb/pebble/internal/testutils"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/pebble/vfs/errorfs"
+	"github.com/cockroachdb/pebble/wal"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 // try repeatedly calls f, sleeping between calls with exponential back-off,
@@ -311,12 +320,12 @@ func TestRandomWrites(t *testing.T) {
 	}
 	xxx := bytes.Repeat([]byte("x"), 512)
 
-	rng := rand.New(rand.NewSource(123))
+	rng := rand.New(rand.NewPCG(0, 123))
 	const N = 1000
 	for i := 0; i < N; i++ {
-		k := rng.Intn(len(keys))
-		if rng.Intn(20) != 0 {
-			wants[k] = rng.Intn(len(xxx) + 1)
+		k := rng.IntN(len(keys))
+		if rng.IntN(20) != 0 {
+			wants[k] = rng.IntN(len(xxx) + 1)
 			if err := d.Set(keys[k], xxx[:wants[k]], nil); err != nil {
 				t.Fatalf("i=%d: Set: %v", i, err)
 			}
@@ -327,7 +336,7 @@ func TestRandomWrites(t *testing.T) {
 			}
 		}
 
-		if i != N-1 || rng.Intn(50) != 0 {
+		if i != N-1 || rng.IntN(50) != 0 {
 			continue
 		}
 		for k := range keys {
@@ -372,24 +381,21 @@ func TestLargeBatch(t *testing.T) {
 		}
 	}
 
-	logNum := func() base.DiskFileNum {
+	getLatestLog := func() wal.LogicalLog {
 		d.mu.Lock()
 		defer d.mu.Unlock()
-		return d.mu.log.queue[len(d.mu.log.queue)-1].fileNum
+		logs := d.mu.log.manager.List()
+		return logs[len(logs)-1]
 	}
-	fileSize := func(fileNum base.DiskFileNum) int64 {
-		info, err := d.opts.FS.Stat(base.MakeFilepath(d.opts.FS, "", fileTypeLog, fileNum))
-		require.NoError(t, err)
-		return info.Size()
-	}
-	memTableCreationSeqNum := func() uint64 {
+	memTableCreationSeqNum := func() base.SeqNum {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		return d.mu.mem.mutable.logSeqNum
 	}
 
-	startLogNum := logNum()
-	startLogStartSize := fileSize(startLogNum)
+	startLog := getLatestLog()
+	startLogStartSize, err := startLog.PhysicalSize()
+	require.NoError(t, err)
 	startSeqNum := d.mu.versions.logSeqNum.Load()
 
 	// Write a key with a value larger than the memtable size.
@@ -398,18 +404,20 @@ func TestLargeBatch(t *testing.T) {
 	// Verify that the large batch was written to the WAL that existed before it
 	// was committed. We verify that WAL rotation occurred, where the large batch
 	// was written to, and that the new WAL is empty.
-	endLogNum := logNum()
-	if startLogNum == endLogNum {
+	endLog := getLatestLog()
+	if startLog.Num == endLog.Num {
 		t.Fatal("expected WAL rotation")
 	}
-	startLogEndSize := fileSize(startLogNum)
+	startLogEndSize, err := startLog.PhysicalSize()
+	require.NoError(t, err)
 	if startLogEndSize == startLogStartSize {
 		t.Fatalf("expected large batch to be written to %s.log, but file size unchanged at %d",
-			startLogNum, startLogEndSize)
+			startLog.Num, startLogEndSize)
 	}
-	endLogSize := fileSize(endLogNum)
+	endLogSize, err := endLog.PhysicalSize()
+	require.NoError(t, err)
 	if endLogSize != 0 {
-		t.Fatalf("expected %s.log to be empty, but found %d", endLogNum, endLogSize)
+		t.Fatalf("expected %s to be empty, but found %d", endLog, endLogSize)
 	}
 	if creationSeqNum := memTableCreationSeqNum(); creationSeqNum <= startSeqNum {
 		t.Fatalf("expected memTable.logSeqNum=%d > largeBatch.seqNum=%d", creationSeqNum, startSeqNum)
@@ -417,13 +425,13 @@ func TestLargeBatch(t *testing.T) {
 
 	// Verify this results in one L0 table being created.
 	require.NoError(t, try(100*time.Microsecond, 20*time.Second,
-		verifyLSM("0.0:\n  000005:[a#10,SET-a#10,SET]\n")))
+		verifyLSM("L0.0:\n  000005:[a#10,SET-a#10,SET]\n")))
 
 	require.NoError(t, d.Set([]byte("b"), bytes.Repeat([]byte("b"), 512), nil))
 
 	// Verify this results in a second L0 table being created.
 	require.NoError(t, try(100*time.Microsecond, 20*time.Second,
-		verifyLSM("0.0:\n  000005:[a#10,SET-a#10,SET]\n  000007:[b#11,SET-b#11,SET]\n")))
+		verifyLSM("L0.0:\n  000005:[a#10,SET-a#10,SET]\n  000007:[b#11,SET-b#11,SET]\n")))
 
 	// Allocate a bunch of batches to exhaust the batchPool. None of these
 	// batches should have a non-zero count.
@@ -493,7 +501,7 @@ func TestMergeOrderSameAfterFlush(t *testing.T) {
 
 	key := []byte("a")
 	verify := func(expected string) {
-		iter := d.NewIter(nil)
+		iter, _ := d.NewIter(nil)
 		if !iter.SeekGE([]byte("a")) {
 			t.Fatal("expected one value, but got empty iterator")
 		}
@@ -696,7 +704,7 @@ func TestIterLeak(t *testing.T) {
 					if flush {
 						require.NoError(t, d.Flush())
 					}
-					iter := d.NewIter(nil)
+					iter, _ := d.NewIter(nil)
 					iter.First()
 					if !leak {
 						require.NoError(t, iter.Close())
@@ -718,7 +726,7 @@ func TestIterLeak(t *testing.T) {
 }
 
 // Make sure that we detect an iter leak when only one DB closes
-// while the second db still holds a reference to the TableCache.
+// while the second db still holds a reference to the FileCache.
 func TestIterLeakSharedCache(t *testing.T) {
 	for _, leak := range []bool{true, false} {
 		t.Run(fmt.Sprintf("leak=%t", leak), func(t *testing.T) {
@@ -746,7 +754,7 @@ func TestIterLeakSharedCache(t *testing.T) {
 
 					// Check if leak detection works with only one db closing.
 					{
-						iter1 := d1.NewIter(nil)
+						iter1, _ := d1.NewIter(nil)
 						iter1.First()
 						if !leak {
 							require.NoError(t, iter1.Close())
@@ -764,7 +772,7 @@ func TestIterLeakSharedCache(t *testing.T) {
 					}
 
 					{
-						iter2 := d2.NewIter(nil)
+						iter2, _ := d2.NewIter(nil)
 						iter2.First()
 						if !leak {
 							require.NoError(t, iter2.Close())
@@ -789,24 +797,25 @@ func TestIterLeakSharedCache(t *testing.T) {
 
 func TestMemTableReservation(t *testing.T) {
 	opts := &Options{
-		Cache:        NewCache(128 << 10 /* 128 KB */),
-		MemTableSize: initialMemTableSize,
-		FS:           vfs.NewMem(),
+		Cache: NewCache(128 << 10 /* 128 KB */),
+		// We're going to be looking at and asserting the global memtable reservation
+		// amount below so we don't want to race with any triggered stats collections.
+		DisableTableStats: true,
+		MemTableSize:      initialMemTableSize,
+		FS:                vfs.NewMem(),
 	}
 	defer opts.Cache.Unref()
 	opts.testingRandomized(t)
 	opts.EnsureDefaults()
-	// We're going to be looking at and asserting the global memtable reservation
-	// amount below so we don't want to race with any triggered stats collections.
-	opts.private.disableTableStats = true
 
 	// Add a block to the cache. Note that the memtable size is larger than the
 	// cache size, so opening the DB should cause this block to be evicted.
 	tmpID := opts.Cache.NewID()
 	helloWorld := []byte("hello world")
 	value := cache.Alloc(len(helloWorld))
-	copy(value.Buf(), helloWorld)
-	opts.Cache.Set(tmpID, base.FileNum(0).DiskFileNum(), 0, value).Release()
+	copy(value.RawBuffer(), helloWorld)
+	opts.Cache.Set(tmpID, base.DiskFileNum(0), 0, value)
+	value.Release()
 
 	d, err := Open("", opts)
 	require.NoError(t, err)
@@ -823,8 +832,8 @@ func TestMemTableReservation(t *testing.T) {
 		t.Fatalf("expected 2 refs, but found %d", refs)
 	}
 	// Verify the memtable reservation has caused our test block to be evicted.
-	if h := opts.Cache.Get(tmpID, base.FileNum(0).DiskFileNum(), 0); h.Get() != nil {
-		t.Fatalf("expected failure, but found success: %s", h.Get())
+	if cv := opts.Cache.Get(tmpID, base.DiskFileNum(0), 0); cv != nil {
+		t.Fatalf("expected failure, but found success: %#v", cv)
 	}
 
 	// Flush the memtable. The memtable reservation should double because old
@@ -837,7 +846,7 @@ func TestMemTableReservation(t *testing.T) {
 	// Flush in the presence of an active iterator. The iterator will hold a
 	// reference to a readState which will in turn hold a reader reference to the
 	// memtable.
-	iter := d.NewIter(nil)
+	iter, _ := d.NewIter(nil)
 	require.NoError(t, d.Flush())
 	// The flush moved the recycled memtable into position as an active mutable
 	// memtable. There are now two allocated memtables: 1 mutable and 1 pinned
@@ -895,7 +904,7 @@ func TestCacheEvict(t *testing.T) {
 	}
 
 	require.NoError(t, d.Flush())
-	iter := d.NewIter(nil)
+	iter, _ := d.NewIter(nil)
 	for iter.First(); iter.Valid(); iter.Next() {
 	}
 	require.NoError(t, iter.Close())
@@ -930,7 +939,7 @@ func TestFlushEmpty(t *testing.T) {
 }
 
 func TestRollManifest(t *testing.T) {
-	toPreserve := rand.Int31n(5) + 1
+	toPreserve := rand.Int32N(5) + 1
 	opts := &Options{
 		MaxManifestFileSize:   1,
 		L0CompactionThreshold: 10,
@@ -943,7 +952,7 @@ func TestRollManifest(t *testing.T) {
 	d, err := Open("", opts)
 	require.NoError(t, err)
 
-	manifestFileNumber := func() FileNum {
+	manifestFileNumber := func() base.DiskFileNum {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		return d.mu.versions.manifestFileNum
@@ -961,7 +970,7 @@ func TestRollManifest(t *testing.T) {
 	}
 
 	lastManifestNum := manifestFileNumber()
-	manifestNums := []base.FileNum{lastManifestNum}
+	manifestNums := []base.DiskFileNum{lastManifestNum}
 	for i := 0; i < 5; i++ {
 		// MaxManifestFileSize is 1, but the rollover logic also counts edits
 		// since the last snapshot to decide on rollover, so do as many flushes as
@@ -1031,10 +1040,7 @@ func TestRollManifest(t *testing.T) {
 			manifests = append(manifests, filename)
 		}
 	}
-
-	sort.Slice(manifests, func(i, j int) bool {
-		return manifests[i] < manifests[j]
-	})
+	slices.Sort(manifests)
 
 	var expected []string
 	for i := len(manifestNums) - int(toPreserve) - 1; i < len(manifestNums); i++ {
@@ -1105,7 +1111,7 @@ func TestDBClosed(t *testing.T) {
 	require.True(t, errors.Is(catch(func() { _, _, _ = d.Get(nil) }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _ = d.Delete(nil, nil) }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _ = d.DeleteRange(nil, nil, nil) }), ErrClosed))
-	require.True(t, errors.Is(catch(func() { _ = d.Ingest(nil) }), ErrClosed))
+	require.True(t, errors.Is(catch(func() { _ = d.Ingest(context.Background(), nil) }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _ = d.LogData(nil, nil) }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _ = d.Merge(nil, nil, nil) }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _ = d.RatchetFormatMajorVersion(internalFormatNewest) }), ErrClosed))
@@ -1116,7 +1122,7 @@ func TestDBClosed(t *testing.T) {
 	b := d.NewIndexedBatch()
 	require.True(t, errors.Is(catch(func() { _ = b.Commit(nil) }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _ = d.Apply(b, nil) }), ErrClosed))
-	require.True(t, errors.Is(catch(func() { _ = b.NewIter(nil) }), ErrClosed))
+	require.True(t, errors.Is(catch(func() { _, _ = b.NewIter(nil) }), ErrClosed))
 }
 
 func TestDBConcurrentCommitCompactFlush(t *testing.T) {
@@ -1170,14 +1176,14 @@ func TestDBConcurrentCompactClose(t *testing.T) {
 		// causing compactions to be running concurrently with the close below.
 		for j := 0; j < 10; j++ {
 			path := fmt.Sprintf("ext%d", j)
-			f, err := mem.Create(path)
+			f, err := mem.Create(path, vfs.WriteCategoryUnspecified)
 			require.NoError(t, err)
 			w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-				TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+				TableFormat: d.TableFormat(),
 			})
 			require.NoError(t, w.Set([]byte(fmt.Sprint(j)), nil))
 			require.NoError(t, w.Close())
-			require.NoError(t, d.Ingest([]string{path}))
+			require.NoError(t, d.Ingest(context.Background(), []string{path}))
 		}
 
 		require.NoError(t, d.Close())
@@ -1238,7 +1244,7 @@ func TestCloseCleanerRace(t *testing.T) {
 		require.NoError(t, db.Set([]byte("a"), []byte("something"), Sync))
 		require.NoError(t, db.Flush())
 		// Ref the sstables so cannot be deleted.
-		it := db.NewIter(nil)
+		it, _ := db.NewIter(nil)
 		require.NotNil(t, it)
 		require.NoError(t, db.DeleteRange([]byte("a"), []byte("b"), Sync))
 		require.NoError(t, db.Compact([]byte("a"), []byte("b"), false))
@@ -1289,10 +1295,6 @@ func TestSSTablesWithApproximateSpanBytes(t *testing.T) {
 	require.NoError(t, d.Set([]byte("g"), nil, nil))
 	require.NoError(t, d.Flush())
 
-	// cannot use WithApproximateSpanBytes without WithProperties.
-	_, err = d.SSTables(WithKeyRangeFilter([]byte("a"), []byte("e")), WithApproximateSpanBytes())
-	require.Error(t, err)
-
 	// cannot use WithApproximateSpanBytes without WithKeyRangeFilter.
 	_, err = d.SSTables(WithProperties(), WithApproximateSpanBytes())
 	require.Error(t, err)
@@ -1302,13 +1304,11 @@ func TestSSTablesWithApproximateSpanBytes(t *testing.T) {
 
 	for _, levelTables := range tableInfos {
 		for _, table := range levelTables {
-			approximateSpanBytes, err := strconv.ParseInt(table.Properties.UserProperties["approximate-span-bytes"], 10, 64)
-			require.NoError(t, err)
 			if table.FileNum == 5 {
-				require.Equal(t, uint64(approximateSpanBytes), table.Size)
+				require.Equal(t, table.ApproximateSpanBytes, table.Size)
 			}
 			if table.FileNum == 7 {
-				require.Less(t, uint64(approximateSpanBytes), table.Size)
+				require.Less(t, table.ApproximateSpanBytes, table.Size)
 			}
 		}
 	}
@@ -1396,14 +1396,18 @@ type testTracer struct {
 }
 
 func (t *testTracer) Infof(format string, args ...interface{})  {}
+func (t *testTracer) Errorf(format string, args ...interface{}) {}
 func (t *testTracer) Fatalf(format string, args ...interface{}) {}
 
 func (t *testTracer) Eventf(ctx context.Context, format string, args ...interface{}) {
 	if t.enabledOnlyForNonBackgroundContext && ctx == context.Background() {
 		return
 	}
-	fmt.Fprintf(&t.buf, format, args...)
-	fmt.Fprint(&t.buf, "\n")
+	str := fmt.Sprintf(format, args...)
+	// Redact known strings that depend on source code line numbers.
+	str = regexp.MustCompile(`\(fileNum=[^)]+\)$`).ReplaceAllString(str, "(<redacted>)")
+	t.buf.WriteString(str)
+	t.buf.WriteString("\n")
 }
 
 func (t *testTracer) IsTracingEnabled(ctx context.Context) bool {
@@ -1414,64 +1418,77 @@ func (t *testTracer) IsTracingEnabled(ctx context.Context) bool {
 }
 
 func TestTracing(t *testing.T) {
-	if !invariants.Enabled {
-		// The test relies on timing behavior injected when invariants.Enabled.
-		return
-	}
+	defer block.DeterministicReadBlockDurationForTesting()()
+
 	var tracer testTracer
-	c := NewCache(0)
-	defer c.Unref()
-	d, err := Open("", &Options{
-		FS:              vfs.NewMem(),
-		Cache:           c,
-		LoggerAndTracer: &tracer,
-	})
-	require.NoError(t, err)
+	buf := &tracer.buf
+	var db *DB
 	defer func() {
-		require.NoError(t, d.Close())
+		if db != nil {
+			db.Close()
+		}
 	}()
-
-	// Create a sstable.
-	require.NoError(t, d.Set([]byte("hello"), nil, nil))
-	require.NoError(t, d.Flush())
-	_, closer, err := d.Get([]byte("hello"))
-	require.NoError(t, err)
-	closer.Close()
-	readerInitTraceString := "reading 37 bytes took 5ms\nreading 628 bytes took 5ms\n"
-	iterTraceString := "reading 27 bytes took 5ms\nreading 29 bytes took 5ms\n"
-	require.Equal(t, readerInitTraceString+iterTraceString, tracer.buf.String())
-
-	// Get again, but since it currently uses context.Background(), no trace
-	// output is produced.
-	tracer.buf.Reset()
-	tracer.enabledOnlyForNonBackgroundContext = true
-	_, closer, err = d.Get([]byte("hello"))
-	require.NoError(t, err)
-	closer.Close()
-	require.Equal(t, "", tracer.buf.String())
-
+	cache := NewCache(0)
+	defer cache.Unref()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	iter := d.NewIterWithContext(ctx, nil)
-	iter.SeekGE([]byte("hello"))
-	iter.Close()
-	require.Equal(t, iterTraceString, tracer.buf.String())
+	datadriven.RunTest(t, "testdata/tracing", func(t *testing.T, td *datadriven.TestData) string {
+		buf.Reset()
+		tracer.enabledOnlyForNonBackgroundContext = td.HasArg("disable-background-tracing")
+		ctx := ctx
+		switch td.Cmd {
+		case "build":
+			if db != nil {
+				db.Close()
+			}
+			db = testutils.CheckErr(Open("", &Options{
+				FS:              vfs.NewMem(),
+				Comparer:        testkeys.Comparer,
+				Cache:           cache,
+				LoggerAndTracer: &tracer,
+			}))
 
-	tracer.buf.Reset()
-	snap := d.NewSnapshot()
-	iter = snap.NewIterWithContext(ctx, nil)
-	iter.SeekGE([]byte("hello"))
-	iter.Close()
-	require.Equal(t, iterTraceString, tracer.buf.String())
-	snap.Close()
+			b := db.NewBatch()
+			require.NoError(t, runBatchDefineCmd(td, b))
+			require.NoError(t, b.Commit(nil))
+			require.NoError(t, db.Flush())
+			return ""
 
-	tracer.buf.Reset()
-	b := d.NewIndexedBatch()
-	iter = b.NewIterWithContext(ctx, nil)
-	iter.SeekGE([]byte("hello"))
-	iter.Close()
-	require.Equal(t, iterTraceString, tracer.buf.String())
-	b.Close()
+		case "get":
+			for _, key := range strings.Split(td.Input, "\n") {
+				v, closer, err := db.Get([]byte(key))
+				require.NoError(t, err)
+				fmt.Fprintf(buf, "%s:%s\n", key, v)
+				closer.Close()
+			}
+
+		case "iter":
+			iter, _ := db.NewIterWithContext(ctx, &IterOptions{
+				KeyTypes: IterKeyTypePointsAndRanges,
+			})
+			buf.WriteString(runIterCmd(td, iter, true))
+
+		case "snapshot-iter":
+			snap := db.NewSnapshot()
+			defer snap.Close()
+			iter, _ := snap.NewIterWithContext(ctx, &IterOptions{
+				KeyTypes: IterKeyTypePointsAndRanges,
+			})
+			buf.WriteString(runIterCmd(td, iter, true))
+
+		case "indexed-batch-iter":
+			b := db.NewIndexedBatch()
+			defer b.Close()
+			iter, _ := b.NewIterWithContext(ctx, &IterOptions{
+				KeyTypes: IterKeyTypePointsAndRanges,
+			})
+			buf.WriteString(runIterCmd(td, iter, true))
+
+		default:
+			td.Fatalf(t, "unknown command: %s", td.Cmd)
+		}
+		return buf.String()
+	})
 }
 
 func TestMemtableIngestInversion(t *testing.T) {
@@ -1619,48 +1636,48 @@ func TestMemtableIngestInversion(t *testing.T) {
 	//           cc
 	{
 		path := "ingest1.sst"
-		f, err := memFS.Create(path)
+		f, err := memFS.Create(path, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		require.NoError(t, w.Set([]byte("cc"), []byte("foo")))
 		require.NoError(t, w.Close())
-		require.NoError(t, d.Ingest([]string{path}))
+		require.NoError(t, d.Ingest(context.Background(), []string{path}))
 	}
 	{
 		path := "ingest2.sst"
-		f, err := memFS.Create(path)
+		f, err := memFS.Create(path, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		require.NoError(t, w.Set([]byte("bb"), []byte("foo2")))
 		require.NoError(t, w.Set([]byte("cc"), []byte("foo2")))
 		require.NoError(t, w.Close())
-		require.NoError(t, d.Ingest([]string{path}))
+		require.NoError(t, d.Ingest(context.Background(), []string{path}))
 	}
 	{
 		path := "ingest3.sst"
-		f, err := memFS.Create(path)
+		f, err := memFS.Create(path, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		require.NoError(t, w.Set([]byte("bb"), []byte("foo3")))
 		require.NoError(t, w.Close())
-		require.NoError(t, d.Ingest([]string{path}))
+		require.NoError(t, d.Ingest(context.Background(), []string{path}))
 	}
 	{
 		path := "ingest4.sst"
-		f, err := memFS.Create(path)
+		f, err := memFS.Create(path, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		require.NoError(t, w.Set([]byte("bb"), []byte("foo4")))
 		require.NoError(t, w.Close())
-		require.NoError(t, d.Ingest([]string{path}))
+		require.NoError(t, d.Ingest(context.Background(), []string{path}))
 	}
 
 	// We now have a base compaction blocked. Block a memtable flush to cause
@@ -1732,14 +1749,14 @@ func TestMemtableIngestInversion(t *testing.T) {
 	//           cc
 	{
 		path := "ingest5.sst"
-		f, err := memFS.Create(path)
+		f, err := memFS.Create(path, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		require.NoError(t, w.DeleteRange([]byte("cc"), []byte("e")))
 		require.NoError(t, w.Close())
-		require.NoError(t, d.Ingest([]string{path}))
+		require.NoError(t, d.Ingest(context.Background(), []string{path}))
 	}
 	t.Log("main ingest complete")
 	printLSM()
@@ -1766,14 +1783,14 @@ func TestMemtableIngestInversion(t *testing.T) {
 	//           cc
 	{
 		path := "ingest6.sst"
-		f, err := memFS.Create(path)
+		f, err := memFS.Create(path, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		require.NoError(t, w.Set([]byte("cc"), []byte("doesntmatter")))
 		require.NoError(t, w.Close())
-		require.NoError(t, d.Ingest([]string{path}))
+		require.NoError(t, d.Ingest(context.Background(), []string{path}))
 	}
 
 	// Unblock earlier flushes. We will first finish flushing the blocked
@@ -1847,7 +1864,7 @@ func TestMemtableIngestInversion(t *testing.T) {
 }
 
 func BenchmarkDelete(b *testing.B) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	const keyCount = 10000
 	var keys [keyCount][]byte
 	for i := 0; i < keyCount; i++ {
@@ -1924,7 +1941,7 @@ func BenchmarkNewIterReadAmp(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				b.StartTimer()
-				iter := d.NewIter(nil)
+				iter, _ := d.NewIter(nil)
 				b.StopTimer()
 				require.NoError(b, iter.Close())
 			}
@@ -1966,5 +1983,481 @@ func BenchmarkRotateMemtables(b *testing.B) {
 		if err := d.Flush(); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// TODO(sumeer): rewrite test when LogRecycler is hidden from this package.
+func TestRecycleLogs(t *testing.T) {
+	mem := vfs.NewMem()
+	d, err := Open("", &Options{
+		FS: mem,
+	})
+	require.NoError(t, err)
+
+	logNum := func() base.DiskFileNum {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		walNums := d.mu.log.manager.List()
+		return base.DiskFileNum(walNums[len(walNums)-1].Num)
+	}
+	logCount := func() int {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		walNums := d.mu.log.manager.List()
+		return len(walNums)
+	}
+
+	recycler := d.mu.log.manager.RecyclerForTesting()
+	// Flush the memtable a few times, forcing rotation of the WAL. We should see
+	// the recycled logs change as expected.
+	require.EqualValues(t, []base.DiskFileNum(nil), recycler.LogNumsForTesting())
+	curLog := logNum()
+
+	require.NoError(t, d.Flush())
+
+	require.EqualValues(t, []base.DiskFileNum{curLog}, recycler.LogNumsForTesting())
+	curLog = logNum()
+
+	require.NoError(t, d.Flush())
+
+	require.EqualValues(t, []base.DiskFileNum{curLog}, recycler.LogNumsForTesting())
+
+	require.NoError(t, d.Close())
+
+	d, err = Open("", &Options{
+		FS:     mem,
+		Logger: testLogger{t},
+	})
+	require.NoError(t, err)
+	recycler = d.mu.log.manager.RecyclerForTesting()
+	metrics := d.Metrics()
+	if n := logCount(); n != int(metrics.WAL.Files) {
+		t.Fatalf("expected %d WAL files, but found %d", n, metrics.WAL.Files)
+	}
+	if n, sz := recycler.Stats(); n != int(metrics.WAL.ObsoleteFiles) {
+		t.Fatalf("expected %d obsolete WAL files, but found %d", n, metrics.WAL.ObsoleteFiles)
+	} else if sz != metrics.WAL.ObsoletePhysicalSize {
+		t.Fatalf("expected %d obsolete physical WAL size, but found %d", sz, metrics.WAL.ObsoletePhysicalSize)
+	}
+	if recycled := recycler.LogNumsForTesting(); len(recycled) != 0 {
+		t.Fatalf("expected no recycled WAL files after recovery, but found %d", recycled)
+	}
+	require.NoError(t, d.Close())
+}
+
+type sstAndLogFileBlockingFS struct {
+	vfs.FS
+	unblocker sync.WaitGroup
+}
+
+var _ vfs.FS = &sstAndLogFileBlockingFS{}
+
+func (fs *sstAndLogFileBlockingFS) Create(
+	name string, category vfs.DiskWriteCategory,
+) (vfs.File, error) {
+	if strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".sst") {
+		fs.unblocker.Wait()
+	}
+	return fs.FS.Create(name, category)
+}
+
+func (fs *sstAndLogFileBlockingFS) unblock() {
+	fs.unblocker.Done()
+}
+
+func newBlockingFS(fs vfs.FS) *sstAndLogFileBlockingFS {
+	lfbfs := &sstAndLogFileBlockingFS{FS: fs}
+	lfbfs.unblocker.Add(1)
+	return lfbfs
+}
+
+func TestWALFailoverAvoidsWriteStall(t *testing.T) {
+	mem := vfs.NewMem()
+	// All sst and log creation is blocked.
+	primaryFS := newBlockingFS(mem)
+	// Secondary for WAL failover can do log creation.
+	secondary := wal.Dir{FS: mem, Dirname: "secondary"}
+	walFailover := &WALFailoverOptions{Secondary: secondary, FailoverOptions: wal.FailoverOptions{
+		UnhealthySamplingInterval:          100 * time.Millisecond,
+		UnhealthyOperationLatencyThreshold: func() (time.Duration, bool) { return time.Second, true },
+	}}
+	o := &Options{
+		FS:                          primaryFS,
+		MemTableSize:                4 << 20,
+		MemTableStopWritesThreshold: 2,
+		WALFailover:                 walFailover,
+	}
+	d, err := Open("", o)
+	require.NoError(t, err)
+	defer d.Close()
+	value := make([]byte, 1<<20)
+	for i := range value {
+		value[i] = byte(rand.Uint32())
+	}
+	// After ~8 writes, the default write stall threshold is exceeded, but the
+	// writes will not block indefinitely since failover has or will happen, and
+	// wal.Manager.ElevateWriteStallThresholdForFailover() will return true.
+	for i := 0; i < 200; i++ {
+		require.NoError(t, d.Set([]byte(fmt.Sprintf("%d", i)), value, nil))
+	}
+	// Validate that the default write stall threshold was exceeded.
+	require.Greater(
+		t, d.Metrics().MemTable.Size, o.MemTableSize*uint64(o.MemTableStopWritesThreshold))
+	// Unblock the writes to allow the DB to close.
+	primaryFS.unblock()
+}
+
+// TestDeterminism is a datadriven test intended to validate determinism of
+// operations in the face of concurrency or randomizing of operations. The test
+// data defines a sequence of commands run sequentially. Then the test may
+// re-run the sequence introducing latencies, reorderings, parallelism, etc,
+// ensuring that all re-runs produce the same output.
+func TestDeterminism(t *testing.T) {
+	var d *DB
+	var fs vfs.FS = vfs.NewMem()
+	defer func() {
+		if d != nil {
+			require.NoError(t, d.Close())
+		}
+	}()
+
+	type step struct {
+		fn     func(td *datadriven.TestData) string
+		td     datadriven.TestData
+		output string
+	}
+	var sequence []step
+	addStep := func(td *datadriven.TestData, fn func(td *datadriven.TestData) string) string {
+		s := strings.TrimSpace(fn(td))
+		sequence = append(sequence, step{
+			fn:     fn,
+			td:     *td,
+			output: s,
+		})
+		if len(s) > 0 {
+			s = s + "\n"
+		}
+		return s + fmt.Sprintf("%d:%s", len(sequence)-1, td.Cmd)
+	}
+
+	datadriven.RunTest(t, "testdata/determinism",
+		func(t *testing.T, td *datadriven.TestData) string {
+			switch td.Cmd {
+			case "reset":
+				fs = vfs.NewMem()
+				sequence = nil
+				return ""
+			case "define":
+				return addStep(td, func(td *datadriven.TestData) string {
+					opts := &Options{
+						FS:                          fs,
+						DebugCheck:                  DebugCheckLevels,
+						Logger:                      testLogger{t},
+						FormatMajorVersion:          FormatNewest,
+						DisableAutomaticCompactions: true,
+					}
+					opts.Experimental.IngestSplit = func() bool { return rand.IntN(2) == 1 }
+					var err error
+					if d, err = runDBDefineCmdReuseFS(td, opts); err != nil {
+						return err.Error()
+					}
+					return d.mu.versions.currentVersion().String()
+				})
+			case "batch":
+				return addStep(td, func(td *datadriven.TestData) string {
+					b := d.NewBatch()
+					require.NoError(t, runBatchDefineCmd(td, b))
+					require.NoError(t, b.Commit(nil))
+					return ""
+				})
+			case "build":
+				return addStep(td, func(td *datadriven.TestData) string {
+					require.NoError(t, runBuildCmd(td, d, fs))
+					return ""
+				})
+			case "flush":
+				return addStep(td, func(td *datadriven.TestData) string {
+					_, err := d.AsyncFlush()
+					if err != nil {
+						return err.Error()
+					}
+					return ""
+				})
+			case "ingest-and-excise":
+				return addStep(td, func(td *datadriven.TestData) string {
+					if err := runIngestAndExciseCmd(td, d, fs); err != nil {
+						return err.Error()
+					}
+					return ""
+				})
+			case "maybe-compact":
+				return addStep(td, func(td *datadriven.TestData) string {
+					d.mu.Lock()
+					defer d.mu.Unlock()
+					d.opts.DisableAutomaticCompactions = false
+					d.maybeScheduleCompaction()
+					d.opts.DisableAutomaticCompactions = true
+					return ""
+				})
+			case "memtable-info":
+				return addStep(td, func(td *datadriven.TestData) string {
+					d.commit.mu.Lock()
+					defer d.commit.mu.Unlock()
+					d.mu.Lock()
+					defer d.mu.Unlock()
+					var buf bytes.Buffer
+					fmt.Fprintf(&buf, "flushable queue: %d entries\n", len(d.mu.mem.queue))
+					fmt.Fprintf(&buf, "mutable:\n")
+					fmt.Fprintf(&buf, "  alloced:  %d\n", d.mu.mem.mutable.totalBytes())
+					if td.HasArg("reserved") {
+						fmt.Fprintf(&buf, "  reserved: %d\n", d.mu.mem.mutable.reserved)
+					}
+					if td.HasArg("in-use") {
+						fmt.Fprintf(&buf, "  in-use:   %d\n", d.mu.mem.mutable.inuseBytes())
+					}
+					return buf.String()
+				})
+			case "run":
+				var mkfs func() vfs.FS = func() vfs.FS { return vfs.NewMem() }
+				var beforeStep func() = func() {}
+				for _, cmdArg := range td.CmdArgs {
+					switch cmdArg.Key {
+					case "io-latency", "step-latency":
+						p, err := strconv.ParseFloat(cmdArg.Vals[0], 64)
+						require.NoError(t, err)
+						mean, err := time.ParseDuration(cmdArg.Vals[1])
+						require.NoError(t, err)
+						if cmdArg.Key == "io-latency" {
+							prevMkfs := mkfs
+							mkfs = func() vfs.FS {
+								return errorfs.Wrap(prevMkfs(), errorfs.RandomLatency(
+									errorfs.Randomly(p, 0), mean, 0 /* seed */, 0 /* no limit */))
+							}
+						} else if cmdArg.Key == "step-latency" {
+							beforeStep = func() {
+								if rand.Float64() < p {
+									time.Sleep(time.Duration(min(rand.ExpFloat64(), 20.0) * float64(mean)))
+								}
+							}
+						}
+					}
+				}
+				ordering := parseOrdering(td.Input)
+
+				var sb strings.Builder
+				rerunSequence := func() string {
+					sb.Reset()
+					fs = mkfs()
+					output := make([]string, len(sequence))
+					ordering.visit(func(i int) {
+						beforeStep()
+						output[i] = strings.TrimSpace(sequence[i].fn(&sequence[i].td))
+					})
+					for i := range output {
+						if output[i] != sequence[i].output {
+							fmt.Fprintf(&sb, "# step %d: %s\n", i, sequence[i].td.Cmd)
+							fmt.Fprintf(&sb, "expected:\n%s\ngot:\n%s", sequence[i].output, output[i])
+							fmt.Fprintln(&sb)
+						}
+					}
+					return sb.String()
+				}
+				retries := 10
+				td.MaybeScanArgs(t, "count", &retries)
+				for i := 0; i < retries; i++ {
+					if diff := rerunSequence(); len(diff) > 0 {
+						return diff
+					}
+				}
+				return "ok"
+			default:
+				return fmt.Sprintf("unknown command: %s", td.Cmd)
+			}
+		})
+}
+
+type orderingNode interface {
+	visit(func(int))
+}
+
+type sequential []orderingNode
+
+func (s sequential) visit(fn func(int)) {
+	for _, n := range s {
+		n.visit(fn)
+	}
+}
+
+type reorder []orderingNode
+
+func (r reorder) visit(fn func(int)) {
+	for _, i := range rand.Perm(len(r)) {
+		r[i].visit(fn)
+	}
+}
+
+type parallel []orderingNode
+
+func (p parallel) visit(fn func(int)) {
+	var wg sync.WaitGroup
+	wg.Add(len(p))
+	for i := range p {
+		go func(i int) {
+			defer wg.Done()
+			p[i].visit(fn)
+		}(i)
+	}
+	wg.Wait()
+}
+
+type leaf int
+
+func (l leaf) visit(fn func(int)) { fn(int(l)) }
+
+func parseOrdering(s string) orderingNode {
+	n, _ := parseOrderingTokens(strings.Fields(s))
+	return n
+}
+
+func parseOrderingTokens(tokens []string) (orderingNode, int) {
+	if len(tokens) == 0 {
+		return nil, 0
+	}
+	switch tokens[0] {
+	case ")":
+		panic("unexpected )")
+	case "sequential(", "reorder(", "parallel(":
+		var nodes []orderingNode
+		i := 1
+		for i < len(tokens) {
+			if tokens[i] == ")" {
+				i++
+				break
+			}
+			n, m := parseOrderingTokens(tokens[i:])
+			nodes = append(nodes, n)
+			i += m
+		}
+		switch tokens[0] {
+		case "sequential(":
+			return sequential(nodes), i
+		case "reorder(":
+			return reorder(nodes), i
+		case "parallel(":
+			return parallel(nodes), i
+		default:
+			panic("unreachable")
+		}
+	default:
+		n := strings.IndexByte(tokens[0], ':')
+		if n == -1 {
+			n = len(tokens[0])
+		}
+		v, err := strconv.Atoi(tokens[0][:n])
+		if err != nil {
+			panic(err)
+		}
+		return leaf(v), 1
+	}
+}
+
+type readTrackFS struct {
+	vfs.FS
+
+	currReadCount atomic.Int32
+	maxReadCount  atomic.Int32
+}
+
+type readTrackFile struct {
+	vfs.File
+	fs *readTrackFS
+}
+
+func (fs *readTrackFS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
+	file, err := fs.FS.Open(name, opts...)
+	if err != nil || !strings.HasSuffix(name, ".sst") {
+		return file, err
+	}
+	return &readTrackFile{
+		File: file,
+		fs:   fs,
+	}, nil
+}
+
+func (f *readTrackFile) ReadAt(p []byte, off int64) (n int, err error) {
+	val := f.fs.currReadCount.Add(1)
+	defer f.fs.currReadCount.Add(-1)
+	for maxVal := f.fs.maxReadCount.Load(); val > maxVal; maxVal = f.fs.maxReadCount.Load() {
+		if f.fs.maxReadCount.CompareAndSwap(maxVal, val) {
+			break
+		}
+	}
+	return f.File.ReadAt(p, off)
+}
+
+func TestLoadBlockSema(t *testing.T) {
+	fs := &readTrackFS{FS: vfs.NewMem()}
+	sema := fifo.NewSemaphore(100)
+	db, err := Open("", testingRandomized(t, &Options{
+		Cache:         cache.New(1),
+		FS:            fs,
+		LoadBlockSema: sema,
+	}))
+	require.NoError(t, err)
+
+	key := func(i, j int) []byte {
+		return []byte(fmt.Sprintf("%02d/%02d", i, j))
+	}
+
+	// Create 20 regions and compact them separately, so we end up with 20
+	// disjoint tables.
+	const numRegions = 20
+	const numKeys = 20
+	for i := 0; i < numRegions; i++ {
+		for j := 0; j < numKeys; j++ {
+			require.NoError(t, db.Set(key(i, j), []byte("value"), nil))
+		}
+		require.NoError(t, db.Compact(key(i, 0), key(i, numKeys-1), false))
+	}
+
+	// Read all regions to warm up the file cache.
+	for i := 0; i < numRegions; i++ {
+		val, closer, err := db.Get(key(i, 1))
+		require.NoError(t, err)
+		require.Equal(t, []byte("value"), val)
+		if closer != nil {
+			closer.Close()
+		}
+	}
+
+	for _, n := range []int64{1, 2, 4} {
+		t.Run(fmt.Sprintf("%d", n), func(t *testing.T) {
+			sema.UpdateCapacity(n)
+			fs.maxReadCount.Store(0)
+			var wg sync.WaitGroup
+			// Spin up workers that perform random reads.
+			const numWorkers = 20
+			for i := 0; i < numWorkers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					const numQueries = 100
+					for i := 0; i < numQueries; i++ {
+						val, closer, err := db.Get(key(rand.IntN(numRegions), rand.IntN(numKeys)))
+						require.NoError(t, err)
+						require.Equal(t, []byte("value"), val)
+						if closer != nil {
+							closer.Close()
+						}
+						runtime.Gosched()
+					}
+				}()
+			}
+			wg.Wait()
+			// Verify the maximum read count did not exceed the limit.
+			maxReadCount := fs.maxReadCount.Load()
+			require.Greater(t, maxReadCount, int32(0))
+			require.LessOrEqual(t, maxReadCount, int32(n))
+		})
 	}
 }

@@ -6,20 +6,23 @@ package tool
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/internal/keyspan"
-	"github.com/cockroachdb/pebble/internal/private"
 	"github.com/cockroachdb/pebble/internal/rangedel"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/spf13/cobra"
 )
@@ -145,14 +148,13 @@ func (s *sstableT) newReader(f vfs.File) (*sstable.Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	o := sstable.ReaderOptions{
-		Cache:    pebble.NewCache(128 << 20 /* 128 MB */),
-		Comparer: s.opts.Comparer,
-		Filters:  s.opts.Filters,
-	}
-	defer o.Cache.Unref()
-	return sstable.NewReader(readable, o, s.comparers, s.mergers,
-		private.SSTableRawTombstonesOpt.(sstable.ReaderOption))
+	o := s.opts.MakeReaderOptions()
+	o.Comparers = s.comparers
+	o.Mergers = s.mergers
+	c := pebble.NewCache(128 << 20 /* 128 MB */)
+	defer c.Unref()
+	o.CacheOpts = sstableinternal.CacheOptions{Cache: c}
+	return sstable.NewReader(context.Background(), readable, o)
 }
 
 func (s *sstableT) runCheck(cmd *cobra.Command, args []string) {
@@ -178,45 +180,38 @@ func (s *sstableT) runCheck(cmd *cobra.Command, args []string) {
 		s.fmtKey.setForComparer(r.Properties.ComparerName, s.comparers)
 		s.fmtValue.setForComparer(r.Properties.ComparerName, s.comparers)
 
-		iter, err := r.NewIter(nil, nil)
+		iter, err := r.NewIter(sstable.NoTransforms, nil, nil)
 		if err != nil {
 			fmt.Fprintf(stderr, "%s\n", err)
 			return
 		}
 
-		// If a split function is defined for the comparer, verify that
-		// SeekPrefixGE can find every key in the table.
-		var prefixIter sstable.Iterator
-		if r.Split != nil {
-			var err error
-			prefixIter, err = r.NewIter(nil, nil)
-			if err != nil {
-				fmt.Fprintf(stderr, "%s\n", err)
-				return
-			}
+		// Verify that SeekPrefixGE can find every key in the table.
+		prefixIter, err := r.NewIter(sstable.NoTransforms, nil, nil)
+		if err != nil {
+			fmt.Fprintf(stderr, "%s\n", err)
+			return
 		}
 
 		var lastKey base.InternalKey
-		for key, _ := iter.First(); key != nil; key, _ = iter.Next() {
-			if base.InternalCompare(r.Compare, lastKey, *key) >= 0 {
+		for kv := iter.First(); kv != nil; kv = iter.Next() {
+			if base.InternalCompare(r.Compare, lastKey, kv.K) >= 0 {
 				fmt.Fprintf(stdout, "WARNING: OUT OF ORDER KEYS!\n")
 				if s.fmtKey.spec != "null" {
 					fmt.Fprintf(stdout, "    %s >= %s\n",
-						lastKey.Pretty(s.fmtKey.fn), key.Pretty(s.fmtKey.fn))
+						lastKey.Pretty(s.fmtKey.fn), kv.K.Pretty(s.fmtKey.fn))
 				}
 			}
-			lastKey.Trailer = key.Trailer
-			lastKey.UserKey = append(lastKey.UserKey[:0], key.UserKey...)
+			lastKey.Trailer = kv.K.Trailer
+			lastKey.UserKey = append(lastKey.UserKey[:0], kv.K.UserKey...)
 
-			if prefixIter != nil {
-				n := r.Split(key.UserKey)
-				prefix := key.UserKey[:n]
-				key2, _ := prefixIter.SeekPrefixGE(prefix, key.UserKey, base.SeekGEFlagsNone)
-				if key2 == nil {
-					fmt.Fprintf(stdout, "WARNING: PREFIX ITERATION FAILURE!\n")
-					if s.fmtKey.spec != "null" {
-						fmt.Fprintf(stdout, "    %s not found\n", key.Pretty(s.fmtKey.fn))
-					}
+			n := r.Split(kv.K.UserKey)
+			prefix := kv.K.UserKey[:n]
+			kv2 := prefixIter.SeekPrefixGE(prefix, kv.K.UserKey, base.SeekGEFlagsNone)
+			if kv2 == nil {
+				fmt.Fprintf(stdout, "WARNING: PREFIX ITERATION FAILURE!\n")
+				if s.fmtKey.spec != "null" {
+					fmt.Fprintf(stdout, "    %s not found\n", kv.K.Pretty(s.fmtKey.fn))
 				}
 			}
 		}
@@ -224,10 +219,8 @@ func (s *sstableT) runCheck(cmd *cobra.Command, args []string) {
 		if err := iter.Close(); err != nil {
 			fmt.Fprintf(stdout, "%s\n", err)
 		}
-		if prefixIter != nil {
-			if err := prefixIter.Close(); err != nil {
-				fmt.Fprintf(stdout, "%s\n", err)
-			}
+		if err := prefixIter.Close(); err != nil {
+			fmt.Fprintf(stdout, "%s\n", err)
 		}
 	})
 }
@@ -259,13 +252,16 @@ func (s *sstableT) runLayout(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(stderr, "%s\n", err)
 			return
 		}
-		fmtRecord := func(key *base.InternalKey, value []byte) {
-			formatKeyValue(stdout, s.fmtKey, s.fmtValue, key, value)
+		var fmtRecord func(key *base.InternalKey, value []byte) string
+		if s.fmtKey.spec != "null" || s.fmtValue.spec != "null" {
+			var buf bytes.Buffer
+			fmtRecord = func(key *base.InternalKey, value []byte) string {
+				buf.Reset()
+				formatKeyValue(&buf, s.fmtKey, s.fmtValue, key, value)
+				return strings.TrimRight(buf.String(), "\n")
+			}
 		}
-		if s.fmtKey.spec == "null" && s.fmtValue.spec == "null" {
-			fmtRecord = nil
-		}
-		l.Describe(stdout, s.verbose, r, fmtRecord)
+		_, _ = stdout.Write([]byte(l.Describe(s.verbose, r, fmtRecord)))
 	})
 }
 
@@ -307,6 +303,13 @@ func (s *sstableT) runProperties(cmd *cobra.Command, args []string) {
 		}
 
 		tw := tabwriter.NewWriter(stdout, 2, 1, 2, ' ', 0)
+		fmt.Fprintf(tw, "format\t")
+		format, err := r.TableFormat()
+		if err != nil {
+			fmt.Fprintf(tw, "error when retrieving format %s\n", err)
+		} else {
+			fmt.Fprintf(tw, "%s\n", format.String())
+		}
 		fmt.Fprintf(tw, "size\t\n")
 		fmt.Fprintf(tw, "  file\t%s\n", humanize.Bytes.Int64(stat.Size()))
 		fmt.Fprintf(tw, "  data\t%s\n", humanize.Bytes.Uint64(r.Properties.DataSize))
@@ -331,16 +334,14 @@ func (s *sstableT) runProperties(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(tw, "  range-key-unset\t%d\n", r.Properties.NumRangeKeyUnsets)
 		fmt.Fprintf(tw, "  range-key-delete\t%d\n", r.Properties.NumRangeKeyDels)
 		fmt.Fprintf(tw, "  merge\t%d\n", r.Properties.NumMergeOperands)
-		fmt.Fprintf(tw, "  global-seq-num\t%d\n", r.Properties.GlobalSeqNum)
 		fmt.Fprintf(tw, "  pinned\t%d\n", r.Properties.SnapshotPinnedKeys)
 		fmt.Fprintf(tw, "index\t\n")
 		fmt.Fprintf(tw, "  key\t")
 		fmt.Fprintf(tw, "  value\t")
 		fmt.Fprintf(tw, "comparer\t%s\n", r.Properties.ComparerName)
+		fmt.Fprintf(tw, "key-schema\t%s\n", formatNull(r.Properties.KeySchemaName))
 		fmt.Fprintf(tw, "merger\t%s\n", formatNull(r.Properties.MergerName))
 		fmt.Fprintf(tw, "filter\t%s\n", formatNull(r.Properties.FilterPolicyName))
-		fmt.Fprintf(tw, "  prefix\t%t\n", r.Properties.PrefixFiltering)
-		fmt.Fprintf(tw, "  whole-key\t%t\n", r.Properties.WholeKeyFiltering)
 		fmt.Fprintf(tw, "compression\t%s\n", r.Properties.CompressionName)
 		fmt.Fprintf(tw, "  options\t%s\n", r.Properties.CompressionOptions)
 		fmt.Fprintf(tw, "user properties\t\n")
@@ -349,7 +350,7 @@ func (s *sstableT) runProperties(cmd *cobra.Command, args []string) {
 		for key := range r.Properties.UserProperties {
 			keys = append(keys, key)
 		}
-		sort.Strings(keys)
+		slices.Sort(keys)
 		for _, key := range keys {
 			fmt.Fprintf(tw, "  %s\t%s\n", key, r.Properties.UserProperties[key])
 		}
@@ -386,19 +387,25 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 		s.fmtKey.setForComparer(r.Properties.ComparerName, s.comparers)
 		s.fmtValue.setForComparer(r.Properties.ComparerName, s.comparers)
 
-		iter, err := r.NewIter(nil, s.end)
+		iter, err := r.NewIter(sstable.NoTransforms, nil, s.end)
 		if err != nil {
 			fmt.Fprintf(stderr, "%s%s\n", prefix, err)
 			return
 		}
-		defer iter.Close()
-		key, value := iter.SeekGE(s.start, base.SeekGEFlagsNone)
+		iterCloser := base.CloseHelper(iter)
+		defer iterCloser.Close()
+		var kv *base.InternalKV
+		if s.start == nil {
+			kv = iter.First()
+		} else {
+			kv = iter.SeekGE(s.start, base.SeekGEFlagsNone)
+		}
 
 		// We configured sstable.Reader to return raw tombstones which requires a
 		// bit more work here to put them in a form that can be iterated in
 		// parallel with the point records.
 		rangeDelIter, err := func() (keyspan.FragmentIterator, error) {
-			iter, err := r.NewRawRangeDelIter()
+			iter, err := r.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, block.NoReadEnv)
 			if err != nil {
 				return nil, err
 			}
@@ -408,20 +415,24 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 			defer iter.Close()
 
 			var tombstones []keyspan.Span
-			for t := iter.First(); t != nil; t = iter.Next() {
+			t, err := iter.First()
+			for ; t != nil; t, err = iter.Next() {
 				if s.end != nil && r.Compare(s.end, t.Start) <= 0 {
 					// The range tombstone lies after the scan range.
 					continue
 				}
-				if r.Compare(s.start, t.End) >= 0 {
+				if s.start != nil && r.Compare(s.start, t.End) >= 0 {
 					// The range tombstone lies before the scan range.
 					continue
 				}
-				tombstones = append(tombstones, t.ShallowClone())
+				tombstones = append(tombstones, t.Clone())
+			}
+			if err != nil {
+				return nil, err
 			}
 
-			sort.Slice(tombstones, func(i, j int) bool {
-				return r.Compare(tombstones[i].Start, tombstones[j].Start) < 0
+			slices.SortFunc(tombstones, func(a, b keyspan.Span) int {
+				return r.Compare(a.Start, b.Start)
 			})
 			return keyspan.NewIter(r.Compare, tombstones), nil
 		}()
@@ -431,33 +442,37 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 		}
 
 		defer rangeDelIter.Close()
-		rangeDel := rangeDelIter.First()
+		rangeDel, err := rangeDelIter.First()
+		if err != nil {
+			fmt.Fprintf(stdout, "%s%s\n", prefix, err)
+			return
+		}
 		count := s.count
 
 		var lastKey base.InternalKey
-		for key != nil || rangeDel != nil {
-			if key != nil && (rangeDel == nil || r.Compare(key.UserKey, rangeDel.Start) < 0) {
+		for kv != nil || rangeDel != nil {
+			if kv != nil && (rangeDel == nil || r.Compare(kv.K.UserKey, rangeDel.Start) < 0) {
 				// The filter specifies a prefix of the key.
 				//
 				// TODO(peter): Is using prefix comparison like this kosher for all
 				// comparers? Probably not, but it is for common ones such as the
 				// Pebble default and CockroachDB's comparer.
-				if s.filter == nil || bytes.HasPrefix(key.UserKey, s.filter) {
+				if s.filter == nil || bytes.HasPrefix(kv.K.UserKey, s.filter) {
 					fmt.Fprint(stdout, prefix)
-					v, _, err := value.Value(nil)
+					v, _, err := kv.Value(nil)
 					if err != nil {
 						fmt.Fprintf(stdout, "%s%s\n", prefix, err)
 						return
 					}
-					formatKeyValue(stdout, s.fmtKey, s.fmtValue, key, v)
+					formatKeyValue(stdout, s.fmtKey, s.fmtValue, &kv.K, v)
 
 				}
-				if base.InternalCompare(r.Compare, lastKey, *key) >= 0 {
+				if base.InternalCompare(r.Compare, lastKey, kv.K) >= 0 {
 					fmt.Fprintf(stdout, "%s    WARNING: OUT OF ORDER KEYS!\n", prefix)
 				}
-				lastKey.Trailer = key.Trailer
-				lastKey.UserKey = append(lastKey.UserKey[:0], key.UserKey...)
-				key, value = iter.Next()
+				lastKey.Trailer = kv.K.Trailer
+				lastKey.UserKey = append(lastKey.UserKey[:0], kv.K.UserKey...)
+				kv = iter.Next()
 			} else {
 				// If a filter is specified, we want to output any range tombstone
 				// which overlaps the prefix. The comparison on the start key is
@@ -468,7 +483,7 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 						bytes.HasPrefix(rangeDel.Start, s.filter)) &&
 						r.Compare(s.filter, rangeDel.End) < 0) {
 					fmt.Fprint(stdout, prefix)
-					if err := rangedel.Encode(rangeDel, func(k base.InternalKey, v []byte) error {
+					if err := rangedel.Encode(*rangeDel, func(k base.InternalKey, v []byte) error {
 						formatKeyValue(stdout, s.fmtKey, s.fmtValue, &k, v)
 						return nil
 					}); err != nil {
@@ -476,7 +491,11 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 						os.Exit(1)
 					}
 				}
-				rangeDel = rangeDelIter.Next()
+				rangeDel, err = rangeDelIter.Next()
+				if err != nil {
+					fmt.Fprintf(stdout, "%s\n", err)
+					os.Exit(1)
+				}
 			}
 
 			if count > 0 {
@@ -488,14 +507,21 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 		}
 
 		// Handle range keys.
-		rkIter, err := r.NewRawRangeKeyIter()
+		rkIter, err := r.NewRawRangeKeyIter(context.Background(), sstable.NoFragmentTransforms, block.NoReadEnv)
 		if err != nil {
 			fmt.Fprintf(stdout, "%s\n", err)
 			os.Exit(1)
 		}
 		if rkIter != nil {
 			defer rkIter.Close()
-			for span := rkIter.SeekGE(s.start); span != nil; span = rkIter.Next() {
+			var span *keyspan.Span
+			var err error
+			if s.start == nil {
+				span, err = rkIter.First()
+			} else {
+				span, err = rkIter.SeekGE(s.start)
+			}
+			for ; span != nil; span, err = rkIter.Next() {
 				// By default, emit the key, unless there is a filter.
 				emit := s.filter == nil
 				// Skip spans that start after the end key (if provided). End keys are
@@ -513,9 +539,13 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 					formatSpan(stdout, s.fmtKey, s.fmtValue, span)
 				}
 			}
+			if err != nil {
+				fmt.Fprintf(stdout, "%s\n", err)
+				os.Exit(1)
+			}
 		}
 
-		if err := iter.Close(); err != nil {
+		if err := iterCloser.Close(); err != nil {
 			fmt.Fprintf(stdout, "%s\n", err)
 		}
 	})

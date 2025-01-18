@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math/rand/v2"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -29,7 +30,6 @@ import (
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 const arenaSize = 1 << 20
@@ -39,8 +39,7 @@ const arenaSize = 1 << 20
 // returned a boolean corresponding to Valid. Only used by test code.
 type iterAdapter struct {
 	*Iterator
-	key *base.InternalKey
-	val []byte
+	kv *base.InternalKV
 }
 
 func newIterAdapter(iter *Iterator) *iterAdapter {
@@ -49,10 +48,9 @@ func newIterAdapter(iter *Iterator) *iterAdapter {
 	}
 }
 
-func (i *iterAdapter) update(key *base.InternalKey, val base.LazyValue) bool {
-	i.key = key
-	i.val = val.InPlaceValue()
-	return i.key != nil
+func (i *iterAdapter) update(kv *base.InternalKV) bool {
+	i.kv = kv
+	return i.kv != nil
 }
 
 func (i *iterAdapter) String() string {
@@ -88,15 +86,15 @@ func (i *iterAdapter) Prev() bool {
 }
 
 func (i *iterAdapter) Key() base.InternalKey {
-	return *i.key
+	return i.kv.K
 }
 
 func (i *iterAdapter) Value() []byte {
-	return i.val
+	return i.kv.V.InPlaceValue()
 }
 
 func (i *iterAdapter) Valid() bool {
-	return i.key != nil
+	return i.kv != nil
 }
 
 func makeIntKey(i int) base.InternalKey {
@@ -771,35 +769,6 @@ func TestIteratorBounds(t *testing.T) {
 	require.False(t, it.Prev())
 }
 
-func TestBytesIterated(t *testing.T) {
-	l := NewSkiplist(newArena(arenaSize), bytes.Compare)
-	emptySize := l.arena.Size()
-	for i := 0; i < 200; i++ {
-		bytesIterated := l.bytesIterated(t)
-		expected := uint64(l.arena.Size() - emptySize)
-		if bytesIterated != expected {
-			t.Fatalf("bytesIterated: got %d, want %d", bytesIterated, expected)
-		}
-		l.Add(base.InternalKey{UserKey: []byte{byte(i)}}, nil)
-	}
-}
-
-// bytesIterated returns the number of bytes iterated in the skiplist.
-func (s *Skiplist) bytesIterated(t *testing.T) (bytesIterated uint64) {
-	x := s.NewFlushIter(&bytesIterated)
-	var prevIterated uint64
-	for key, _ := x.First(); key != nil; key, _ = x.Next() {
-		if bytesIterated < prevIterated {
-			t.Fatalf("bytesIterated moved backward: %d < %d", bytesIterated, prevIterated)
-		}
-		prevIterated = bytesIterated
-	}
-	if x.Close() != nil {
-		return 0
-	}
-	return bytesIterated
-}
-
 func randomKey(rng *rand.Rand, b []byte) base.InternalKey {
 	key := rng.Uint32()
 	key2 := rng.Uint32()
@@ -819,14 +788,14 @@ func BenchmarkReadWrite(b *testing.B) {
 			var count int
 			b.RunParallel(func(pb *testing.PB) {
 				it := l.NewIter(nil, nil)
-				rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+				rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 				buf := make([]byte, 8)
 
 				for pb.Next() {
 					if rng.Float32() < readFrac {
-						key, _ := it.SeekGE(randomKey(rng, buf).UserKey, base.SeekGEFlagsNone)
-						if key != nil {
-							_ = key
+						kv := it.SeekGE(randomKey(rng, buf).UserKey, base.SeekGEFlagsNone)
+						if kv != nil {
+							_ = kv
 							count++
 						}
 					} else {
@@ -857,7 +826,7 @@ func BenchmarkOrderedWrite(b *testing.B) {
 
 func BenchmarkIterNext(b *testing.B) {
 	l := NewSkiplist(newArena(64<<10), bytes.Compare)
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	buf := make([]byte, 8)
 	for {
 		if err := l.Add(randomKey(rng, buf), nil); err == ErrArenaFull {
@@ -868,17 +837,17 @@ func BenchmarkIterNext(b *testing.B) {
 	it := l.NewIter(nil, nil)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key, _ := it.Next()
-		if key == nil {
-			key, _ = it.First()
+		kv := it.Next()
+		if kv == nil {
+			kv = it.First()
 		}
-		_ = key
+		_ = kv
 	}
 }
 
 func BenchmarkIterPrev(b *testing.B) {
 	l := NewSkiplist(newArena(64<<10), bytes.Compare)
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	buf := make([]byte, 8)
 	for {
 		if err := l.Add(randomKey(rng, buf), nil); err == ErrArenaFull {
@@ -887,14 +856,14 @@ func BenchmarkIterPrev(b *testing.B) {
 	}
 
 	it := l.NewIter(nil, nil)
-	_, _ = it.Last()
+	_ = it.Last()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key, _ := it.Prev()
-		if key == nil {
-			key, _ = it.Last()
+		kv := it.Prev()
+		if kv == nil {
+			kv = it.Last()
 		}
-		_ = key
+		_ = kv
 	}
 }
 
@@ -951,7 +920,7 @@ func BenchmarkSeekPrefixGE(b *testing.B) {
 // 			b.ResetTimer()
 // 			var count int
 // 			b.RunParallel(func(pb *testing.PB) {
-// 				rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+// 				rng := rand.New(rand.NewPCG(0, time.Now().UnixNano()))
 // 				for pb.Next() {
 // 					if rng.Float32() < readFrac {
 // 						mutex.RLock()

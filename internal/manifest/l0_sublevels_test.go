@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,7 +23,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 func readManifest(filename string) (*Version, error) {
@@ -50,7 +51,7 @@ func readManifest(filename string) (*Version, error) {
 		if err := bve.Accumulate(&ve); err != nil {
 			return nil, err
 		}
-		if v, err = bve.Apply(v, base.DefaultComparer.Compare, base.DefaultFormatter, 10<<20, 32000, nil); err != nil {
+		if v, err = bve.Apply(v, base.DefaultComparer, 10<<20, 32000); err != nil {
 			return nil, err
 		}
 	}
@@ -176,6 +177,7 @@ func TestL0Sublevels(t *testing.T) {
 		if m.Largest.IsExclusiveSentinel() {
 			m.LargestSeqNum = m.SmallestSeqNum
 		}
+		m.LargestSeqNumAbsolute = m.LargestSeqNum
 		m.FileNum = base.FileNum(fileNum)
 		m.Size = uint64(256)
 		m.InitPhysicalBacking()
@@ -287,7 +289,7 @@ func TestL0Sublevels(t *testing.T) {
 				SortBySmallest(fileMetas[i], base.DefaultComparer.Compare)
 			}
 
-			levelMetadata := makeLevelMetadata(base.DefaultComparer.Compare, 0, fileMetas[0])
+			levelMetadata := MakeLevelMetadata(base.DefaultComparer.Compare, 0, fileMetas[0])
 			if initialize {
 				if addL0FilesOpt {
 					SortBySeqNum(addedL0Files)
@@ -336,7 +338,7 @@ func TestL0Sublevels(t *testing.T) {
 			fallthrough
 		case "pick-intra-l0-compaction":
 			minCompactionDepth := 3
-			earliestUnflushedSeqNum := uint64(math.MaxUint64)
+			earliestUnflushedSeqNum := base.SeqNum(math.MaxUint64)
 			for _, arg := range td.CmdArgs {
 				switch arg.Key {
 				case "min_depth":
@@ -345,11 +347,7 @@ func TestL0Sublevels(t *testing.T) {
 						t.Fatal(err)
 					}
 				case "earliest_unflushed_seqnum":
-					eusnInt, err := strconv.Atoi(arg.Vals[0])
-					if err != nil {
-						t.Fatal(err)
-					}
-					earliestUnflushedSeqNum = uint64(eusnInt)
+					earliestUnflushedSeqNum = base.ParseSeqNum(arg.Vals[0])
 				}
 			}
 
@@ -416,7 +414,7 @@ func TestL0Sublevels(t *testing.T) {
 
 				keyRanges := sublevels.InUseKeyRanges(smallest, largest)
 				for i, r := range keyRanges {
-					fmt.Fprintf(&buf, "%s-%s", sublevels.formatKey(r.Start), sublevels.formatKey(r.End))
+					fmt.Fprintf(&buf, "%s-%s", sublevels.formatKey(r.Start), sublevels.formatKey(r.End.Key))
 					if i < len(keyRanges)-1 {
 						fmt.Fprint(&buf, ", ")
 					}
@@ -496,7 +494,7 @@ func TestL0Sublevels(t *testing.T) {
 
 func TestAddL0FilesEquivalence(t *testing.T) {
 	seed := uint64(time.Now().UnixNano())
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(0, seed))
 	t.Logf("seed: %d", seed)
 
 	var inUseKeys [][]byte
@@ -505,26 +503,24 @@ func TestAddL0FilesEquivalence(t *testing.T) {
 	var s, s2 *L0Sublevels
 	keySpace := testkeys.Alpha(8)
 
-	flushSplitMaxBytes := rng.Int63n(1 << 20)
+	flushSplitMaxBytes := rng.Int64N(1 << 20)
 
 	// The outer loop runs once for each version edit. The inner loop(s) run
 	// once for each file, or each file bound.
 	for i := 0; i < 100; i++ {
 		var filesToAdd []*FileMetadata
-		numFiles := 1 + rng.Intn(9)
+		numFiles := 1 + rng.IntN(9)
 		keys := make([][]byte, 0, 2*numFiles)
 		for j := 0; j < 2*numFiles; j++ {
 			if rng.Float64() <= keyReusePct && len(inUseKeys) > 0 {
-				keys = append(keys, inUseKeys[rng.Intn(len(inUseKeys))])
+				keys = append(keys, inUseKeys[rng.IntN(len(inUseKeys))])
 			} else {
-				newKey := testkeys.Key(keySpace, rng.Intn(keySpace.Count()))
+				newKey := testkeys.Key(keySpace, rng.Int64N(keySpace.Count()))
 				inUseKeys = append(inUseKeys, newKey)
 				keys = append(keys, newKey)
 			}
 		}
-		sort.Slice(keys, func(i, j int) bool {
-			return bytes.Compare(keys[i], keys[j]) < 0
-		})
+		slices.SortFunc(keys, bytes.Compare)
 		for j := 0; j < numFiles; j++ {
 			startKey := keys[j*2]
 			endKey := keys[j*2+1]
@@ -532,13 +528,14 @@ func TestAddL0FilesEquivalence(t *testing.T) {
 				continue
 			}
 			meta := (&FileMetadata{
-				FileNum:        base.FileNum(i*10 + j + 1),
-				Size:           rng.Uint64n(1 << 20),
-				SmallestSeqNum: uint64(2*i + 1),
-				LargestSeqNum:  uint64(2*i + 2),
+				FileNum:               base.FileNum(i*10 + j + 1),
+				Size:                  rng.Uint64N(1 << 20),
+				SmallestSeqNum:        base.SeqNum(2*i + 1),
+				LargestSeqNum:         base.SeqNum(2*i + 2),
+				LargestSeqNumAbsolute: base.SeqNum(2*i + 2),
 			}).ExtendPointKeyBounds(
 				base.DefaultComparer.Compare,
-				base.MakeInternalKey(startKey, uint64(2*i+1), base.InternalKeyKindSet),
+				base.MakeInternalKey(startKey, base.SeqNum(2*i+1), base.InternalKeyKindSet),
 				base.MakeRangeDeleteSentinelKey(endKey),
 			)
 			meta.InitPhysicalBacking()
@@ -549,7 +546,7 @@ func TestAddL0FilesEquivalence(t *testing.T) {
 			continue
 		}
 
-		levelMetadata := makeLevelMetadata(testkeys.Comparer.Compare, 0, fileMetas)
+		levelMetadata := MakeLevelMetadata(testkeys.Comparer.Compare, 0, fileMetas)
 		var err error
 
 		if s2 == nil {

@@ -16,12 +16,16 @@ import (
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/invalidating"
+	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
-	"github.com/cockroachdb/pebble/internal/private"
-	"github.com/cockroachdb/pebble/internal/rangedel"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
@@ -37,7 +41,8 @@ func TestCheckLevelsBasics(t *testing.T) {
 				t.Fatalf("%s: cloneFileSystem failed: %v", tc, err)
 			}
 			d, err := Open(tc, &Options{
-				FS: fs,
+				FS:     fs,
+				Logger: testLogger{t},
 			})
 			if err != nil {
 				t.Fatalf("%s: Open failed: %v", tc, err)
@@ -82,10 +87,13 @@ func (f *failMerger) Close() error {
 }
 
 func TestCheckLevelsCornerCases(t *testing.T) {
+	if invariants.Enabled {
+		t.Skip("disabled under invariants; relies on violating invariants to detect them")
+	}
+
 	memFS := vfs.NewMem()
-	cmp := DefaultComparer.Compare
 	var levels [][]*fileMetadata
-	formatKey := DefaultComparer.FormatKey
+	formatKey := testkeys.Comparer.FormatKey
 	// Indexed by fileNum
 	var readers []*sstable.Reader
 	defer func() {
@@ -96,17 +104,21 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 
 	var fileNum FileNum
 	newIters :=
-		func(_ context.Context, file *manifest.FileMetadata, _ *IterOptions, _ internalIterOpts) (internalIterator, keyspan.FragmentIterator, error) {
+		func(_ context.Context, file *manifest.FileMetadata, _ *IterOptions, iio internalIterOpts, _ iterKinds) (iterSet, error) {
 			r := readers[file.FileNum]
-			rangeDelIter, err := r.NewRawRangeDelIter()
+			rangeDelIter, err := r.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, block.ReadEnv{Stats: iio.stats})
 			if err != nil {
-				return nil, nil, err
+				return iterSet{}, err
 			}
-			iter, err := r.NewIter(nil /* lower */, nil /* upper */)
+			iter, err := r.NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
 			if err != nil {
-				return nil, nil, err
+				return iterSet{}, err
 			}
-			return iter, rangeDelIter, nil
+
+			return iterSet{
+				point:         invalidating.MaybeWrapIfInvariants(iter),
+				rangeDeletion: rangeDelIter,
+			}, nil
 		}
 
 	fm := &failMerger{}
@@ -140,7 +152,7 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 				largestKey := base.ParseInternalKey(keys[1])
 				m := (&fileMetadata{
 					FileNum: fileNum,
-				}).ExtendPointKeyBounds(cmp, smallestKey, largestKey)
+				}).ExtendPointKeyBounds(testkeys.Comparer.Compare, smallestKey, largestKey)
 				m.InitPhysicalBacking()
 				*li = append(*li, m)
 
@@ -149,53 +161,67 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 				line = strings.TrimSpace(line)
 				name := fmt.Sprint(fileNum)
 				fileNum++
-				f, err := memFS.Create(name)
+				f, err := memFS.Create(name, vfs.WriteCategoryUnspecified)
 				if err != nil {
 					return err.Error()
 				}
 				writeUnfragmented := false
-				w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{})
+				disableKeyOrderChecks := false
 				for _, arg := range d.CmdArgs {
 					switch arg.Key {
 					case "disable-key-order-checks":
-						private.SSTableWriterDisableKeyOrderChecks(w)
+						disableKeyOrderChecks = true
 					case "write-unfragmented":
 						writeUnfragmented = true
 					default:
 						return fmt.Sprintf("unknown arg: %s", arg.Key)
 					}
 				}
+				keySchema := colblk.DefaultKeySchema(testkeys.Comparer, 16)
+				writerOpts := sstable.WriterOptions{
+					Comparer:    testkeys.Comparer,
+					KeySchema:   &keySchema,
+					TableFormat: FormatNewest.MaxTableFormat(),
+				}
+				writerOpts.SetInternal(sstableinternal.WriterOptions{
+					DisableKeyOrderChecks: disableKeyOrderChecks,
+				})
+				w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), writerOpts)
 				var tombstones []keyspan.Span
 				frag := keyspan.Fragmenter{
-					Cmp:    cmp,
+					Cmp:    testkeys.Comparer.Compare,
 					Format: formatKey,
 					Emit: func(fragmented keyspan.Span) {
 						tombstones = append(tombstones, fragmented)
 					},
 				}
-				keyvalues := strings.Fields(line)
-				for _, kv := range keyvalues {
+				keyValues := strings.Fields(line)
+				for _, kv := range keyValues {
+					if strings.HasPrefix(kv, "EncodeSpan:") {
+						kv = kv[len("EncodeSpan:"):]
+						s := keyspan.ParseSpan(kv)
+						if writeUnfragmented {
+							if err = w.EncodeSpan(s); err != nil {
+								return err.Error()
+							}
+						} else if s.Keys[0].Kind() == base.InternalKeyKindRangeDelete {
+							frag.Add(s)
+						} else {
+							t.Fatalf("unexpected span: %s", s.Pretty(testkeys.Comparer.FormatKey))
+						}
+						continue
+					}
 					j := strings.Index(kv, ":")
 					ikey := base.ParseInternalKey(kv[:j])
 					value := []byte(kv[j+1:])
-					var err error
-					switch ikey.Kind() {
-					case InternalKeyKindRangeDelete:
-						if writeUnfragmented {
-							err = w.Add(ikey, value)
-							break
-						}
-						frag.Add(rangedel.Decode(ikey, value, nil))
-					default:
-						err = w.Add(ikey, value)
-					}
+					err = w.AddWithForceObsolete(ikey, value, false /* forceObsolete */)
 					if err != nil {
 						return err.Error()
 					}
 				}
 				frag.Finish()
 				for _, v := range tombstones {
-					if err := rangedel.Encode(&v, w.Add); err != nil {
+					if err := w.EncodeSpan(v); err != nil {
 						return err.Error()
 					}
 				}
@@ -210,8 +236,13 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 				if err != nil {
 					return err.Error()
 				}
-				cacheOpts := private.SSTableCacheOpts(0, base.FileNum(uint64(fileNum)-1).DiskFileNum()).(sstable.ReaderOption)
-				r, err := sstable.NewReader(readable, sstable.ReaderOptions{}, cacheOpts)
+				// Set FileNum for logging purposes.
+				readerOpts := sstable.ReaderOptions{
+					Comparer:   testkeys.Comparer,
+					KeySchemas: sstable.KeySchemas{writerOpts.KeySchema.Name: writerOpts.KeySchema},
+				}
+				readerOpts.CacheOpts = sstableinternal.CacheOptions{FileNum: base.DiskFileNum(fileNum - 1)}
+				r, err := sstable.NewReader(context.Background(), readable, readerOpts)
 				if err != nil {
 					return err.Error()
 				}
@@ -250,16 +281,15 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 				files[i+1] = levels[i]
 			}
 			version := manifest.NewVersion(
-				base.DefaultComparer.Compare,
-				base.DefaultFormatter,
+				testkeys.Comparer,
 				0,
 				files)
 			readState := &readState{current: version}
 			c := &checkConfig{
-				cmp:       cmp,
+				comparer:  testkeys.Comparer,
 				readState: readState,
 				newIters:  newIters,
-				seqNum:    InternalKeySeqNumMax,
+				seqNum:    base.SeqNumMax,
 				merge:     merge,
 				formatKey: formatKey,
 			}

@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -18,13 +19,18 @@ import (
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/remoteobjcat"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/sharedcache"
 	"github.com/cockroachdb/pebble/objstorage/remote"
+	"github.com/cockroachdb/redact"
 )
 
 // remoteSubsystem contains the provider fields related to remote storage.
 // All fields remain unset if remote storage is not configured.
 type remoteSubsystem struct {
 	catalog *remoteobjcat.Catalog
-	cache   *sharedcache.Cache
+	// catalogSyncMutex is used to correctly serialize two sharedSync operations.
+	// It must be acquired before the provider mutex.
+	catalogSyncMutex sync.Mutex
+
+	cache *sharedcache.Cache
 
 	// shared contains the fields relevant to shared objects, i.e. objects that
 	// are created by Pebble and potentially shared between Pebble instances.
@@ -39,6 +45,43 @@ type remoteSubsystem struct {
 		// test tweaks this field).
 		checkRefsOnOpen bool
 	}
+}
+
+type remoteLockedState struct {
+	// catalogBatch accumulates remote object creations and deletions until
+	// Sync is called.
+	catalogBatch remoteobjcat.Batch
+
+	storageObjects map[remote.Locator]remote.Storage
+
+	externalObjects map[remote.ObjectKey][]base.DiskFileNum
+}
+
+func (rs *remoteLockedState) addExternalObject(meta objstorage.ObjectMetadata) {
+	if rs.externalObjects == nil {
+		rs.externalObjects = make(map[remote.ObjectKey][]base.DiskFileNum)
+	}
+	key := remote.MakeObjectKey(meta.Remote.Locator, meta.Remote.CustomObjectName)
+	rs.externalObjects[key] = append(rs.externalObjects[key], meta.DiskFileNum)
+}
+
+func (rs *remoteLockedState) removeExternalObject(meta objstorage.ObjectMetadata) {
+	key := remote.MakeObjectKey(meta.Remote.Locator, meta.Remote.CustomObjectName)
+	newSlice := slices.DeleteFunc(rs.externalObjects[key], func(n base.DiskFileNum) bool {
+		return n == meta.DiskFileNum
+	})
+	if len(newSlice) == 0 {
+		delete(rs.externalObjects, key)
+	} else {
+		rs.externalObjects[key] = newSlice
+	}
+}
+
+func (rs *remoteLockedState) getExternalObjects(
+	locator remote.Locator, objName string,
+) []base.DiskFileNum {
+	key := remote.MakeObjectKey(locator, objName)
+	return rs.externalObjects[key]
 }
 
 // remoteInit initializes the remote object subsystem (if configured) and finds
@@ -105,6 +148,9 @@ func (p *provider) remoteInit() error {
 			o.AssertValid()
 		}
 		p.mu.knownObjects[o.DiskFileNum] = o
+		if o.IsExternal() {
+			p.mu.remote.addExternalObject(o)
+		}
 	}
 	return nil
 }
@@ -121,9 +167,9 @@ func (p *provider) sharedClose() error {
 	if p.st.Remote.StorageFactory == nil {
 		return nil
 	}
-	var err error
+	err := p.sharedSync()
 	if p.remote.cache != nil {
-		err = p.remote.cache.Close()
+		err = firstError(err, p.remote.cache.Close())
 		p.remote.cache = nil
 	}
 	if p.remote.catalog != nil {
@@ -136,7 +182,7 @@ func (p *provider) sharedClose() error {
 // SetCreatorID is part of the objstorage.Provider interface.
 func (p *provider) SetCreatorID(creatorID objstorage.CreatorID) error {
 	if p.st.Remote.StorageFactory == nil {
-		return errors.AssertionFailedf("attempt to set CreatorID but remote storage not enabled")
+		return base.AssertionFailedf("attempt to set CreatorID but remote storage not enabled")
 	}
 	// Note: this call is a cheap no-op if the creator ID was already set. This
 	// call also checks if we are trying to change the ID.
@@ -176,6 +222,12 @@ func (p *provider) sharedCheckInitialized() error {
 }
 
 func (p *provider) sharedSync() error {
+	// Serialize parallel sync operations. Note that ApplyBatch is already
+	// serialized internally, but we want to make sure they get called with
+	// batches in the right order.
+	p.remote.catalogSyncMutex.Lock()
+	defer p.remote.catalogSyncMutex.Unlock()
+
 	batch := func() remoteobjcat.Batch {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -188,9 +240,9 @@ func (p *provider) sharedSync() error {
 		return nil
 	}
 
-	err := p.remote.catalog.ApplyBatch(batch)
-	if err != nil {
-		// We have to put back the batch (for the next Sync).
+	if err := p.remote.catalog.ApplyBatch(batch); err != nil {
+		// Put back the batch (for the next Sync), appending any operations that
+		// happened in the meantime.
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		batch.Append(p.mu.remote.catalogBatch)
@@ -223,7 +275,7 @@ func (p *provider) sharedCreateRef(meta objstorage.ObjectMetadata) error {
 		err = writer.Close()
 	}
 	if err != nil {
-		return errors.Wrapf(err, "creating marker object %q", refName)
+		return errors.Wrapf(err, "creating marker object %q", errors.Safe(refName))
 	}
 	return nil
 }
@@ -255,7 +307,7 @@ func (p *provider) sharedCreate(
 	objName := remoteObjectName(meta)
 	writer, err := storage.CreateObject(objName)
 	if err != nil {
-		return nil, objstorage.ObjectMetadata{}, errors.Wrapf(err, "creating object %q", objName)
+		return nil, objstorage.ObjectMetadata{}, errors.Wrapf(err, "creating object %q", errors.Safe(objName))
 	}
 	return &sharedWritable{
 		p:             p,
@@ -280,19 +332,19 @@ func (p *provider) remoteOpenForReading(
 		if _, err := meta.Remote.Storage.Size(refName); err != nil {
 			if meta.Remote.Storage.IsNotExistError(err) {
 				if opts.MustExist {
-					p.st.Logger.Fatalf("marker object %q does not exist", refName)
+					p.st.Logger.Fatalf("marker object %q does not exist", errors.Safe(refName))
 					// TODO(radu): maybe list references for the object.
 				}
-				return nil, errors.Errorf("marker object %q does not exist", refName)
+				return nil, errors.Errorf("marker object %q does not exist", errors.Safe(refName))
 			}
-			return nil, errors.Wrapf(err, "checking marker object %q", refName)
+			return nil, errors.Wrapf(err, "checking marker object %q", errors.Safe(refName))
 		}
 	}
 	objName := remoteObjectName(meta)
 	reader, size, err := meta.Remote.Storage.ReadObject(ctx, objName)
 	if err != nil {
 		if opts.MustExist && meta.Remote.Storage.IsNotExistError(err) {
-			p.st.Logger.Fatalf("object %q does not exist", objName)
+			p.st.Logger.Fatalf("object %q does not exist", redact.SafeString(objName))
 			// TODO(radu): maybe list references for the object.
 		}
 		return nil, err
@@ -363,4 +415,11 @@ func (p *provider) ensureStorage(locator remote.Locator) (remote.Storage, error)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.ensureStorageLocked(locator)
+}
+
+// GetExternalObjects is part of the Provider interface.
+func (p *provider) GetExternalObjects(locator remote.Locator, objName string) []base.DiskFileNum {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.mu.remote.getExternalObjects(locator, objName))
 }

@@ -1,0 +1,483 @@
+init
+----
+size=37:
+0: user keys:      bytes: 0 rows set; 0 bytes in data
+1: start indices:  uint: 0 rows
+2: trailers:       uint: 0 rows
+3: suffixes:       bytes: 0 rows set; 0 bytes in data
+4: values:         bytes: 0 rows set; 0 bytes in data
+
+add
+a-b:{(#0,RANGEDEL)}
+----
+size=50:
+0: user keys:      bytes: 2 rows set; 2 bytes in data
+1: start indices:  uint: 2 rows
+2: trailers:       uint: 1 rows
+3: suffixes:       bytes: 1 rows set; 0 bytes in data
+4: values:         bytes: 1 rows set; 0 bytes in data
+
+add
+b-c:{(#100,RANGEDEL) (#20,RANGEDEL) (#0,RANGEDEL)}
+----
+size=61:
+0: user keys:      bytes: 3 rows set; 3 bytes in data
+1: start indices:  uint: 3 rows
+2: trailers:       uint: 4 rows
+3: suffixes:       bytes: 4 rows set; 0 bytes in data
+4: values:         bytes: 4 rows set; 0 bytes in data
+
+add
+c-d:{(#100,RANGEDEL) (#0,RANGEDEL)}
+----
+size=67:
+0: user keys:      bytes: 4 rows set; 4 bytes in data
+1: start indices:  uint: 4 rows
+2: trailers:       uint: 6 rows
+3: suffixes:       bytes: 6 rows set; 0 bytes in data
+4: values:         bytes: 6 rows set; 0 bytes in data
+
+add
+d-e:{(#0,RANGEDEL)}
+----
+size=73:
+0: user keys:      bytes: 5 rows set; 5 bytes in data
+1: start indices:  uint: 5 rows
+2: trailers:       uint: 7 rows
+3: suffixes:       bytes: 7 rows set; 0 bytes in data
+4: values:         bytes: 7 rows set; 0 bytes in data
+
+finish
+----
+Boundaries: a#0,RANGEDEL — e#inf,RANGEDEL
+keyspan-decoder
+ └── keyspan block header
+      ├── 00-04: x 05000000 # user key count: 5
+      ├── columnar block header
+      │    ├── 04-05: x 01       # version 1
+      │    ├── 05-07: x 0500     # 5 columns
+      │    ├── 07-11: x 07000000 # 7 rows
+      │    ├── 11-12: b 00000011 # col 0: bytes
+      │    ├── 12-16: x 24000000 # col 0: page start 36
+      │    ├── 16-17: b 00000010 # col 1: uint
+      │    ├── 17-21: x 30000000 # col 1: page start 48
+      │    ├── 21-22: b 00000010 # col 2: uint
+      │    ├── 22-26: x 36000000 # col 2: page start 54
+      │    ├── 26-27: b 00000011 # col 3: bytes
+      │    ├── 27-31: x 46000000 # col 3: page start 70
+      │    ├── 31-32: b 00000011 # col 4: bytes
+      │    └── 32-36: x 47000000 # col 4: page start 71
+      ├── data for column 0 (bytes)
+      │    ├── offsets table
+      │    │    ├── 36-37: x 01 # encoding: 1b
+      │    │    ├── 37-38: x 00 # data[0] = 0 [43 overall]
+      │    │    ├── 38-39: x 01 # data[1] = 1 [44 overall]
+      │    │    ├── 39-40: x 02 # data[2] = 2 [45 overall]
+      │    │    ├── 40-41: x 03 # data[3] = 3 [46 overall]
+      │    │    ├── 41-42: x 04 # data[4] = 4 [47 overall]
+      │    │    └── 42-43: x 05 # data[5] = 5 [48 overall]
+      │    └── data
+      │         ├── 43-44: x 61 # data[0]: a
+      │         ├── 44-45: x 62 # data[1]: b
+      │         ├── 45-46: x 63 # data[2]: c
+      │         ├── 46-47: x 64 # data[3]: d
+      │         └── 47-48: x 65 # data[4]: e
+      ├── data for column 1 (uint)
+      │    ├── 48-49: x 01 # encoding: 1b
+      │    ├── 49-50: x 00 # data[0] = 0
+      │    ├── 50-51: x 01 # data[1] = 1
+      │    ├── 51-52: x 04 # data[2] = 4
+      │    ├── 52-53: x 06 # data[3] = 6
+      │    └── 53-54: x 07 # data[4] = 7
+      ├── data for column 2 (uint)
+      │    ├── 54-55: x 02   # encoding: 2b
+      │    ├── 55-56: x 00   # padding (aligning to 16-bit boundary)
+      │    ├── 56-58: x 0f00 # data[0] = 15
+      │    ├── 58-60: x 0f64 # data[1] = 25615
+      │    ├── 60-62: x 0f14 # data[2] = 5135
+      │    ├── 62-64: x 0f00 # data[3] = 15
+      │    ├── 64-66: x 0f64 # data[4] = 25615
+      │    ├── 66-68: x 0f00 # data[5] = 15
+      │    └── 68-70: x 0f00 # data[6] = 15
+      ├── data for column 3 (bytes)
+      │    ├── offsets table
+      │    │    └── 70-71: x 00 # encoding: zero
+      │    └── data
+      │         ├── 71-71: x  # data[0]:
+      │         ├── 71-71: x  # data[1]:
+      │         ├── 71-71: x  # data[2]:
+      │         ├── 71-71: x  # data[3]:
+      │         ├── 71-71: x  # data[4]:
+      │         ├── 71-71: x  # data[5]:
+      │         └── 71-71: x  # data[6]:
+      ├── data for column 4 (bytes)
+      │    ├── offsets table
+      │    │    └── 71-72: x 00 # encoding: zero
+      │    └── data
+      │         ├── 72-72: x  # data[0]:
+      │         ├── 72-72: x  # data[1]:
+      │         ├── 72-72: x  # data[2]:
+      │         ├── 72-72: x  # data[3]:
+      │         ├── 72-72: x  # data[4]:
+      │         ├── 72-72: x  # data[5]:
+      │         └── 72-72: x  # data[6]:
+      └── 72-73: x 00 # block padding byte
+
+# Test iterating over the block's spans.
+
+iter
+seek-ge a
+seek-ge apple
+seek-ge b
+seek-ge banana
+seek-ge c
+seek-ge coconut
+seek-ge d
+seek-ge dragonfruit
+seek-ge e
+seek-ge z
+----
+a-b:{(#0,RANGEDEL)}
+a-b:{(#0,RANGEDEL)}
+b-c:{(#100,RANGEDEL) (#20,RANGEDEL) (#0,RANGEDEL)}
+b-c:{(#100,RANGEDEL) (#20,RANGEDEL) (#0,RANGEDEL)}
+c-d:{(#100,RANGEDEL) (#0,RANGEDEL)}
+c-d:{(#100,RANGEDEL) (#0,RANGEDEL)}
+d-e:{(#0,RANGEDEL)}
+d-e:{(#0,RANGEDEL)}
+.
+.
+
+iter
+seek-lt z
+seek-lt e
+seek-lt dragonfruit
+seek-lt d
+----
+d-e:{(#0,RANGEDEL)}
+d-e:{(#0,RANGEDEL)}
+d-e:{(#0,RANGEDEL)}
+c-d:{(#100,RANGEDEL) (#0,RANGEDEL)}
+
+iter
+seek-lt coconut
+seek-lt c
+seek-lt banana
+seek-lt b
+seek-lt apple
+seek-lt a
+----
+c-d:{(#100,RANGEDEL) (#0,RANGEDEL)}
+b-c:{(#100,RANGEDEL) (#20,RANGEDEL) (#0,RANGEDEL)}
+b-c:{(#100,RANGEDEL) (#20,RANGEDEL) (#0,RANGEDEL)}
+a-b:{(#0,RANGEDEL)}
+a-b:{(#0,RANGEDEL)}
+.
+
+iter
+first
+next
+next
+next
+next
+prev
+prev
+prev
+prev
+prev
+----
+a-b:{(#0,RANGEDEL)}
+b-c:{(#100,RANGEDEL) (#20,RANGEDEL) (#0,RANGEDEL)}
+c-d:{(#100,RANGEDEL) (#0,RANGEDEL)}
+d-e:{(#0,RANGEDEL)}
+.
+d-e:{(#0,RANGEDEL)}
+c-d:{(#100,RANGEDEL) (#0,RANGEDEL)}
+b-c:{(#100,RANGEDEL) (#20,RANGEDEL) (#0,RANGEDEL)}
+a-b:{(#0,RANGEDEL)}
+.
+
+iter
+last
+prev
+prev
+prev
+prev
+next
+next
+next
+next
+next
+----
+d-e:{(#0,RANGEDEL)}
+c-d:{(#100,RANGEDEL) (#0,RANGEDEL)}
+b-c:{(#100,RANGEDEL) (#20,RANGEDEL) (#0,RANGEDEL)}
+a-b:{(#0,RANGEDEL)}
+.
+a-b:{(#0,RANGEDEL)}
+b-c:{(#100,RANGEDEL) (#20,RANGEDEL) (#0,RANGEDEL)}
+c-d:{(#100,RANGEDEL) (#0,RANGEDEL)}
+d-e:{(#0,RANGEDEL)}
+.
+
+init
+----
+size=37:
+0: user keys:      bytes: 0 rows set; 0 bytes in data
+1: start indices:  uint: 0 rows
+2: trailers:       uint: 0 rows
+3: suffixes:       bytes: 0 rows set; 0 bytes in data
+4: values:         bytes: 0 rows set; 0 bytes in data
+
+add
+b-d:{(#4,RANGEKEYSET,@3,coconut)}
+----
+size=64:
+0: user keys:      bytes: 2 rows set; 2 bytes in data
+1: start indices:  uint: 2 rows
+2: trailers:       uint: 1 rows
+3: suffixes:       bytes: 1 rows set; 2 bytes in data
+4: values:         bytes: 1 rows set; 7 bytes in data
+
+finish
+----
+Boundaries: b#4,RANGEKEYSET — d#inf,RANGEKEYSET
+keyspan-decoder
+ └── keyspan block header
+      ├── 00-04: x 02000000 # user key count: 2
+      ├── columnar block header
+      │    ├── 04-05: x 01       # version 1
+      │    ├── 05-07: x 0500     # 5 columns
+      │    ├── 07-11: x 01000000 # 1 rows
+      │    ├── 11-12: b 00000011 # col 0: bytes
+      │    ├── 12-16: x 24000000 # col 0: page start 36
+      │    ├── 16-17: b 00000010 # col 1: uint
+      │    ├── 17-21: x 2a000000 # col 1: page start 42
+      │    ├── 21-22: b 00000010 # col 2: uint
+      │    ├── 22-26: x 2d000000 # col 2: page start 45
+      │    ├── 26-27: b 00000011 # col 3: bytes
+      │    ├── 27-31: x 30000000 # col 3: page start 48
+      │    ├── 31-32: b 00000011 # col 4: bytes
+      │    └── 32-36: x 35000000 # col 4: page start 53
+      ├── data for column 0 (bytes)
+      │    ├── offsets table
+      │    │    ├── 36-37: x 01 # encoding: 1b
+      │    │    ├── 37-38: x 00 # data[0] = 0 [40 overall]
+      │    │    ├── 38-39: x 01 # data[1] = 1 [41 overall]
+      │    │    └── 39-40: x 02 # data[2] = 2 [42 overall]
+      │    └── data
+      │         ├── 40-41: x 62 # data[0]: b
+      │         └── 41-42: x 64 # data[1]: d
+      ├── data for column 1 (uint)
+      │    ├── 42-43: x 01 # encoding: 1b
+      │    ├── 43-44: x 00 # data[0] = 0
+      │    └── 44-45: x 01 # data[1] = 1
+      ├── data for column 2 (uint)
+      │    ├── 45-46: x 02   # encoding: 2b
+      │    └── 46-48: x 1504 # data[0] = 1045
+      ├── data for column 3 (bytes)
+      │    ├── offsets table
+      │    │    ├── 48-49: x 01 # encoding: 1b
+      │    │    ├── 49-50: x 00 # data[0] = 0 [51 overall]
+      │    │    └── 50-51: x 02 # data[1] = 2 [53 overall]
+      │    └── data
+      │         └── 51-53: x 4033 # data[0]: @3
+      ├── data for column 4 (bytes)
+      │    ├── offsets table
+      │    │    ├── 53-54: x 01 # encoding: 1b
+      │    │    ├── 54-55: x 00 # data[0] = 0 [56 overall]
+      │    │    └── 55-56: x 07 # data[1] = 7 [63 overall]
+      │    └── data
+      │         └── 56-63: x 636f636f6e7574 # data[0]: coconut
+      └── 63-64: x 00 # block padding byte
+
+iter
+seek-ge a
+next
+prev
+prev
+next
+----
+b-d:{(#4,RANGEKEYSET,@3,coconut)}
+.
+b-d:{(#4,RANGEKEYSET,@3,coconut)}
+.
+b-d:{(#4,RANGEKEYSET,@3,coconut)}
+
+reset
+----
+size=37:
+0: user keys:      bytes: 0 rows set; 0 bytes in data
+1: start indices:  uint: 0 rows
+2: trailers:       uint: 0 rows
+3: suffixes:       bytes: 0 rows set; 0 bytes in data
+4: values:         bytes: 0 rows set; 0 bytes in data
+
+add
+b-d:{(#4,RANGEKEYSET,@3,coconut)}
+e-g:{(#5,RANGEKEYSET,@1,tree)}
+----
+size=80:
+0: user keys:      bytes: 4 rows set; 4 bytes in data
+1: start indices:  uint: 4 rows
+2: trailers:       uint: 2 rows
+3: suffixes:       bytes: 2 rows set; 4 bytes in data
+4: values:         bytes: 2 rows set; 11 bytes in data
+
+finish
+----
+Boundaries: b#4,RANGEKEYSET — g#inf,RANGEKEYSET
+keyspan-decoder
+ └── keyspan block header
+      ├── 00-04: x 04000000 # user key count: 4
+      ├── columnar block header
+      │    ├── 04-05: x 01       # version 1
+      │    ├── 05-07: x 0500     # 5 columns
+      │    ├── 07-11: x 02000000 # 2 rows
+      │    ├── 11-12: b 00000011 # col 0: bytes
+      │    ├── 12-16: x 24000000 # col 0: page start 36
+      │    ├── 16-17: b 00000010 # col 1: uint
+      │    ├── 17-21: x 2e000000 # col 1: page start 46
+      │    ├── 21-22: b 00000010 # col 2: uint
+      │    ├── 22-26: x 33000000 # col 2: page start 51
+      │    ├── 26-27: b 00000011 # col 3: bytes
+      │    ├── 27-31: x 38000000 # col 3: page start 56
+      │    ├── 31-32: b 00000011 # col 4: bytes
+      │    └── 32-36: x 40000000 # col 4: page start 64
+      ├── data for column 0 (bytes)
+      │    ├── offsets table
+      │    │    ├── 36-37: x 01 # encoding: 1b
+      │    │    ├── 37-38: x 00 # data[0] = 0 [42 overall]
+      │    │    ├── 38-39: x 01 # data[1] = 1 [43 overall]
+      │    │    ├── 39-40: x 02 # data[2] = 2 [44 overall]
+      │    │    ├── 40-41: x 03 # data[3] = 3 [45 overall]
+      │    │    └── 41-42: x 04 # data[4] = 4 [46 overall]
+      │    └── data
+      │         ├── 42-43: x 62 # data[0]: b
+      │         ├── 43-44: x 64 # data[1]: d
+      │         ├── 44-45: x 65 # data[2]: e
+      │         └── 45-46: x 67 # data[3]: g
+      ├── data for column 1 (uint)
+      │    ├── 46-47: x 01 # encoding: 1b
+      │    ├── 47-48: x 00 # data[0] = 0
+      │    ├── 48-49: x 01 # data[1] = 1
+      │    ├── 49-50: x 01 # data[2] = 1
+      │    └── 50-51: x 02 # data[3] = 2
+      ├── data for column 2 (uint)
+      │    ├── 51-52: x 02   # encoding: 2b
+      │    ├── 52-54: x 1504 # data[0] = 1045
+      │    └── 54-56: x 1505 # data[1] = 1301
+      ├── data for column 3 (bytes)
+      │    ├── offsets table
+      │    │    ├── 56-57: x 01 # encoding: 1b
+      │    │    ├── 57-58: x 00 # data[0] = 0 [60 overall]
+      │    │    ├── 58-59: x 02 # data[1] = 2 [62 overall]
+      │    │    └── 59-60: x 04 # data[2] = 4 [64 overall]
+      │    └── data
+      │         ├── 60-62: x 4033 # data[0]: @3
+      │         └── 62-64: x 4031 # data[1]: @1
+      ├── data for column 4 (bytes)
+      │    ├── offsets table
+      │    │    ├── 64-65: x 01 # encoding: 1b
+      │    │    ├── 65-66: x 00 # data[0] = 0 [68 overall]
+      │    │    ├── 66-67: x 07 # data[1] = 7 [75 overall]
+      │    │    └── 67-68: x 0b # data[2] = 11 [79 overall]
+      │    └── data
+      │         ├── 68-75: x 636f636f6e7574 # data[0]: coconut
+      │         └── 75-79: x 74726565       # data[1]: tree
+      └── 79-80: x 00 # block padding byte
+
+iter
+seek-ge dog
+seek-ge g
+seek-ge z
+----
+e-g:{(#5,RANGEKEYSET,@1,tree)}
+.
+.
+
+iter
+seek-lt dog
+seek-lt g
+seek-lt z
+seek-lt e
+----
+b-d:{(#4,RANGEKEYSET,@3,coconut)}
+e-g:{(#5,RANGEKEYSET,@1,tree)}
+e-g:{(#5,RANGEKEYSET,@1,tree)}
+b-d:{(#4,RANGEKEYSET,@3,coconut)}
+
+iter synthetic-seq-num=99
+first
+next
+next
+----
+b-d:{(#99,RANGEKEYSET,@3,coconut)}
+e-g:{(#99,RANGEKEYSET,@1,tree)}
+.
+
+iter synthetic-suffix=@9
+first
+next
+next
+----
+b-d:{(#4,RANGEKEYSET,@9,coconut)}
+e-g:{(#5,RANGEKEYSET,@9,tree)}
+.
+
+iter synthetic-prefix=foo
+first
+next
+next
+----
+foob-food:{(#4,RANGEKEYSET,@3,coconut)}
+fooe-foog:{(#5,RANGEKEYSET,@1,tree)}
+.
+
+iter synthetic-prefix=foo
+seek-ge fax
+seek-ge fun
+prev
+----
+foob-food:{(#4,RANGEKEYSET,@3,coconut)}
+.
+fooe-foog:{(#5,RANGEKEYSET,@1,tree)}
+
+iter synthetic-prefix=foo
+seek-ge fooa
+seek-ge foob
+seek-ge foobanana
+seek-ge foococonut
+seek-ge fooc
+seek-ge foofoo
+----
+foob-food:{(#4,RANGEKEYSET,@3,coconut)}
+foob-food:{(#4,RANGEKEYSET,@3,coconut)}
+foob-food:{(#4,RANGEKEYSET,@3,coconut)}
+foob-food:{(#4,RANGEKEYSET,@3,coconut)}
+foob-food:{(#4,RANGEKEYSET,@3,coconut)}
+fooe-foog:{(#5,RANGEKEYSET,@1,tree)}
+
+iter synthetic-prefix=foo
+seek-lt fax
+next
+seek-lt fun
+----
+.
+foob-food:{(#4,RANGEKEYSET,@3,coconut)}
+fooe-foog:{(#5,RANGEKEYSET,@1,tree)}
+
+iter synthetic-prefix=foo
+seek-lt fooa
+seek-lt foob
+seek-lt foobanana
+seek-lt foococonut
+seek-lt fooc
+seek-lt foofoo
+----
+.
+.
+foob-food:{(#4,RANGEKEYSET,@3,coconut)}
+foob-food:{(#4,RANGEKEYSET,@3,coconut)}
+foob-food:{(#4,RANGEKEYSET,@3,coconut)}
+fooe-foog:{(#5,RANGEKEYSET,@1,tree)}

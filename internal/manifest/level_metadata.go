@@ -7,6 +7,7 @@ package manifest
 import (
 	"bytes"
 	"fmt"
+	"reflect"
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
@@ -15,41 +16,79 @@ import (
 // LevelMetadata contains metadata for all of the files within
 // a level of the LSM.
 type LevelMetadata struct {
-	level int
-	tree  btree
+	level     int
+	totalSize uint64
+	// NumVirtual is the number of virtual sstables in the level.
+	NumVirtual uint64
+	// VirtualSize is the size of the virtual sstables in the level.
+	VirtualSize uint64
+	tree        btree
 }
 
 // clone makes a copy of the level metadata, implicitly increasing the ref
 // count of every file contained within lm.
 func (lm *LevelMetadata) clone() LevelMetadata {
 	return LevelMetadata{
-		level: lm.level,
-		tree:  lm.tree.Clone(),
+		level:       lm.level,
+		totalSize:   lm.totalSize,
+		NumVirtual:  lm.NumVirtual,
+		VirtualSize: lm.VirtualSize,
+		tree:        lm.tree.Clone(),
 	}
 }
 
-func (lm *LevelMetadata) release() (obsolete []*FileMetadata) {
+func (lm *LevelMetadata) release() (obsolete []*FileBacking) {
 	return lm.tree.Release()
 }
 
-func makeLevelMetadata(cmp Compare, level int, files []*FileMetadata) LevelMetadata {
+// MakeLevelMetadata creates a LevelMetadata with the given files.
+func MakeLevelMetadata(cmp Compare, level int, files []*FileMetadata) LevelMetadata {
 	bcmp := btreeCmpSeqNum
 	if level > 0 {
 		bcmp = btreeCmpSmallestKey(cmp)
 	}
 	var lm LevelMetadata
 	lm.level = level
-	lm.tree, _ = makeBTree(bcmp, files)
+	lm.tree, _ = makeBTree(cmp, bcmp, files)
+	for _, f := range files {
+		lm.totalSize += f.Size
+		if f.Virtual {
+			lm.NumVirtual++
+			lm.VirtualSize += f.Size
+		}
+	}
 	return lm
 }
 
-func makeBTree(cmp btreeCmp, files []*FileMetadata) (btree, LevelSlice) {
+func makeBTree(cmp base.Compare, bcmp btreeCmp, files []*FileMetadata) (btree, LevelSlice) {
 	var t btree
 	t.cmp = cmp
+	t.bcmp = bcmp
 	for _, f := range files {
 		t.Insert(f)
 	}
 	return t, newLevelSlice(t.Iter())
+}
+
+func (lm *LevelMetadata) insert(f *FileMetadata) error {
+	if err := lm.tree.Insert(f); err != nil {
+		return err
+	}
+	lm.totalSize += f.Size
+	if f.Virtual {
+		lm.NumVirtual++
+		lm.VirtualSize += f.Size
+	}
+	return nil
+}
+
+func (lm *LevelMetadata) remove(f *FileMetadata) bool {
+	lm.totalSize -= f.Size
+	if f.Virtual {
+		lm.NumVirtual--
+		lm.VirtualSize -= f.Size
+	}
+	return lm.tree.Delete(f)
 }
 
 // Empty indicates whether there are any files in the level.
@@ -62,6 +101,11 @@ func (lm *LevelMetadata) Len() int {
 	return lm.tree.Count()
 }
 
+// Size returns the cumulative size of all the files within the level.
+func (lm *LevelMetadata) Size() uint64 {
+	return lm.totalSize
+}
+
 // Iter constructs a LevelIterator over the entire level.
 func (lm *LevelMetadata) Iter() LevelIterator {
 	return LevelIterator{iter: lm.tree.Iter()}
@@ -72,48 +116,29 @@ func (lm *LevelMetadata) Slice() LevelSlice {
 	return newLevelSlice(lm.tree.Iter())
 }
 
-// Find finds the provided file in the level if it exists.
-func (lm *LevelMetadata) Find(cmp base.Compare, m *FileMetadata) *LevelFile {
+// Find finds the provided file in the level. If it exists, returns a LevelSlice
+// that contains just that file; otherwise, returns an empty LevelSlice.
+func (lm *LevelMetadata) Find(cmp base.Compare, m *FileMetadata) LevelSlice {
 	iter := lm.Iter()
-	if lm.level != 0 {
-		// If lm holds files for levels >0, we can narrow our search by binary
-		// searching by bounds.
-		o := overlaps(iter, cmp, m.Smallest.UserKey,
-			m.Largest.UserKey, m.Largest.IsExclusiveSentinel())
-		iter = o.Iter()
-	}
-	for f := iter.First(); f != nil; f = iter.Next() {
-		if f == m {
-			lf := iter.Take()
-			return &lf
+	if lm.level == 0 {
+		// We only need to look at the portion of files that are "equal" to m with
+		// respect to the L0 ordering.
+		f := iter.seek(func(f *FileMetadata) bool {
+			return f.cmpSeqNum(m) >= 0
+		})
+		for ; f != nil && f.cmpSeqNum(m) == 0; f = iter.Next() {
+			if f == m {
+				return iter.Take().slice
+			}
+		}
+	} else {
+		// For levels other than L0, UserKeyBounds in the level are non-overlapping
+		// so we only need to check one file.
+		if f := iter.SeekGE(cmp, m.UserKeyBounds().Start); f == m {
+			return iter.Take().slice
 		}
 	}
-	return nil
-}
-
-// Annotation lazily calculates and returns the annotation defined by
-// Annotator. The Annotator is used as the key for pre-calculated
-// values, so equal Annotators must be used to avoid duplicate computations
-// and cached annotations. Annotation must not be called concurrently, and in
-// practice this is achieved by requiring callers to hold DB.mu.
-func (lm *LevelMetadata) Annotation(annotator Annotator) interface{} {
-	if lm.Empty() {
-		return annotator.Zero(nil)
-	}
-	v, _ := lm.tree.root.Annotation(annotator)
-	return v
-}
-
-// InvalidateAnnotation clears any cached annotations defined by Annotator. The
-// Annotator is used as the key for pre-calculated values, so equal Annotators
-// must be used to clear the appropriate cached annotation. InvalidateAnnotation
-// must not be called concurrently, and in practice this is achieved by
-// requiring callers to hold DB.mu.
-func (lm *LevelMetadata) InvalidateAnnotation(annotator Annotator) {
-	if lm.Empty() {
-		return
-	}
-	lm.tree.root.InvalidateAnnotation(annotator)
+	return LevelSlice{}
 }
 
 // LevelFile holds a file's metadata along with its position
@@ -133,7 +158,7 @@ func (lf LevelFile) Slice() LevelSlice {
 // TODO(jackson): Can we improve this interface or avoid needing to export
 // a slice constructor like this?
 func NewLevelSliceSeqSorted(files []*FileMetadata) LevelSlice {
-	tr, slice := makeBTree(btreeCmpSeqNum, files)
+	tr, slice := makeBTree(nil, btreeCmpSeqNum, files)
 	tr.Release()
 	slice.verifyInvariants()
 	return slice
@@ -144,7 +169,7 @@ func NewLevelSliceSeqSorted(files []*FileMetadata) LevelSlice {
 // TODO(jackson): Can we improve this interface or avoid needing to export
 // a slice constructor like this?
 func NewLevelSliceKeySorted(cmp base.Compare, files []*FileMetadata) LevelSlice {
-	tr, slice := makeBTree(btreeCmpSmallestKey(cmp), files)
+	tr, slice := makeBTree(cmp, btreeCmpSmallestKey(cmp), files)
 	tr.Release()
 	slice.verifyInvariants()
 	return slice
@@ -155,7 +180,7 @@ func NewLevelSliceKeySorted(cmp base.Compare, files []*FileMetadata) LevelSlice 
 // tests.
 // TODO(jackson): Update tests to avoid requiring this and remove it.
 func NewLevelSliceSpecificOrder(files []*FileMetadata) LevelSlice {
-	tr, slice := makeBTree(btreeCmpSpecificOrder(files), files)
+	tr, slice := makeBTree(nil, btreeCmpSpecificOrder(files), files)
 	tr.Release()
 	slice.verifyInvariants()
 	return slice
@@ -280,6 +305,32 @@ func (ls *LevelSlice) SizeSum() uint64 {
 	return sum
 }
 
+// NumVirtual returns the number of virtual sstables in the level. Its runtime is
+// linear in the length of the slice.
+func (ls *LevelSlice) NumVirtual() uint64 {
+	var n uint64
+	iter := ls.Iter()
+	for f := iter.First(); f != nil; f = iter.Next() {
+		if f.Virtual {
+			n++
+		}
+	}
+	return n
+}
+
+// VirtualSizeSum returns the sum of the sizes of the virtual sstables in the
+// level.
+func (ls *LevelSlice) VirtualSizeSum() uint64 {
+	var sum uint64
+	iter := ls.Iter()
+	for f := iter.First(); f != nil; f = iter.Next() {
+		if f.Virtual {
+			sum += f.Size
+		}
+	}
+	return sum
+}
+
 // Reslice constructs a new slice backed by the same underlying level, with
 // new start and end positions. Reslice invokes the provided function, passing
 // two LevelIterators: one positioned to i's inclusive start and one
@@ -309,6 +360,24 @@ func (ls LevelSlice) Reslice(resliceFunc func(start, end *LevelIterator)) LevelS
 	return newBoundedLevelSlice(start.iter.clone(), &start.iter, &end.iter)
 }
 
+// Overlaps returns a new LevelSlice that reflects the portion of files with
+// boundaries that overlap with the provided bounds.
+func (ls LevelSlice) Overlaps(cmp Compare, bounds base.UserKeyBounds) LevelSlice {
+	startIter := ls.Iter()
+	startIter.SeekGE(cmp, bounds.Start)
+
+	// Note: newBoundedLevelSlice uses inclusive bounds, so we need to position
+	// endIter at the last overlapping file.
+	endIter := ls.Iter()
+	endIterFile := endIter.SeekGE(cmp, bounds.End.Key)
+	// The first file that ends at/after bounds.End.Key might or might not overlap
+	// the bounds; we need to check the start key.
+	if endIterFile == nil || !bounds.End.IsUpperBoundFor(cmp, endIterFile.Smallest.UserKey) {
+		endIter.Prev()
+	}
+	return newBoundedLevelSlice(startIter.iter.clone(), &startIter.iter, &endIter.iter)
+}
+
 // KeyType is used to specify the type of keys we're looking for in
 // LevelIterator positioning operations. Files not containing any keys of the
 // desired type are skipped.
@@ -326,57 +395,13 @@ const (
 	KeyTypeRange
 )
 
-type keyTypeAnnotator struct{}
-
-var _ Annotator = keyTypeAnnotator{}
-
-func (k keyTypeAnnotator) Zero(dst interface{}) interface{} {
-	var val *KeyType
-	if dst != nil {
-		val = dst.(*KeyType)
-	} else {
-		val = new(KeyType)
-	}
-	*val = KeyTypePoint
-	return val
-}
-
-func (k keyTypeAnnotator) Accumulate(m *FileMetadata, dst interface{}) (interface{}, bool) {
-	v := dst.(*KeyType)
-	switch *v {
-	case KeyTypePoint:
-		if m.HasRangeKeys {
-			*v = KeyTypePointAndRange
-		}
-	case KeyTypePointAndRange:
-		// Do nothing.
-	default:
-		panic("unexpected key type")
-	}
-	return v, true
-}
-
-func (k keyTypeAnnotator) Merge(src interface{}, dst interface{}) interface{} {
-	v := dst.(*KeyType)
-	srcVal := src.(*KeyType)
-	switch *v {
-	case KeyTypePoint:
-		if *srcVal == KeyTypePointAndRange {
-			*v = KeyTypePointAndRange
-		}
-	case KeyTypePointAndRange:
-		// Do nothing.
-	default:
-		panic("unexpected key type")
-	}
-	return v
-}
-
 // LevelIterator iterates over a set of files' metadata. Its zero value is an
 // empty iterator.
 type LevelIterator struct {
-	iter   iterator
-	start  *iterator
+	iter iterator
+	// If set, start is an inclusive lower bound on the iterator.
+	start *iterator
+	// If set, end is an inclusive upper bound on the iterator.
 	end    *iterator
 	filter KeyType
 }
@@ -433,19 +458,6 @@ func (i *LevelIterator) Clone() LevelIterator {
 		end:    i.end,
 		filter: i.filter,
 	}
-}
-
-// Current returns the item at the current iterator position.
-//
-// Current is deprecated. Callers should instead use the return value of a
-// positioning operation.
-func (i *LevelIterator) Current() *FileMetadata {
-	if !i.iter.valid() ||
-		(i.end != nil && cmpIter(i.iter, *i.end) > 0) ||
-		(i.start != nil && cmpIter(i.iter, *i.start) < 0) {
-		return nil
-	}
-	return i.iter.cur()
 }
 
 func (i *LevelIterator) empty() bool {
@@ -529,59 +541,81 @@ func (i *LevelIterator) Prev() *FileMetadata {
 	return i.skipFilteredBackward(i.iter.cur())
 }
 
-// SeekGE seeks to the first file in the iterator's file set with a largest
-// user key greater than or equal to the provided user key. The iterator must
-// have been constructed from L1+, because it requires the underlying files to
-// be sorted by user keys and non-overlapping.
+// SeekGE seeks to the first file with a largest key (of the desired type) that
+// is an upper bound for the given user key. This is the first file that could
+// contain a user key that is greater than or equal to userKey.
+//
+// More specifically, userKey is less than the file's largest.UserKey or they
+// are equal and largest is not an exclusive sentinel.
+//
+// The iterator must have been constructed from L1+ or from a single sublevel of
+// L0, because it requires the underlying files to be sorted by user keys and
+// non-overlapping.
 func (i *LevelIterator) SeekGE(cmp Compare, userKey []byte) *FileMetadata {
-	// TODO(jackson): Assert that i.iter.cmp == btreeCmpSmallestKey.
 	if i.iter.r == nil {
 		return nil
 	}
+	i.assertNotL0Cmp()
 	m := i.seek(func(m *FileMetadata) bool {
-		return cmp(m.Largest.UserKey, userKey) >= 0
+		return m.Largest.IsUpperBoundFor(cmp, userKey)
 	})
 	if i.filter != KeyTypePointAndRange && m != nil {
 		b, ok := m.LargestBound(i.filter)
-		if !ok {
-			m = i.Next()
-		} else if c := cmp(b.UserKey, userKey); c < 0 || c == 0 && b.IsExclusiveSentinel() {
-			// This file does not contain any keys of the type ≥ lower. It
-			// should be filtered, even though it does contain point keys.
-			m = i.Next()
+		if !ok || !b.IsUpperBoundFor(cmp, userKey) {
+			// The file does not contain any keys of desired key types
+			// that are >= userKey.
+			return i.Next()
 		}
 	}
 	return i.skipFilteredForward(m)
 }
 
-// SeekLT seeks to the last file in the iterator's file set with a smallest
-// user key less than the provided user key. The iterator must have been
-// constructed from L1+, because it requires the underlying files to be sorted
-// by user keys and non-overlapping.
+// SeekLT seeks to the last file with a smallest key (of the desired type) that
+// is less than the given user key. This is the last file that could contain a
+// key less than userKey.
+//
+// The iterator must have been constructed from L1+ or from a single sublevel of
+// L0, because it requires the underlying files to be sorted by user keys and
+// non-overlapping.
 func (i *LevelIterator) SeekLT(cmp Compare, userKey []byte) *FileMetadata {
-	// TODO(jackson): Assert that i.iter.cmp == btreeCmpSmallestKey.
 	if i.iter.r == nil {
 		return nil
 	}
+	i.assertNotL0Cmp()
 	i.seek(func(m *FileMetadata) bool {
 		return cmp(m.Smallest.UserKey, userKey) >= 0
 	})
 	m := i.Prev()
 	// Although i.Prev() guarantees that the current file contains keys of the
 	// relevant type, it doesn't guarantee that the keys of the relevant type
-	// are < userKey.
+	// are < userKey. For example, say that we have these two files:
+	//   f1: [a, f) with keys of the desired type in the range [c, d)
+	//   f2: [h, k)
+	// and userKey is b. The seek call above will position us at f2 and Prev will
+	// position us at f1.
 	if i.filter != KeyTypePointAndRange && m != nil {
 		b, ok := m.SmallestBound(i.filter)
 		if !ok {
 			panic("unreachable")
 		}
-		if c := cmp(b.UserKey, userKey); c >= 0 {
-			// This file does not contain any keys of the type ≥ lower. It
-			// should be filtered, even though it does contain point keys.
-			m = i.Prev()
+		if cmp(b.UserKey, userKey) >= 0 {
+			// This file does not contain any keys of desired key types
+			// that are <= userKey.
+			return i.Prev()
 		}
 	}
-	return i.skipFilteredBackward(m)
+	return m
+}
+
+// assertNotL0Cmp verifies that the btree associated with the iterator is
+// ordered by Smallest key (i.e. L1+ or L0 sublevel) and not by LargestSeqNum
+// (L0).
+func (i *LevelIterator) assertNotL0Cmp() {
+	if invariants.Enabled {
+		if reflect.ValueOf(i.iter.cmp).Pointer() == reflect.ValueOf(btreeCmpSeqNum).Pointer() {
+			panic("Seek used with btreeCmpSeqNum")
+		}
+	}
 }
 
 // skipFilteredForward takes the file metadata at the iterator's current
@@ -632,6 +666,10 @@ func (i *LevelIterator) skipFilteredBackward(meta *FileMetadata) *FileMetadata {
 	return meta
 }
 
+// seek repositions the iterator over the first file for which fn returns true,
+// mirroring the semantics of the standard library's sort.Search function: fn
+// returns false for some (possibly empty) prefix of the tree's files, and then
+// true for the (possibly empty) remainder.
 func (i *LevelIterator) seek(fn func(*FileMetadata) bool) *FileMetadata {
 	i.iter.seek(fn)
 
@@ -665,10 +703,12 @@ func (i *LevelIterator) seek(fn func(*FileMetadata) bool) *FileMetadata {
 // position. Take panics if the iterator is not currently positioned over a
 // file.
 func (i *LevelIterator) Take() LevelFile {
-	m := i.Current()
-	if m == nil {
+	if !i.iter.valid() ||
+		(i.end != nil && cmpIter(i.iter, *i.end) > 0) ||
+		(i.start != nil && cmpIter(i.iter, *i.start) < 0) {
 		panic("Take called on invalid LevelIterator")
 	}
+	m := i.iter.cur()
 	// LevelSlice's start and end fields are immutable and are positioned to
 	// the same position for a LevelFile because they're inclusive, so we can
 	// share one iterator stack between the two bounds.

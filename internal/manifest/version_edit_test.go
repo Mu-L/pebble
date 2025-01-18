@@ -10,8 +10,7 @@ import (
 	"io"
 	"os"
 	"reflect"
-	"sort"
-	"strconv"
+	"slices"
 	"strings"
 	"testing"
 
@@ -19,6 +18,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/record"
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
 )
@@ -32,7 +32,12 @@ func checkRoundTrip(e0 VersionEdit) error {
 	if err := e1.Decode(buf); err != nil {
 		return errors.Wrap(err, "decode")
 	}
-	if diff := pretty.Diff(e0, e1); diff != nil {
+	diff := pretty.Diff(e0, e1)
+	// SyntheticPrefixAndSuffix can't be correctly compared with pretty.Diff.
+	diff = slices.DeleteFunc(diff, func(s string) bool {
+		return strings.Contains(s, "SyntheticPrefixAndSuffix")
+	})
+	if len(diff) > 0 {
 		return errors.Errorf("%s", strings.Join(diff, "\n"))
 	}
 	return nil
@@ -45,11 +50,13 @@ func checkRoundTrip(e0 VersionEdit) error {
 func TestVERoundTripAndAccumulate(t *testing.T) {
 	cmp := base.DefaultComparer.Compare
 	m1 := (&FileMetadata{
-		FileNum:        810,
-		Size:           8090,
-		CreationTime:   809060,
-		SmallestSeqNum: 9,
-		LargestSeqNum:  11,
+		FileNum:                  810,
+		Size:                     8090,
+		CreationTime:             809060,
+		SmallestSeqNum:           9,
+		LargestSeqNum:            11,
+		LargestSeqNumAbsolute:    11,
+		SyntheticPrefixAndSuffix: sstable.MakeSyntheticPrefixAndSuffix([]byte("after"), []byte("foo")),
 	}).ExtendPointKeyBounds(
 		cmp,
 		base.MakeInternalKey([]byte("a"), 0, base.InternalKeyKindSet),
@@ -62,13 +69,14 @@ func TestVERoundTripAndAccumulate(t *testing.T) {
 	m1.InitPhysicalBacking()
 
 	m2 := (&FileMetadata{
-		FileNum:        812,
-		Size:           8090,
-		CreationTime:   809060,
-		SmallestSeqNum: 9,
-		LargestSeqNum:  11,
-		Virtual:        true,
-		FileBacking:    m1.FileBacking,
+		FileNum:               812,
+		Size:                  8090,
+		CreationTime:          809060,
+		SmallestSeqNum:        9,
+		LargestSeqNum:         11,
+		LargestSeqNumAbsolute: 11,
+		Virtual:               true,
+		FileBacking:           m1.FileBacking,
 	}).ExtendPointKeyBounds(
 		cmp,
 		base.MakeInternalKey([]byte("a"), 0, base.InternalKeyKindSet),
@@ -123,12 +131,14 @@ func TestVersionEditRoundTrip(t *testing.T) {
 	m1.InitPhysicalBacking()
 
 	m2 := (&FileMetadata{
-		FileNum:             806,
-		Size:                8060,
-		CreationTime:        806040,
-		SmallestSeqNum:      3,
-		LargestSeqNum:       5,
-		MarkedForCompaction: true,
+		FileNum:                  806,
+		Size:                     8060,
+		CreationTime:             806040,
+		SmallestSeqNum:           3,
+		LargestSeqNum:            5,
+		LargestSeqNumAbsolute:    5,
+		MarkedForCompaction:      true,
+		SyntheticPrefixAndSuffix: sstable.MakeSyntheticPrefixAndSuffix(nil, []byte("foo")),
 	}).ExtendPointKeyBounds(
 		cmp,
 		base.DecodeInternalKey([]byte("A\x00\x01\x02\x03\x04\x05\x06\x07")),
@@ -148,11 +158,12 @@ func TestVersionEditRoundTrip(t *testing.T) {
 	m3.InitPhysicalBacking()
 
 	m4 := (&FileMetadata{
-		FileNum:        809,
-		Size:           8090,
-		CreationTime:   809060,
-		SmallestSeqNum: 9,
-		LargestSeqNum:  11,
+		FileNum:               809,
+		Size:                  8090,
+		CreationTime:          809060,
+		SmallestSeqNum:        9,
+		LargestSeqNum:         11,
+		LargestSeqNumAbsolute: 11,
 	}).ExtendPointKeyBounds(
 		cmp,
 		base.MakeInternalKey([]byte("a"), 0, base.InternalKeyKindSet),
@@ -165,11 +176,12 @@ func TestVersionEditRoundTrip(t *testing.T) {
 	m4.InitPhysicalBacking()
 
 	m5 := (&FileMetadata{
-		FileNum:        810,
-		Size:           8090,
-		CreationTime:   809060,
-		SmallestSeqNum: 9,
-		LargestSeqNum:  11,
+		FileNum:               810,
+		Size:                  8090,
+		CreationTime:          809060,
+		SmallestSeqNum:        9,
+		LargestSeqNum:         11,
+		LargestSeqNumAbsolute: 11,
 	}).ExtendPointKeyBounds(
 		cmp,
 		base.MakeInternalKey([]byte("a"), 0, base.InternalKeyKindSet),
@@ -182,11 +194,12 @@ func TestVersionEditRoundTrip(t *testing.T) {
 	m5.InitPhysicalBacking()
 
 	m6 := (&FileMetadata{
-		FileNum:        811,
-		Size:           8090,
-		CreationTime:   809060,
-		SmallestSeqNum: 9,
-		LargestSeqNum:  11,
+		FileNum:               811,
+		Size:                  8090,
+		CreationTime:          809060,
+		SmallestSeqNum:        9,
+		LargestSeqNum:         11,
+		LargestSeqNumAbsolute: 11,
 	}).ExtendPointKeyBounds(
 		cmp,
 		base.MakeInternalKey([]byte("a"), 0, base.InternalKeyKindSet),
@@ -203,14 +216,12 @@ func TestVersionEditRoundTrip(t *testing.T) {
 		{},
 		// A complete version edit.
 		{
-			ComparerName:       "11",
-			MinUnflushedLogNum: 22,
-			ObsoletePrevLogNum: 33,
-			NextFileNum:        44,
-			LastSeqNum:         55,
-			RemovedBackingTables: []base.DiskFileNum{
-				base.FileNum(10).DiskFileNum(), base.FileNum(11).DiskFileNum(),
-			},
+			ComparerName:         "11",
+			MinUnflushedLogNum:   22,
+			ObsoletePrevLogNum:   33,
+			NextFileNum:          44,
+			LastSeqNum:           55,
+			RemovedBackingTables: []base.DiskFileNum{10, 11},
 			CreatedBackingTables: []*FileBacking{m5.FileBacking, m6.FileBacking},
 			DeletedFiles: map[DeletedFileEntry]*FileMetadata{
 				{
@@ -250,16 +261,20 @@ func TestVersionEditRoundTrip(t *testing.T) {
 }
 
 func TestVersionEditDecode(t *testing.T) {
+	// TODO(radu): these should be datadriven tests that output the encoded and
+	// decoded edits.
 	cmp := base.DefaultComparer.Compare
 	m := (&FileMetadata{
-		FileNum:        4,
-		Size:           986,
-		SmallestSeqNum: 3,
-		LargestSeqNum:  5,
+		FileNum:               4,
+		Size:                  709,
+		SmallestSeqNum:        12,
+		LargestSeqNum:         14,
+		LargestSeqNumAbsolute: 14,
+		CreationTime:          1701712644,
 	}).ExtendPointKeyBounds(
 		cmp,
-		base.MakeInternalKey([]byte("bar"), 5, base.InternalKeyKindDelete),
-		base.MakeInternalKey([]byte("foo"), 4, base.InternalKeyKindSet),
+		base.MakeInternalKey([]byte("bar"), 14, base.InternalKeyKindDelete),
+		base.MakeInternalKey([]byte("foo"), 13, base.InternalKeyKindSet),
 	)
 	m.InitPhysicalBacking()
 
@@ -272,34 +287,38 @@ func TestVersionEditDecode(t *testing.T) {
 		{
 			filename: "db-stage-1/MANIFEST-000001",
 			encodedEdits: []string{
-				"\x02\x00\x03\x02\x04\x00",
+				"\x01\x1aleveldb.BytewiseComparator\x03\x02\x04\x00",
+				"\x02\x02\x03\x03\x04\t",
 			},
 			edits: []VersionEdit{
 				{
-					NextFileNum: 2,
+					ComparerName: "leveldb.BytewiseComparator",
+					NextFileNum:  2,
+				},
+				{
+					MinUnflushedLogNum: 0x2,
+					NextFileNum:        0x3,
+					LastSeqNum:         0x9,
 				},
 			},
 		},
 		// db-stage-3 and db-stage-4 have the same manifest.
 		{
-			filename: "db-stage-3/MANIFEST-000005",
+			filename: "db-stage-3/MANIFEST-000006",
 			encodedEdits: []string{
-				"\x01\x1aleveldb.BytewiseComparator",
-				"\x02\x00",
-				"\x02\x04\t\x00\x03\x06\x04\x05d\x00\x04\xda\a\vbar" +
-					"\x00\x05\x00\x00\x00\x00\x00\x00\vfoo\x01\x04\x00" +
-					"\x00\x00\x00\x00\x00\x03\x05",
+				"\x01\x1aleveldb.BytewiseComparator\x02\x02\x03\a\x04\x00",
+				"\x02\x05\x03\x06\x04\x0eg\x00\x04\xc5\x05\vbar\x00\x0e\x00\x00\x00\x00\x00\x00\vfoo\x01\r\x00\x00\x00\x00\x00\x00\f\x0e\x06\x05\x84\xa6\xb8\xab\x06\x01",
 			},
 			edits: []VersionEdit{
 				{
-					ComparerName: "leveldb.BytewiseComparator",
+					ComparerName:       "leveldb.BytewiseComparator",
+					MinUnflushedLogNum: 0x2,
+					NextFileNum:        0x7,
 				},
-				{},
 				{
-					MinUnflushedLogNum: 4,
-					ObsoletePrevLogNum: 0,
-					NextFileNum:        6,
-					LastSeqNum:         5,
+					MinUnflushedLogNum: 0x5,
+					NextFileNum:        0x6,
+					LastSeqNum:         0xe,
 					NewFiles: []NewFileEntry{
 						{
 							Level: 0,
@@ -407,7 +426,7 @@ func TestVersionEditEncodeLastSeqNum(t *testing.T) {
 				}
 				val, err := d.readUvarint()
 				require.NoError(t, err)
-				if c.edit.LastSeqNum != val {
+				if c.edit.LastSeqNum != base.SeqNum(val) {
 					t.Fatalf("expected %d, but found %d", c.edit.LastSeqNum, val)
 				}
 			}
@@ -416,125 +435,114 @@ func TestVersionEditEncodeLastSeqNum(t *testing.T) {
 }
 
 func TestVersionEditApply(t *testing.T) {
-	parseMeta := func(s string) (*FileMetadata, error) {
-		m, err := ParseFileMetadataDebug(s)
-		if err != nil {
-			return nil, err
-		}
-		m.SmallestSeqNum = m.Smallest.SeqNum()
-		m.LargestSeqNum = m.Largest.SeqNum()
-		if m.SmallestSeqNum > m.LargestSeqNum {
-			m.SmallestSeqNum, m.LargestSeqNum = m.LargestSeqNum, m.SmallestSeqNum
-		}
-		m.InitPhysicalBacking()
-		return m, nil
-	}
+	const flushSplitBytes = 10 * 1024 * 1024
+	const readCompactionRate = 32000
 
-	// TODO(bananabrick): Improve the parsing logic in this test.
+	versions := make(map[string]*Version)
 	datadriven.RunTest(t, "testdata/version_edit_apply",
 		func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
-			case "apply":
-				// TODO(sumeer): move this Version parsing code to utils, to
-				// avoid repeating it, and make it the inverse of
-				// Version.DebugString().
-				var v *Version
-				var veList []*VersionEdit
-				isVersion := true
-				isDelete := true
-				var level int
-				var err error
-				versionFiles := map[base.FileNum]*FileMetadata{}
-				for _, data := range strings.Split(d.Input, "\n") {
-					data = strings.TrimSpace(data)
-					switch data {
-					case "edit":
-						isVersion = false
-						veList = append(veList, &VersionEdit{})
-					case "delete":
-						isVersion = false
-						isDelete = true
-					case "add":
-						isVersion = false
-						isDelete = false
-					case "L0", "L1", "L2", "L3", "L4", "L5", "L6":
-						level, err = strconv.Atoi(data[1:])
-						if err != nil {
-							return err.Error()
-						}
-					default:
-						var ve *VersionEdit
-						if len(veList) > 0 {
-							ve = veList[len(veList)-1]
-						}
-						if isVersion || !isDelete {
-							meta, err := parseMeta(data)
-							if err != nil {
-								return err.Error()
-							}
-							if isVersion {
-								if v == nil {
-									v = new(Version)
-									for l := 0; l < NumLevels; l++ {
-										v.Levels[l] = makeLevelMetadata(base.DefaultComparer.Compare, l, nil /* files */)
-									}
-								}
-								versionFiles[meta.FileNum] = meta
-								v.Levels[level].tree.Insert(meta)
-								meta.LatestRef()
-							} else {
-								ve.NewFiles =
-									append(ve.NewFiles, NewFileEntry{Level: level, Meta: meta})
-							}
-						} else {
-							fileNum, err := strconv.Atoi(data)
-							if err != nil {
-								return err.Error()
-							}
-							dfe := DeletedFileEntry{Level: level, FileNum: base.FileNum(fileNum)}
-							if ve.DeletedFiles == nil {
-								ve.DeletedFiles = make(map[DeletedFileEntry]*FileMetadata)
-							}
-							ve.DeletedFiles[dfe] = versionFiles[dfe.FileNum]
-						}
-					}
+			case "define":
+				// Define a version.
+				name := d.CmdArgs[0].String()
+				v, err := ParseVersionDebug(base.DefaultComparer, flushSplitBytes, d.Input)
+				if err != nil {
+					d.Fatalf(t, "%v", err)
 				}
+				versions[name] = v
+				return v.DebugString()
 
-				if v != nil {
-					if err := v.InitL0Sublevels(base.DefaultComparer.Compare, base.DefaultFormatter, 10<<20); err != nil {
-						return err.Error()
-					}
+			case "apply":
+				// Apply an edit to the given version.
+				name := d.CmdArgs[0].String()
+				v := versions[name]
+				if v == nil {
+					d.Fatalf(t, "unknown version %q", name)
+					return ""
 				}
 
 				bve := BulkVersionEdit{}
 				bve.AddedByFileNum = make(map[base.FileNum]*FileMetadata)
-				for _, ve := range veList {
-					if err := bve.Accumulate(ve); err != nil {
-						return err.Error()
+				for _, l := range v.Levels {
+					it := l.Iter()
+					for f := it.First(); f != nil; f = it.Next() {
+						bve.AddedByFileNum[f.FileNum] = f
 					}
 				}
-				zombies := make(map[base.DiskFileNum]uint64)
-				newv, err := bve.Apply(v, base.DefaultComparer.Compare, base.DefaultFormatter, 10<<20, 32000, zombies)
+
+				lines := strings.Split(d.Input, "\n")
+				for len(lines) > 0 {
+					// We allow multiple version edits with a special separator.
+					var linesForOneVE []string
+					if nextSplit := slices.Index(lines, "new version edit"); nextSplit != -1 {
+						linesForOneVE = lines[:nextSplit]
+						lines = lines[nextSplit+1:]
+					} else {
+						linesForOneVE = lines
+						lines = nil
+					}
+					ve, err := ParseVersionEditDebug(strings.Join(linesForOneVE, "\n"))
+					if err != nil {
+						d.Fatalf(t, "%v", err)
+					}
+					if err := bve.Accumulate(ve); err != nil {
+						return fmt.Sprintf("error during Accumulate: %v", err)
+					}
+				}
+
+				newv, err := bve.Apply(v, base.DefaultComparer, flushSplitBytes, readCompactionRate)
 				if err != nil {
 					return err.Error()
 				}
 
-				zombieFileNums := make([]base.DiskFileNum, 0, len(zombies))
-				if len(veList) == 1 {
-					// Only care about zombies if a single version edit was
-					// being applied.
-					for fileNum := range zombies {
-						zombieFileNums = append(zombieFileNums, fileNum)
-					}
-					sort.Slice(zombieFileNums, func(i, j int) bool {
-						return zombieFileNums[i].FileNum() < zombieFileNums[j].FileNum()
-					})
+				// Reinitialize the L0 sublevels in the original version; otherwise we
+				// will get "AddL0Files called twice on the same receiver" panics.
+				if err := v.InitL0Sublevels(flushSplitBytes); err != nil {
+					panic(err)
 				}
-
-				return fmt.Sprintf("%szombies %d\n", newv, zombieFileNums)
+				return newv.DebugString()
 
 			default:
 				return fmt.Sprintf("unknown command: %s", d.Cmd)
 			}
 		})
+}
+
+func TestParseVersionEditDebugRoundTrip(t *testing.T) {
+	testCases := []struct {
+		input  string
+		output string
+	}{
+		{
+			input: `  add-table:     L1 000001:[a#0,SET-z#0,DEL] seqnums:[0-0] points:[a#0,SET-z#0,DEL] size:1`,
+		},
+		{
+			input:  `add-table: L0 1:[a#0,SET-z#0,DEL]`,
+			output: `  add-table:     L0 000001:[a#0,SET-z#0,DEL] seqnums:[0-0] points:[a#0,SET-z#0,DEL]`,
+		},
+		{
+			input: `  del-table:     L1 000001`,
+		},
+		{
+			input: strings.Join([]string{
+				`  del-table:     L1 000002`,
+				`  del-table:     L3 000003`,
+				`  add-table:     L1 000001:[a#0,SET-z#0,DEL] seqnums:[0-0] points:[a#0,SET-z#0,DEL] size:1`,
+				`  add-table:     L2 000002:[a#0,SET-z#0,DEL] seqnums:[0-0] points:[a#0,SET-z#0,DEL] size:2`,
+			}, "\n"),
+		},
+	}
+	for _, tc := range testCases {
+		t.Run("", func(t *testing.T) {
+			ve, err := ParseVersionEditDebug(tc.input)
+			require.NoError(t, err)
+			got := ve.DebugString(base.DefaultFormatter)
+			got = strings.TrimSuffix(got, "\n")
+			want := tc.input
+			if tc.output != "" {
+				want = tc.output
+			}
+			require.Equal(t, want, got)
+		})
+	}
 }

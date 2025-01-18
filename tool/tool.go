@@ -10,6 +10,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/spf13/cobra"
 )
@@ -37,6 +38,9 @@ type T struct {
 	comparers       sstable.Comparers
 	mergers         sstable.Mergers
 	defaultComparer string
+	openErrEnhancer func(error) error
+	openOptions     []OpenOption
+	exciseSpanFn    DBExciseSpanFn
 }
 
 // A Option configures the Pebble introspection tool.
@@ -48,6 +52,26 @@ func Comparers(cmps ...*Comparer) Option {
 	return func(t *T) {
 		for _, c := range cmps {
 			t.comparers[c.Name] = c
+		}
+	}
+}
+
+// KeySchema configures the name of the schema to use when writing sstables.
+func KeySchema(name string) Option {
+	return func(t *T) {
+		t.opts.KeySchema = name
+	}
+}
+
+// KeySchemas may be passed to New to register key schemas for use by the
+// introspection tools.
+func KeySchemas(schemas ...*colblk.KeySchema) Option {
+	return func(t *T) {
+		if t.opts.KeySchemas == nil {
+			t.opts.KeySchemas = make(map[string]*colblk.KeySchema)
+		}
+		for _, s := range schemas {
+			t.opts.KeySchemas[s.Name] = s
 		}
 	}
 }
@@ -81,10 +105,42 @@ func Filters(filters ...FilterPolicy) Option {
 	}
 }
 
+// OpenOptions may be passed to New to provide a set of OpenOptions that should
+// be invoked to configure the *pebble.Options before opening a database.
+func OpenOptions(openOptions ...OpenOption) Option {
+	return func(t *T) {
+		t.openOptions = append(t.openOptions, openOptions...)
+	}
+}
+
 // FS sets the filesystem implementation to use by the introspection tools.
 func FS(fs vfs.FS) Option {
 	return func(t *T) {
 		t.opts.FS = fs
+	}
+}
+
+// OpenErrEnhancer sets a function that enhances an error encountered when the
+// tool opens a database; used to provide the user additional context, for
+// example that a corruption error might be caused by encryption at rest not
+// being configured properly.
+func OpenErrEnhancer(fn func(error) error) Option {
+	return func(t *T) {
+		t.openErrEnhancer = fn
+	}
+}
+
+// DBExciseSpanFn is a function used to obtain the excise span for the `db
+// excise` command. This allows a higher-level wrapper to add its own way of
+// specifying the span. Returns an invalid KeyRange if none was specified (in
+// which case the default --start/end flags are used).
+type DBExciseSpanFn func() (pebble.KeyRange, error)
+
+// WithDBExciseSpanFn specifies a function that returns the excise span for the
+// `db excise` command.
+func WithDBExciseSpanFn(fn DBExciseSpanFn) Option {
+	return func(t *T) {
+		t.exciseSpanFn = fn
 	}
 }
 
@@ -110,7 +166,7 @@ func New(opts ...Option) *T {
 		opt(t)
 	}
 
-	t.db = newDB(&t.opts, t.comparers, t.mergers)
+	t.db = newDB(&t.opts, t.comparers, t.mergers, t.openErrEnhancer, t.openOptions, t.exciseSpanFn)
 	t.find = newFind(&t.opts, t.comparers, t.defaultComparer, t.mergers)
 	t.lsm = newLSM(&t.opts, t.comparers)
 	t.manifest = newManifest(&t.opts, t.comparers)
@@ -131,7 +187,9 @@ func New(opts ...Option) *T {
 
 // ConfigureSharedStorage updates the shared storage options.
 func (t *T) ConfigureSharedStorage(
-	s remote.StorageFactory, createOnShared bool, createOnSharedLocator remote.Locator,
+	s remote.StorageFactory,
+	createOnShared remote.CreateOnSharedStrategy,
+	createOnSharedLocator remote.Locator,
 ) {
 	t.opts.Experimental.RemoteStorage = s
 	t.opts.Experimental.CreateOnShared = createOnShared

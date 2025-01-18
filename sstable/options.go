@@ -5,20 +5,26 @@
 package sstable
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/pebble/internal/base"
-	"github.com/cockroachdb/pebble/internal/cache"
+	"github.com/cockroachdb/pebble/internal/sstableinternal"
+	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/colblk"
+	"github.com/cockroachdb/pebble/sstable/rowblk"
 )
 
-// Compression is the per-block compression algorithm to use.
-type Compression int
-
-// The available compression types.
 const (
-	DefaultCompression Compression = iota
-	NoCompression
-	SnappyCompression
-	ZstdCompression
-	NCompression
+	// MaximumBlockSize is the maximum permissible size of a block.
+	MaximumBlockSize = rowblk.MaximumSize
+	// DefaultNumDeletionsThreshold defines the minimum number of point
+	// tombstones that must be present in a data block for it to be
+	// considered tombstone-dense.
+	DefaultNumDeletionsThreshold = 100
+	// DefaultDeletionSizeRatioThreshold defines the minimum ratio of the size
+	// of point tombstones to the size of the data block in order to consider the
+	// block as tombstone-dense.
+	DefaultDeletionSizeRatioThreshold = 0.5
 )
 
 var ignoredInternalProperties = map[string]struct{}{
@@ -30,21 +36,6 @@ var ignoredInternalProperties = map[string]struct{}{
 	"rocksdb.creation.time":                {},
 	"rocksdb.file.creation.time":           {},
 	"rocksdb.format.version":               {},
-}
-
-func (c Compression) String() string {
-	switch c {
-	case DefaultCompression:
-		return "Default"
-	case NoCompression:
-		return "NoCompression"
-	case SnappyCompression:
-		return "Snappy"
-	case ZstdCompression:
-		return "ZSTD"
-	default:
-		return "Unknown"
-	}
 }
 
 // FilterType exports the base.FilterType type.
@@ -61,55 +52,35 @@ type FilterWriter = base.FilterWriter
 // FilterPolicy exports the base.FilterPolicy type.
 type FilterPolicy = base.FilterPolicy
 
-// TablePropertyCollector provides a hook for collecting user-defined
-// properties based on the keys and values stored in an sstable. A new
-// TablePropertyCollector is created for an sstable when the sstable is being
-// written.
-type TablePropertyCollector interface {
-	// Add is called with each new entry added to the sstable. While the sstable
-	// is itself sorted by key, do not assume that the entries are added in any
-	// order. In particular, the ordering of point entries and range tombstones
-	// is unspecified.
-	Add(key InternalKey, value []byte) error
+// Comparers is a map from comparer name to comparer. It is used for debugging
+// tools which may be used on multiple databases configured with different
+// comparers.
+type Comparers map[string]*base.Comparer
 
-	// Finish is called when all entries have been added to the sstable. The
-	// collected properties (if any) should be added to the specified map. Note
-	// that in case of an error during sstable construction, Finish may not be
-	// called.
-	Finish(userProps map[string]string) error
+// Mergers is a map from merger name to merger. It is used for debugging tools
+// which may be used on multiple databases configured with different
+// mergers.
+type Mergers map[string]*base.Merger
 
-	// The name of the property collector.
-	Name() string
-}
+// KeySchemas is a map from key schema name to key schema. A single database may
+// contain sstables with multiple key schemas.
+type KeySchemas map[string]*colblk.KeySchema
 
-// SuffixReplaceableTableCollector is an extension to the TablePropertyCollector
-// interface that allows a table property collector to indicate that it supports
-// being *updated* during suffix replacement, i.e. when an existing SST in which
-// all keys have the same key suffix is updated to have a new suffix.
-//
-// A collector which supports being updated in such cases must be able to derive
-// its updated value from its old value and the change being made to the suffix,
-// without needing to be passed each updated K/V.
-//
-// For example, a collector that only inspects values can simply copy its
-// previously computed property as-is, since key-suffix replacement does not
-// change values, while a collector that depends only on key suffixes, like one
-// which collected mvcc-timestamp bounds from timestamp-suffixed keys, can just
-// set its new bounds from the new suffix, as it is common to all keys, without
-// needing to recompute it from every key.
-type SuffixReplaceableTableCollector interface {
-	// UpdateKeySuffixes is called when a table is updated to change the suffix of
-	// all keys in the table, and is passed the old value for that prop, if any,
-	// for that table as well as the old and new suffix.
-	UpdateKeySuffixes(oldProps map[string]string, oldSuffix, newSuffix []byte) error
+// MakeKeySchemas constructs a KeySchemas from a slice of key schemas.
+func MakeKeySchemas(keySchemas ...*colblk.KeySchema) KeySchemas {
+	m := make(KeySchemas, len(keySchemas))
+	for _, keySchema := range keySchemas {
+		if _, ok := m[keySchema.Name]; ok {
+			panic(fmt.Sprintf("duplicate key schemas with name %q", keySchema.Name))
+		}
+		m[keySchema.Name] = keySchema
+	}
+	return m
 }
 
 // ReaderOptions holds the parameters needed for reading an sstable.
 type ReaderOptions struct {
-	// Cache is used to cache uncompressed blocks from sstables.
-	//
-	// The default cache size is a zero-size cache.
-	Cache *cache.Cache
+	block.ReaderOptions
 
 	// User properties specified in this map will not be added to sst.Properties.UserProperties.
 	DeniedUserProperties map[string]struct{}
@@ -121,33 +92,30 @@ type ReaderOptions struct {
 	// The default value uses the same ordering as bytes.Compare.
 	Comparer *Comparer
 
-	// Merge defines the Merge function in use for this keyspace.
-	Merge base.Merge
+	// Merger defines the Merge function in use for this keyspace.
+	Merger *Merger
 
-	// Filters is a map from filter policy name to filter policy. It is used for
-	// debugging tools which may be used on multiple databases configured with
-	// different filter policies. It is not necessary to populate this filters
-	// map during normal usage of a DB.
+	Comparers Comparers
+	Mergers   Mergers
+	// KeySchemas contains the set of known key schemas to use when interpreting
+	// columnar data blocks. Only used for sstables encoded in format
+	// TableFormatPebblev5 or higher.
+	KeySchemas KeySchemas
+
+	// Filters is a map from filter policy name to filter policy. Filters with
+	// policies that are not in this map will be ignored.
 	Filters map[string]FilterPolicy
 
-	// Merger defines the associative merge operation to use for merging values
-	// written with {Batch,DB}.Merge. The MergerName is checked for consistency
-	// with the value stored in the sstable when it was written.
-	MergerName string
-
-	// Logger is an optional logger and tracer.
-	LoggerAndTracer base.LoggerAndTracer
+	// FilterMetricsTracker is optionally used to track filter metrics.
+	FilterMetricsTracker *FilterMetricsTracker
 }
 
 func (o ReaderOptions) ensureDefaults() ReaderOptions {
 	if o.Comparer == nil {
 		o.Comparer = base.DefaultComparer
 	}
-	if o.Merge == nil {
-		o.Merge = base.DefaultMerger.Merge
-	}
-	if o.MergerName == "" {
-		o.MergerName = base.DefaultMerger.Name
+	if o.Merger == nil {
+		o.Merger = base.DefaultMerger
 	}
 	if o.LoggerAndTracer == nil {
 		o.LoggerAndTracer = base.NoopLoggerAndTracer{}
@@ -155,8 +123,14 @@ func (o ReaderOptions) ensureDefaults() ReaderOptions {
 	if o.DeniedUserProperties == nil {
 		o.DeniedUserProperties = ignoredInternalProperties
 	}
+	if o.KeySchemas == nil {
+		o.KeySchemas = defaultKeySchemas
+	}
 	return o
 }
+
+var defaultKeySchema = colblk.DefaultKeySchema(base.DefaultComparer, 16)
+var defaultKeySchemas = MakeKeySchemas(&defaultKeySchema)
 
 // WriterOptions holds the parameters used to control building an sstable.
 type WriterOptions struct {
@@ -175,13 +149,16 @@ type WriterOptions struct {
 	// specified percentage of the target block size and adding the next entry
 	// would cause the block to be larger than the target block size.
 	//
-	// The default value is 90
+	// The default value is 90.
 	BlockSizeThreshold int
 
-	// Cache is used to cache uncompressed blocks from sstables.
+	// SizeClassAwareThreshold imposes a minimum block size restriction for blocks
+	// to be flushed, that is computed as the percentage of the target block size.
+	// Note that this threshold takes precedence over BlockSizeThreshold when
+	// valid AllocatorSizeClasses are specified.
 	//
-	// The default is a nil cache.
-	Cache *cache.Cache
+	// The default value is 60.
+	SizeClassAwareThreshold int
 
 	// Comparer defines a total ordering over the space of []byte keys: a 'less
 	// than' relationship. The same comparison algorithm must be used for reads
@@ -193,7 +170,7 @@ type WriterOptions struct {
 	// Compression defines the per-block compression to use.
 	//
 	// The default value (DefaultCompression) uses snappy compression.
-	Compression Compression
+	Compression block.Compression
 
 	// FilterPolicy defines a filter algorithm (such as a Bloom filter) that can
 	// reduce disk reads for Get calls.
@@ -222,15 +199,18 @@ type WriterOptions struct {
 	// The default value is the value of BlockSize.
 	IndexBlockSize int
 
+	// KeySchema describes the schema to use for sstable formats that make use
+	// of columnar blocks, decomposing keys into their constituent components.
+	// Ignored if TableFormat <= TableFormatPebblev4.
+	KeySchema *colblk.KeySchema
+
 	// Merger defines the associative merge operation to use for merging values
 	// written with {Batch,DB}.Merge. The MergerName is checked for consistency
 	// with the value stored in the sstable when it was written.
 	MergerName string
 
 	// TableFormat specifies the format version for writing sstables. The default
-	// is TableFormatRocksDBv2 which creates RocksDB compatible sstables. Use
-	// TableFormatLevelDB to create LevelDB compatible sstable which can be used
-	// by a wider range of tools and libraries.
+	// is TableFormatMinSupported.
 	TableFormat TableFormat
 
 	// IsStrictObsolete is only relevant for >= TableFormatPebblev4. See comment
@@ -244,18 +224,13 @@ type WriterOptions struct {
 	// youngest for a userkey.
 	WritingToLowestLevel bool
 
-	// TablePropertyCollectors is a list of TablePropertyCollector creation
-	// functions. A new TablePropertyCollector is created for each sstable built
-	// and lives for the lifetime of the table.
-	TablePropertyCollectors []func() TablePropertyCollector
-
 	// BlockPropertyCollectors is a list of BlockPropertyCollector creation
 	// functions. A new BlockPropertyCollector is created for each sstable
 	// built and lives for the lifetime of writing that table.
 	BlockPropertyCollectors []func() BlockPropertyCollector
 
 	// Checksum specifies which checksum to use.
-	Checksum ChecksumType
+	Checksum block.ChecksumType
 
 	// Parallelism is used to indicate that the sstable Writer is allowed to
 	// compress data blocks and write datablocks to disk in parallel with the
@@ -269,6 +244,77 @@ type WriterOptions struct {
 	// RequiredInPlaceValueBound mirrors
 	// Options.Experimental.RequiredInPlaceValueBound.
 	RequiredInPlaceValueBound UserKeyPrefixBound
+
+	// DisableValueBlocks is only used for TableFormat >= TableFormatPebblev3,
+	// and if set to true, does not write any values to value blocks. This is
+	// only intended for cases where the in-memory buffering of all value blocks
+	// while writing a sstable is too expensive and likely to cause an OOM. It
+	// is never set to true by a Pebble DB, and can be set to true when some
+	// external code is directly generating huge sstables using Pebble's
+	// sstable.Writer (for example, CockroachDB backups can sometimes write
+	// 750MB sstables -- see
+	// https://github.com/cockroachdb/cockroach/issues/117113).
+	DisableValueBlocks bool
+
+	// AllocatorSizeClasses provides a sorted list containing the supported size
+	// classes of the underlying memory allocator. This provides hints to the
+	// writer's flushing policy to select block sizes that preemptively reduce
+	// internal fragmentation when loaded into the block cache.
+	AllocatorSizeClasses []int
+
+	// internal options can only be used from within the pebble package.
+	internal sstableinternal.WriterOptions
+
+	// NumDeletionsThreshold mirrors Options.Experimental.NumDeletionsThreshold.
+	NumDeletionsThreshold int
+
+	// DeletionSizeRatioThreshold mirrors
+	// Options.Experimental.DeletionSizeRatioThreshold.
+	DeletionSizeRatioThreshold float32
+
+	// disableObsoleteCollector is used to disable the obsolete key block property
+	// collector automatically added by sstable block writers.
+	disableObsoleteCollector bool
+}
+
+// UserKeyPrefixBound represents a [Lower,Upper) bound of user key prefixes.
+// If both are nil, there is no bound specified. Else, Compare(Lower,Upper)
+// must be < 0.
+type UserKeyPrefixBound struct {
+	// Lower is a lower bound user key prefix.
+	Lower []byte
+	// Upper is an upper bound user key prefix.
+	Upper []byte
+}
+
+// IsEmpty returns true iff the bound is empty.
+func (ukb *UserKeyPrefixBound) IsEmpty() bool {
+	return len(ukb.Lower) == 0 && len(ukb.Upper) == 0
+}
+
+// JemallocSizeClasses are a subset of available size classes in jemalloc[1],
+// suitable for the AllocatorSizeClasses option.
+//
+// The size classes are used when writing sstables for determining target block
+// sizes for flushes, with the goal of reducing internal memory fragmentation
+// when the blocks are later loaded into the block cache. We only use the size
+// classes between 16KiB - 256KiB as block limits fall in that range.
+//
+// [1] https://jemalloc.net/jemalloc.3.html#size_classes
+var JemallocSizeClasses = []int{
+	16 * 1024,
+	20 * 1024, 24 * 1024, 28 * 1024, 32 * 1024, // 4KiB spacing
+	40 * 1024, 48 * 1024, 56 * 1024, 64 * 1024, // 8KiB spacing
+	80 * 1024, 96 * 1024, 112 * 1024, 128 * 1024, // 16KiB spacing.
+	160 * 1024, 192 * 1024, 224 * 1024, 256 * 1024, // 32KiB spacing.
+	320 * 1024,
+}
+
+// SetInternal sets the internal writer options. Note that even though this
+// method is public, a caller outside the pebble package can't construct a value
+// to pass to it.
+func (o *WriterOptions) SetInternal(internalOpts sstableinternal.WriterOptions) {
+	o.internal = internalOpts
 }
 
 func (o WriterOptions) ensureDefaults() WriterOptions {
@@ -281,11 +327,14 @@ func (o WriterOptions) ensureDefaults() WriterOptions {
 	if o.BlockSizeThreshold <= 0 {
 		o.BlockSizeThreshold = base.DefaultBlockSizeThreshold
 	}
+	if o.SizeClassAwareThreshold <= 0 {
+		o.SizeClassAwareThreshold = base.SizeClassAwareBlockSizeThreshold
+	}
 	if o.Comparer == nil {
 		o.Comparer = base.DefaultComparer
 	}
-	if o.Compression <= DefaultCompression || o.Compression >= NCompression {
-		o.Compression = SnappyCompression
+	if o.Compression <= block.DefaultCompression || o.Compression >= block.NCompression {
+		o.Compression = block.SnappyCompression
 	}
 	if o.IndexBlockSize <= 0 {
 		o.IndexBlockSize = o.BlockSize
@@ -293,13 +342,23 @@ func (o WriterOptions) ensureDefaults() WriterOptions {
 	if o.MergerName == "" {
 		o.MergerName = base.DefaultMerger.Name
 	}
-	if o.Checksum == ChecksumTypeNone {
-		o.Checksum = ChecksumTypeCRC32c
+	if o.Checksum == block.ChecksumTypeNone {
+		o.Checksum = block.ChecksumTypeCRC32c
 	}
 	// By default, if the table format is not specified, fall back to using the
-	// most compatible format.
+	// most compatible format that is supported by Pebble.
 	if o.TableFormat == TableFormatUnspecified {
-		o.TableFormat = TableFormatRocksDBv2
+		o.TableFormat = TableFormatMinSupported
+	}
+	if o.NumDeletionsThreshold == 0 {
+		o.NumDeletionsThreshold = DefaultNumDeletionsThreshold
+	}
+	if o.DeletionSizeRatioThreshold == 0 {
+		o.DeletionSizeRatioThreshold = DefaultDeletionSizeRatioThreshold
+	}
+	if o.KeySchema == nil && o.TableFormat.BlockColumnar() {
+		s := colblk.DefaultKeySchema(o.Comparer, 16 /* bundle size */)
+		o.KeySchema = &s
 	}
 	return o
 }

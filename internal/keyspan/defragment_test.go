@@ -7,9 +7,7 @@ package keyspan
 import (
 	"bytes"
 	"fmt"
-	"io"
-	"math/rand"
-	"sort"
+	"math/rand/v2"
 	"strings"
 	"testing"
 	"time"
@@ -24,11 +22,11 @@ func TestDefragmentingIter(t *testing.T) {
 	comparer := testkeys.Comparer
 	cmp := comparer.Compare
 	internalEqual := DefragmentInternal
-	alwaysEqual := DefragmentMethodFunc(func(_ base.Equal, _, _ *Span) bool { return true })
+	alwaysEqual := DefragmentMethodFunc(func(_ base.CompareRangeSuffixes, _, _ *Span) bool { return true })
 	staticReducer := StaticDefragmentReducer
 	collectReducer := func(cur, next []Key) []Key {
-		c := keysBySeqNumKind(append(cur, next...))
-		sort.Sort(&c)
+		c := append(cur, next...)
+		SortKeysByTrailer(c)
 		return c
 	}
 
@@ -47,6 +45,7 @@ func TestDefragmentingIter(t *testing.T) {
 		case "iter":
 			equal := internalEqual
 			reducer := staticReducer
+			var probes []probe
 			for _, cmdArg := range td.CmdArgs {
 				switch cmd := cmdArg.Key; cmd {
 				case "equal":
@@ -73,16 +72,18 @@ func TestDefragmentingIter(t *testing.T) {
 					default:
 						return fmt.Sprintf("unknown reducer %s", val)
 					}
+				case "probes":
+					probes = parseProbes(cmdArg.Vals...)
 				default:
 					return fmt.Sprintf("unknown command: %s", cmd)
 				}
 			}
-			var innerIter MergingIter
-			innerIter.Init(cmp, noopTransform, new(MergingBuffers), NewIter(cmp, spans))
+			innerIter := attachProbes(NewIter(cmp, spans), probeContext{log: &buf}, probes...)
 			var iter DefragmentingIter
-			iter.Init(comparer, &innerIter, equal, reducer, new(DefragmentingBuffers))
+			iter.Init(comparer, innerIter, equal, reducer, new(DefragmentingBuffers))
 			for _, line := range strings.Split(td.Input, "\n") {
 				runIterOp(&buf, &iter, line)
+				fmt.Fprintln(&buf)
 			}
 			return strings.TrimSpace(buf.String())
 		default:
@@ -108,33 +109,33 @@ func testDefragmentingIteRandomizedOnce(t *testing.T, seed int64) {
 	cmp := comparer.Compare
 	formatKey := comparer.FormatKey
 
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(0, uint64(seed)))
 	t.Logf("seed = %d", seed)
 
 	// Use a key space of alphanumeric strings, with a random max length between
 	// 1-2. Repeat keys are more common at the lower max lengths.
-	ks := testkeys.Alpha(rng.Intn(2) + 1)
+	ks := testkeys.Alpha(rng.IntN(2) + 1)
 
 	// Generate between 1-15 range keys.
 	const maxRangeKeys = 15
 	var original, fragmented []Span
-	numRangeKeys := 1 + rng.Intn(maxRangeKeys)
+	numRangeKeys := 1 + rng.IntN(maxRangeKeys)
 	for i := 0; i < numRangeKeys; i++ {
-		startIdx := rng.Intn(ks.Count())
-		endIdx := rng.Intn(ks.Count())
+		startIdx := rng.Int64N(ks.Count())
+		endIdx := rng.Int64N(ks.Count())
 		for startIdx == endIdx {
-			endIdx = rng.Intn(ks.Count())
+			endIdx = rng.Int64N(ks.Count())
 		}
 		if startIdx > endIdx {
 			startIdx, endIdx = endIdx, startIdx
 		}
 
 		key := Key{
-			Trailer: base.MakeTrailer(uint64(i), base.InternalKeyKindRangeKeySet),
-			Value:   []byte(fmt.Sprintf("v%d", rng.Intn(3))),
+			Trailer: base.MakeTrailer(base.SeqNum(i), base.InternalKeyKindRangeKeySet),
+			Value:   []byte(fmt.Sprintf("v%d", rng.IntN(3))),
 		}
 		// Generate suffixes 0, 1, 2, or 3 with 0 indicating none.
-		if suffix := rng.Intn(4); suffix > 0 {
+		if suffix := rng.Int64N(4); suffix > 0 {
 			key.Suffix = testkeys.Suffix(suffix)
 		}
 		original = append(original, Span{
@@ -144,7 +145,7 @@ func testDefragmentingIteRandomizedOnce(t *testing.T, seed int64) {
 		})
 
 		for startIdx < endIdx {
-			width := rng.Intn(endIdx-startIdx) + 1
+			width := rng.Int64N(endIdx-startIdx) + 1
 			fragmented = append(fragmented, Span{
 				Start: testkeys.Key(ks, startIdx),
 				End:   testkeys.Key(ks, startIdx+width),
@@ -159,14 +160,9 @@ func testDefragmentingIteRandomizedOnce(t *testing.T, seed int64) {
 	original = fragment(cmp, formatKey, original)
 	fragmented = fragment(cmp, formatKey, fragmented)
 
-	var originalInner MergingIter
-	originalInner.Init(cmp, noopTransform, new(MergingBuffers), NewIter(cmp, original))
-	var fragmentedInner MergingIter
-	fragmentedInner.Init(cmp, noopTransform, new(MergingBuffers), NewIter(cmp, fragmented))
-
 	var referenceIter, fragmentedIter DefragmentingIter
-	referenceIter.Init(comparer, &originalInner, DefragmentInternal, StaticDefragmentReducer, new(DefragmentingBuffers))
-	fragmentedIter.Init(comparer, &fragmentedInner, DefragmentInternal, StaticDefragmentReducer, new(DefragmentingBuffers))
+	referenceIter.Init(comparer, NewIter(cmp, original), DefragmentInternal, StaticDefragmentReducer, new(DefragmentingBuffers))
+	fragmentedIter.Init(comparer, NewIter(cmp, fragmented), DefragmentInternal, StaticDefragmentReducer, new(DefragmentingBuffers))
 
 	// Generate 100 random operations and run them against both iterators.
 	const numIterOps = 100
@@ -180,11 +176,11 @@ func testDefragmentingIteRandomizedOnce(t *testing.T, seed int64) {
 		{weight: 50, fn: func() string { return "next" }},
 		{weight: 50, fn: func() string { return "prev" }},
 		{weight: 5, fn: func() string {
-			k := testkeys.Key(ks, rng.Intn(ks.Count()))
+			k := testkeys.Key(ks, rng.Int64N(ks.Count()))
 			return fmt.Sprintf("seekge(%s)", k)
 		}},
 		{weight: 5, fn: func() string {
-			k := testkeys.Key(ks, rng.Intn(ks.Count()))
+			k := testkeys.Key(ks, rng.Int64N(ks.Count()))
 			return fmt.Sprintf("seeklt(%s)", k)
 		}},
 	}
@@ -194,7 +190,7 @@ func testDefragmentingIteRandomizedOnce(t *testing.T, seed int64) {
 	}
 	var referenceHistory, fragmentedHistory bytes.Buffer
 	for i := 0; i < numIterOps; i++ {
-		p := rng.Intn(totalWeight)
+		p := rng.IntN(totalWeight)
 		opIndex := 0
 		if i == 0 {
 			// First op is always a First().
@@ -214,11 +210,13 @@ func testDefragmentingIteRandomizedOnce(t *testing.T, seed int64) {
 			t.Fatal(debugContext(cmp, formatKey, original, fragmented,
 				referenceHistory.String(), fragmentedHistory.String()))
 		}
+		fmt.Fprintln(&referenceHistory)
+		fmt.Fprintln(&fragmentedHistory)
 	}
 }
 
 func fragment(cmp base.Compare, formatKey base.FormatKey, spans []Span) []Span {
-	Sort(cmp, spans)
+	SortSpansByStartKey(cmp, spans)
 	var fragments []Span
 	f := Fragmenter{
 		Cmp:    cmp,
@@ -262,33 +260,4 @@ func debugContext(
 	}
 	fmt.Fprintln(&buf, diff)
 	return buf.String()
-}
-
-var iterDelim = map[rune]bool{',': true, ' ': true, '(': true, ')': true, '"': true}
-
-func runIterOp(w io.Writer, it FragmentIterator, op string) {
-	fields := strings.FieldsFunc(op, func(r rune) bool { return iterDelim[r] })
-	var s *Span
-	switch strings.ToLower(fields[0]) {
-	case "first":
-		s = it.First()
-	case "last":
-		s = it.Last()
-	case "seekge":
-		s = it.SeekGE([]byte(fields[1]))
-	case "seeklt":
-		s = it.SeekLT([]byte(fields[1]))
-	case "next":
-		s = it.Next()
-	case "prev":
-		s = it.Prev()
-	default:
-		panic(fmt.Sprintf("unrecognized iter op %q", fields[0]))
-	}
-	fmt.Fprintf(w, "%-10s", op)
-	if s == nil {
-		fmt.Fprintln(w, ".")
-		return
-	}
-	fmt.Fprintln(w, s)
 }

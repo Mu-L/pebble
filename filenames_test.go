@@ -59,6 +59,7 @@ func TestSetCurrentFileCrash(t *testing.T) {
 			FS:                    mem,
 			MaxManifestFileSize:   1,
 			L0CompactionThreshold: 10,
+			Logger:                testLogger{t},
 		})
 		require.NoError(t, err)
 		require.NoError(t, d.Close())
@@ -98,6 +99,10 @@ type noFatalLogger struct {
 }
 
 func (l noFatalLogger) Infof(format string, args ...interface{}) {
+	l.t.Logf(format, args...)
+}
+
+func (l noFatalLogger) Errorf(format string, args ...interface{}) {
 	l.t.Logf(format, args...)
 }
 

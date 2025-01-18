@@ -7,9 +7,13 @@ package manifest
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/pebble/internal/base"
@@ -18,7 +22,7 @@ import (
 )
 
 func levelMetadata(level int, files ...*FileMetadata) LevelMetadata {
-	return makeLevelMetadata(base.DefaultComparer.Compare, level, files)
+	return MakeLevelMetadata(base.DefaultComparer.Compare, level, files)
 }
 
 func ikey(s string) InternalKey {
@@ -78,7 +82,7 @@ func TestIkeyRange(t *testing.T) {
 				f = append(f, m)
 			}
 		}
-		levelMetadata := makeLevelMetadata(base.DefaultComparer.Compare, 0, f)
+		levelMetadata := MakeLevelMetadata(base.DefaultComparer.Compare, 0, f)
 
 		sm, la := KeyRange(base.DefaultComparer.Compare, levelMetadata.Iter())
 		got := string(sm.UserKey) + "-" + string(la.UserKey)
@@ -90,13 +94,11 @@ func TestIkeyRange(t *testing.T) {
 
 func TestOverlaps(t *testing.T) {
 	var v *Version
-	cmp := testkeys.Comparer.Compare
-	fmtKey := testkeys.Comparer.FormatKey
 	datadriven.RunTest(t, "testdata/overlaps", func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "define":
 			var err error
-			v, err = ParseVersionDebug(cmp, fmtKey, 64>>10 /* flush split bytes */, d.Input)
+			v, err = ParseVersionDebug(testkeys.Comparer, 64*1024 /* flush split bytes */, d.Input)
 			if err != nil {
 				return err.Error()
 			}
@@ -109,7 +111,7 @@ func TestOverlaps(t *testing.T) {
 			d.ScanArgs(t, "start", &start)
 			d.ScanArgs(t, "end", &end)
 			d.ScanArgs(t, "exclusive-end", &exclusiveEnd)
-			overlaps := v.Overlaps(level, testkeys.Comparer.Compare, []byte(start), []byte(end), exclusiveEnd)
+			overlaps := v.Overlaps(level, base.UserKeyBoundsEndExclusiveIf([]byte(start), []byte(end), exclusiveEnd))
 			var buf bytes.Buffer
 			fmt.Fprintf(&buf, "%d files:\n", overlaps.Len())
 			overlaps.Each(func(f *FileMetadata) {
@@ -190,25 +192,25 @@ func TestContains(t *testing.T) {
 	m11 := newFileMeta(
 		711,
 		1,
-		base.ParseInternalKey("g.SET.7118"),
+		base.ParseInternalKey("h.SET.7118"),
 		base.ParseInternalKey("j.SET.7119"),
 	)
 	m12 := newFileMeta(
 		712,
 		1,
 		base.ParseInternalKey("n.SET.7128"),
-		base.ParseInternalKey("p.SET.7129"),
+		base.ParseInternalKey("o.SET.7129"),
 	)
 	m13 := newFileMeta(
 		713,
 		1,
-		base.ParseInternalKey("p.SET.7148"),
 		base.ParseInternalKey("p.SET.7149"),
+		base.ParseInternalKey("p.SET.7148"),
 	)
 	m14 := newFileMeta(
 		714,
 		1,
-		base.ParseInternalKey("p.SET.7138"),
+		base.ParseInternalKey("q.SET.7138"),
 		base.ParseInternalKey("u.SET.7139"),
 	)
 
@@ -217,7 +219,9 @@ func TestContains(t *testing.T) {
 			0: levelMetadata(0, m00, m01, m02, m03, m04, m05, m06, m07),
 			1: levelMetadata(1, m10, m11, m12, m13, m14),
 		},
+		cmp: testkeys.Comparer,
 	}
+	require.NoError(t, v.CheckOrdering())
 
 	testCases := []struct {
 		level int
@@ -264,7 +268,7 @@ func TestContains(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		got := v.Contains(tc.level, cmp, tc.file)
+		got := v.Contains(tc.level, tc.file)
 		if got != tc.want {
 			t.Errorf("level=%d, file=%s\ngot %t\nwant %t", tc.level, tc.file, got, tc.want)
 		}
@@ -284,13 +288,11 @@ func TestVersionUnref(t *testing.T) {
 }
 
 func TestCheckOrdering(t *testing.T) {
-	cmp := base.DefaultComparer.Compare
-	fmtKey := base.DefaultComparer.FormatKey
 	datadriven.RunTest(t, "testdata/version_check_ordering",
 		func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "check-ordering":
-				v, err := ParseVersionDebug(cmp, fmtKey, 10<<20, d.Input)
+				v, err := ParseVersionDebug(base.DefaultComparer, 10*1024*1024, d.Input)
 				if err != nil {
 					return err.Error()
 				}
@@ -299,8 +301,9 @@ func TestCheckOrdering(t *testing.T) {
 				v.Levels[0].Slice().Each(func(m *FileMetadata) {
 					m.SmallestSeqNum = m.Smallest.SeqNum()
 					m.LargestSeqNum = m.Largest.SeqNum()
+					m.LargestSeqNumAbsolute = m.LargestSeqNum
 				})
-				if err = v.CheckOrdering(cmp, base.DefaultFormatter); err != nil {
+				if err = v.CheckOrdering(); err != nil {
 					return err.Error()
 				}
 				return "OK"
@@ -407,6 +410,10 @@ func TestFileMetadata_ParseRoundTrip(t *testing.T) {
 			input:  " 000001 : [ a#0,SET - z#0,DEL] points : [ a#0,SET - z#0,DEL] ",
 			output: "000001:[a#0,SET-z#0,DEL] seqnums:[0-0] points:[a#0,SET-z#0,DEL]",
 		},
+		{
+			name:  "virtual",
+			input: "000001(000008):[a#0,SET-z#0,DEL] seqnums:[0-0] points:[a#0,SET-z#0,DEL]",
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -421,5 +428,354 @@ func TestFileMetadata_ParseRoundTrip(t *testing.T) {
 			}
 			require.Equal(t, want, got)
 		})
+	}
+}
+
+func TestCalculateInuseKeyRanges(t *testing.T) {
+	newVersion := func(files [NumLevels][]*FileMetadata) *Version {
+		t.Helper()
+		v := NewVersion(base.DefaultComparer, 64*1024, files)
+		if err := v.CheckOrdering(); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	newFileMeta := func(fileNum base.FileNum, size uint64, smallest, largest base.InternalKey) *FileMetadata {
+		m := &FileMetadata{
+			FileNum: fileNum,
+			Size:    size,
+		}
+		m.ExtendPointKeyBounds(base.DefaultComparer.Compare, smallest, largest)
+		m.InitPhysicalBacking()
+		return m
+	}
+	tests := []struct {
+		name     string
+		v        *Version
+		level    int
+		depth    int
+		smallest []byte
+		largest  []byte
+		want     []base.UserKeyBounds
+	}{
+		{
+			name: "No files in next level",
+			v: newVersion([NumLevels][]*FileMetadata{
+				1: {
+					newFileMeta(
+						1,
+						1,
+						base.ParseInternalKey("a.SET.2"),
+						base.ParseInternalKey("c.SET.2"),
+					),
+					newFileMeta(
+						2,
+						1,
+						base.ParseInternalKey("d.SET.2"),
+						base.ParseInternalKey("e.SET.2"),
+					),
+				},
+			}),
+			level:    1,
+			depth:    2,
+			smallest: []byte("a"),
+			largest:  []byte("e"),
+			want: []base.UserKeyBounds{
+				base.UserKeyBoundsInclusive([]byte("a"), []byte("c")),
+				base.UserKeyBoundsInclusive([]byte("d"), []byte("e")),
+			},
+		},
+		{
+			name: "No overlapping key ranges",
+			v: newVersion([NumLevels][]*FileMetadata{
+				1: {
+					newFileMeta(
+						1,
+						1,
+						base.ParseInternalKey("a.SET.1"),
+						base.ParseInternalKey("c.SET.1"),
+					),
+					newFileMeta(
+						2,
+						1,
+						base.ParseInternalKey("l.SET.1"),
+						base.ParseInternalKey("p.SET.1"),
+					),
+				},
+				2: {
+					newFileMeta(
+						3,
+						1,
+						base.ParseInternalKey("d.SET.1"),
+						base.ParseInternalKey("i.SET.1"),
+					),
+					newFileMeta(
+						4,
+						1,
+						base.ParseInternalKey("s.SET.1"),
+						base.ParseInternalKey("w.SET.1"),
+					),
+				},
+			}),
+			level:    1,
+			depth:    2,
+			smallest: []byte("a"),
+			largest:  []byte("z"),
+			want: []base.UserKeyBounds{
+				base.UserKeyBoundsInclusive([]byte("a"), []byte("c")),
+				base.UserKeyBoundsInclusive([]byte("d"), []byte("i")),
+				base.UserKeyBoundsInclusive([]byte("l"), []byte("p")),
+				base.UserKeyBoundsInclusive([]byte("s"), []byte("w")),
+			},
+		},
+		{
+			name: "First few non-overlapping, followed by overlapping",
+			v: newVersion([NumLevels][]*FileMetadata{
+				1: {
+					newFileMeta(
+						1,
+						1,
+						base.ParseInternalKey("a.SET.1"),
+						base.ParseInternalKey("c.SET.1"),
+					),
+					newFileMeta(
+						2,
+						1,
+						base.ParseInternalKey("d.SET.1"),
+						base.ParseInternalKey("e.SET.1"),
+					),
+					newFileMeta(
+						3,
+						1,
+						base.ParseInternalKey("n.SET.1"),
+						base.ParseInternalKey("o.SET.1"),
+					),
+					newFileMeta(
+						4,
+						1,
+						base.ParseInternalKey("p.SET.1"),
+						base.ParseInternalKey("q.SET.1"),
+					),
+				},
+				2: {
+					newFileMeta(
+						5,
+						1,
+						base.ParseInternalKey("m.SET.1"),
+						base.ParseInternalKey("q.SET.1"),
+					),
+					newFileMeta(
+						6,
+						1,
+						base.ParseInternalKey("s.SET.1"),
+						base.ParseInternalKey("w.SET.1"),
+					),
+				},
+			}),
+			level:    1,
+			depth:    2,
+			smallest: []byte("a"),
+			largest:  []byte("z"),
+			want: []base.UserKeyBounds{
+				base.UserKeyBoundsInclusive([]byte("a"), []byte("c")),
+				base.UserKeyBoundsInclusive([]byte("d"), []byte("e")),
+				base.UserKeyBoundsInclusive([]byte("m"), []byte("q")),
+				base.UserKeyBoundsInclusive([]byte("s"), []byte("w")),
+			},
+		},
+		{
+			name: "All overlapping",
+			v: newVersion([NumLevels][]*FileMetadata{
+				1: {
+					newFileMeta(
+						1,
+						1,
+						base.ParseInternalKey("d.SET.1"),
+						base.ParseInternalKey("e.SET.1"),
+					),
+					newFileMeta(
+						2,
+						1,
+						base.ParseInternalKey("n.SET.1"),
+						base.ParseInternalKey("o.SET.1"),
+					),
+					newFileMeta(
+						3,
+						1,
+						base.ParseInternalKey("p.SET.1"),
+						base.ParseInternalKey("q.SET.1"),
+					),
+				},
+				2: {
+					newFileMeta(
+						4,
+						1,
+						base.ParseInternalKey("a.SET.1"),
+						base.ParseInternalKey("c.SET.1"),
+					),
+					newFileMeta(
+						5,
+						1,
+						base.ParseInternalKey("d.SET.1"),
+						base.ParseInternalKey("w.SET.1"),
+					),
+				},
+			}),
+			level:    1,
+			depth:    2,
+			smallest: []byte("a"),
+			largest:  []byte("z"),
+			want: []base.UserKeyBounds{
+				base.UserKeyBoundsInclusive([]byte("a"), []byte("c")),
+				base.UserKeyBoundsInclusive([]byte("d"), []byte("w")),
+			},
+		},
+		{
+			name: "Touching ranges",
+			v: newVersion([NumLevels][]*FileMetadata{
+				1: {
+					newFileMeta(
+						1,
+						1,
+						base.ParseInternalKey("a.SET.1"),
+						base.ParseInternalKey("b.RANGEDEL.inf"),
+					),
+				},
+				2: {
+					newFileMeta(
+						4,
+						1,
+						base.ParseInternalKey("b.SET.1"),
+						base.ParseInternalKey("c.SET.1"),
+					),
+				},
+			}),
+			level:    1,
+			depth:    2,
+			smallest: []byte("a"),
+			largest:  []byte("z"),
+			want: []base.UserKeyBounds{
+				base.UserKeyBoundsInclusive([]byte("a"), []byte("c")),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.v.CalculateInuseKeyRanges(tt.level, tt.depth, tt.smallest, tt.largest); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("CalculateInuseKeyRanges() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCalculateInuseKeyRangesRandomized(t *testing.T) {
+	var (
+		fileNum     = base.FileNum(0)
+		seed        = uint64(time.Now().UnixNano())
+		rng         = rand.New(rand.NewPCG(0, seed))
+		endKeyspace = 26 * 26
+		cmp         = base.DefaultComparer.Compare
+	)
+	t.Logf("Using rng seed %d.", seed)
+
+	for iter := 0; iter < 100; iter++ {
+		makeUserKey := func(i int) []byte {
+			if i >= endKeyspace {
+				i = endKeyspace - 1
+			}
+			return []byte{byte(i/26 + 'a'), byte(i%26 + 'a')}
+		}
+		makeIK := func(level, i int) InternalKey {
+			seqNum := base.SeqNum(NumLevels-level) * 100
+			if level == 0 {
+				seqNum += base.SeqNum(i)
+			}
+			return base.MakeInternalKey(
+				makeUserKey(i),
+				seqNum,
+				base.InternalKeyKindSet,
+			)
+		}
+		makeFile := func(level, start, end int) *FileMetadata {
+			fileNum++
+			m := &FileMetadata{FileNum: fileNum}
+			m.ExtendPointKeyBounds(
+				cmp,
+				makeIK(level, start),
+				makeIK(level, end),
+			)
+			m.SmallestSeqNum = m.Smallest.SeqNum()
+			m.LargestSeqNum = m.Largest.SeqNum()
+			m.LargestSeqNumAbsolute = m.LargestSeqNum
+			m.InitPhysicalBacking()
+			return m
+		}
+		overlaps := func(startA, endA, startB, endB []byte) bool {
+			disjoint := cmp(endB, startA) < 0 || cmp(endA, startB) < 0
+			return !disjoint
+		}
+		var files [NumLevels][]*FileMetadata
+		for l := 0; l < NumLevels; l++ {
+			for i := 0; i < rand.IntN(10); i++ {
+				s := rng.IntN(endKeyspace)
+				maxWidth := rng.IntN(endKeyspace-s) + 1
+				e := rng.IntN(maxWidth) + s
+				sKey, eKey := makeUserKey(s), makeUserKey(e)
+				// Discard the key range if it overlaps any existing files
+				// within this level.
+				var o bool
+				for _, f := range files[l] {
+					o = o || overlaps(sKey, eKey, f.Smallest.UserKey, f.Largest.UserKey)
+				}
+				if o {
+					continue
+				}
+				files[l] = append(files[l], makeFile(l, s, e))
+			}
+			slices.SortFunc(files[l], func(a, b *FileMetadata) int {
+				return cmp(a.Smallest.UserKey, b.Smallest.UserKey)
+			})
+		}
+		v := NewVersion(base.DefaultComparer, 64*1024, files)
+		if err := v.CheckOrdering(); err != nil {
+			t.Fatal(err)
+		}
+		t.Log(v.DebugString())
+		for i := 0; i < 1000; i++ {
+			l := rng.IntN(NumLevels)
+			s := rng.IntN(endKeyspace)
+			maxWidth := rng.IntN(endKeyspace-s) + 1
+			e := rng.IntN(maxWidth) + s
+			sKey, eKey := makeUserKey(s), makeUserKey(e)
+			keyRanges := v.CalculateInuseKeyRanges(l, NumLevels-1, sKey, eKey)
+
+			for level := l; level < NumLevels; level++ {
+				for _, f := range files[level] {
+					if !overlaps(sKey, eKey, f.Smallest.UserKey, f.Largest.UserKey) {
+						// This file doesn't overlap the queried range. Skip it.
+						continue
+					}
+					// This file does overlap the queried range. The key range
+					// [MAX(f.Smallest, sKey), MIN(f.Largest, eKey)] must be fully
+					// contained by a key range in keyRanges.
+					checkStart, checkEnd := f.Smallest.UserKey, f.Largest.UserKey
+					if cmp(checkStart, sKey) < 0 {
+						checkStart = sKey
+					}
+					if cmp(checkEnd, eKey) > 0 {
+						checkEnd = eKey
+					}
+					var contained bool
+					for _, kr := range keyRanges {
+						contained = contained ||
+							(cmp(checkStart, kr.Start) >= 0 && cmp(checkEnd, kr.End.Key) <= 0)
+					}
+					if !contained {
+						t.Errorf("Seed %d, iter %d: File %s overlaps %q-%q, but is not fully contained in any of the key ranges.",
+							seed, iter, f, sKey, eKey)
+					}
+				}
+			}
+		}
 	}
 }

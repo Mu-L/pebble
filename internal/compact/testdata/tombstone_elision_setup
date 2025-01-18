@@ -1,0 +1,419 @@
+define
+L1
+  1:[a#1,SET-b#1,SET]
+  2:[d#1,SET-e#inf,RANGEDEL]
+  3:[e#1,SET-f#1,SET]
+----
+L1:
+  000001:[a#1,SET-b#1,SET]
+  000002:[d#1,SET-e#inf,RANGEDEL]
+  000003:[e#1,SET-f#1,SET]
+
+# Each test case indicates the compaction output level and bounds; we want the
+# in-use key ranges to reflect the levels *below* the output level (except for
+# L0 where we want to reflect all levels including L0).
+inuse-key-ranges
+L0 a b
+L0 c d
+L0 g h
+L1 a b
+----
+L0 [a, b]: elide nothing
+L0 [c, d]: [d, e)
+L0 [g, h]: elide everything
+L1 [a, b]: elide everything
+
+define
+L1
+  1:[a#1,SET-b#1,SET]
+L2
+  2:[b#1,SET-c#2,SET]
+----
+L1:
+  000001:[a#1,SET-b#1,SET]
+L2:
+  000002:[b#1,SET-c#2,SET]
+
+inuse-key-ranges
+L0 a c
+L1 a aa
+L1 a b
+L2 a z
+----
+L0 [a, c]: elide nothing
+L1 [a, aa]: elide everything
+L1 [a, b]: [b, c]
+L2 [a, z]: elide everything
+
+define
+L1
+  1:[a#1,SET-b#1,SET]
+L2
+  2:[c#1,SET-d#2,SET]
+----
+L1:
+  000001:[a#1,SET-b#1,SET]
+L2:
+  000002:[c#1,SET-d#2,SET]
+
+inuse-key-ranges
+L0 a c
+L0 a b
+----
+L0 [a, c]: [a, b] [c, d]
+L0 [a, b]: elide nothing
+
+define
+L1
+  1:[b#1,SET-c#1,SET]
+L2
+  2:[a#1,SET-b#2,SET]
+----
+L1:
+  000001:[b#1,SET-c#1,SET]
+L2:
+  000002:[a#1,SET-b#2,SET]
+
+inuse-key-ranges
+L0 a c
+----
+L0 [a, c]: elide nothing
+
+define
+L1
+  1:[c#1,SET-d#1,SET]
+L2
+  2:[a#1,SET-b#2,SET]
+----
+L1:
+  000001:[c#1,SET-d#1,SET]
+L2:
+  000002:[a#1,SET-b#2,SET]
+
+inuse-key-ranges
+L0 a c
+----
+L0 [a, c]: [a, b] [c, d]
+
+define
+L1
+  1:[a#1,SET-b#inf,RANGEDEL]
+  1:[c#1,SET-d#inf,RANGEDEL]
+  1:[f#1,SET-g#inf,RANGEDEL]
+  1:[i#1,SET-j#inf,RANGEDEL]
+----
+L1:
+  000001:[a#1,SET-b#inf,RANGEDEL]
+  000001:[c#1,SET-d#inf,RANGEDEL]
+  000001:[f#1,SET-g#inf,RANGEDEL]
+  000001:[i#1,SET-j#inf,RANGEDEL]
+
+inuse-key-ranges
+L0 a z
+L0 a c
+L0 g z
+----
+L0 [a, z]: [a, b) [c, d) [f, g) [i, j)
+L0 [a, c]: [a, b) [c, d)
+L0 [g, z]: [i, j)
+
+define
+L1
+  1:[a#1,SET-b#inf,RANGEDEL]
+  1:[c#1,SET-d#inf,RANGEDEL]
+  1:[f#1,SET-g#inf,RANGEDEL]
+  1:[i#1,SET-j#inf,RANGEDEL]
+L6
+  1:[a#0,SET-i#inf,RANGEDEL]
+  1:[k#0,SET-z#inf,RANGEDEL]
+----
+L1:
+  000001:[a#1,SET-b#inf,RANGEDEL]
+  000001:[c#1,SET-d#inf,RANGEDEL]
+  000001:[f#1,SET-g#inf,RANGEDEL]
+  000001:[i#1,SET-j#inf,RANGEDEL]
+L6:
+  000001:[a#0,SET-i#inf,RANGEDEL]
+  000001:[k#0,SET-z#inf,RANGEDEL]
+
+inuse-key-ranges
+L0 a z
+----
+L0 [a, z]: [a, j) [k, z)
+
+define
+L0
+  1:[a#1,SET-b#inf,RANGEDEL]
+  1:[c#1,SET-d#inf,RANGEDEL]
+  1:[f#1,SET-g#inf,RANGEDEL]
+  1:[i#1,SET-j#inf,RANGEDEL]
+L6
+  1:[a#0,SET-i#inf,RANGEDEL]
+  1:[k#0,SET-z#inf,RANGEDEL]
+----
+L0.0:
+  000001:[a#1,SET-b#inf,RANGEDEL]
+  000001:[c#1,SET-d#inf,RANGEDEL]
+  000001:[f#1,SET-g#inf,RANGEDEL]
+  000001:[i#1,SET-j#inf,RANGEDEL]
+L6:
+  000001:[a#0,SET-i#inf,RANGEDEL]
+  000001:[k#0,SET-z#inf,RANGEDEL]
+
+# L0 compaction should reflect the ranges in L0 as well.
+inuse-key-ranges
+L0 a z
+----
+L0 [a, z]: [a, j) [k, z)
+
+define
+L0
+  1:[aa#7,SET-ab#inf,RANGEDEL] seqnums:[7-7]
+  2:[bb#6,SET-dd#inf,RANGEDEL] seqnums:[6-6]
+  3:[a#5,SET-b#inf,RANGEDEL] seqnums:[5-5]
+  4:[b#4,SET-d#inf,RANGEDEL] seqnums:[4-4]
+  5:[c#3,SET-d#inf,RANGEDEL] seqnums:[3-3]
+  6:[e#2,SET-m#inf,RANGEDEL] seqnums:[2-2]
+  7:[g#1,SET-p#inf,RANGEDEL] seqnums:[1-1]
+----
+L0.2:
+  000002:[bb#6,SET-dd#inf,RANGEDEL]
+L0.1:
+  000001:[aa#7,SET-ab#inf,RANGEDEL]
+  000004:[b#4,SET-d#inf,RANGEDEL]
+  000006:[e#2,SET-m#inf,RANGEDEL]
+L0.0:
+  000003:[a#5,SET-b#inf,RANGEDEL]
+  000005:[c#3,SET-d#inf,RANGEDEL]
+  000007:[g#1,SET-p#inf,RANGEDEL]
+
+inuse-key-ranges
+L0 a z
+L0 e p
+L0 e f
+L0 b c
+L0 q r
+L0 1 2
+L0 ddd dddd
+----
+L0 [a, z]: [a, dd) [e, p)
+L0 [e, p]: [e, p)
+L0 [e, f]: elide nothing
+L0 [b, c]: elide nothing
+L0 [q, r]: elide everything
+L0 [1, 2]: elide everything
+L0 [ddd, dddd]: elide everything
+
+define
+L1
+  1:[a#6,SET-b#inf,RANGEDEL]
+  2:[d#6,SET-g#inf,RANGEDEL]
+L2
+  3:[c#5,SET-d#inf,RANGEDEL]
+  4:[i#5,SET-j#inf,RANGEDEL]
+L3
+  5:[b#1,SET-c#inf,RANGEDEL]
+L4
+  6:[f#1,SET-k#inf,RANGEDEL]
+L6
+  7:[m#1,SET-z#inf,RANGEDEL]
+----
+L1:
+  000001:[a#6,SET-b#inf,RANGEDEL]
+  000002:[d#6,SET-g#inf,RANGEDEL]
+L2:
+  000003:[c#5,SET-d#inf,RANGEDEL]
+  000004:[i#5,SET-j#inf,RANGEDEL]
+L3:
+  000005:[b#1,SET-c#inf,RANGEDEL]
+L4:
+  000006:[f#1,SET-k#inf,RANGEDEL]
+L6:
+  000007:[m#1,SET-z#inf,RANGEDEL]
+
+inuse-key-ranges
+L5 a z
+L5 a b
+L5 m z
+L5 m zz
+L5 mm zz
+L5 l x
+L5 l zz
+----
+L5 [a, z]: [m, z)
+L5 [a, b]: elide everything
+L5 [m, z]: [m, z)
+L5 [m, zz]: [m, z)
+L5 [mm, zz]: [m, z)
+L5 [l, x]: [m, z)
+L5 [l, zz]: [m, z)
+
+inuse-key-ranges
+L3 a z
+L3 f k
+L3 k m
+L3 l ll
+L3 b n
+----
+L3 [a, z]: [f, k) [m, z)
+L3 [f, k]: [f, k)
+L3 [k, m]: [m, z)
+L3 [l, ll]: elide everything
+L3 [b, n]: [f, k) [m, z)
+
+inuse-key-ranges
+L2 a z
+----
+L2 [a, z]: [b, c) [f, k) [m, z)
+
+inuse-key-ranges
+L1 a z
+----
+L1 [a, z]: [b, d) [f, k) [m, z)
+
+inuse-key-ranges
+L0 a z
+L0 a k
+L0 a b
+L0 bb bc
+L0 f k
+----
+L0 [a, z]: [a, k) [m, z)
+L0 [a, k]: [a, k)
+L0 [a, b]: elide nothing
+L0 [bb, bc]: elide nothing
+L0 [f, k]: [d, k)
+
+define
+L1
+  1:[m#6,SET-p#inf,RANGEDEL]
+L2
+  2:[j#5,SET-n#inf,RANGEDEL]
+  3:[o#5,SET-t#inf,RANGEDEL]
+L3
+  4:[a#2,SET-k#inf,RANGEDEL]
+  5:[s#2,SET-x#inf,RANGEDEL]
+L4
+  6:[a#1,SET-f#inf,RANGEDEL]
+  7:[w#1,SET-z#inf,RANGEDEL]
+----
+L1:
+  000001:[m#6,SET-p#inf,RANGEDEL]
+L2:
+  000002:[j#5,SET-n#inf,RANGEDEL]
+  000003:[o#5,SET-t#inf,RANGEDEL]
+L3:
+  000004:[a#2,SET-k#inf,RANGEDEL]
+  000005:[s#2,SET-x#inf,RANGEDEL]
+L4:
+  000006:[a#1,SET-f#inf,RANGEDEL]
+  000007:[w#1,SET-z#inf,RANGEDEL]
+
+inuse-key-ranges
+L3 a z
+L2 a z
+L1 a z
+L0 a z
+L0 a n
+L0 a mm
+L0 a nn
+L0 p z
+L0 pp z
+L0 oo z
+----
+L3 [a, z]: [a, f) [w, z)
+L2 [a, z]: [a, k) [s, z)
+L1 [a, z]: [a, n) [o, z)
+L0 [a, z]: [a, z)
+L0 [a, n]: elide nothing
+L0 [a, mm]: elide nothing
+L0 [a, nn]: elide nothing
+L0 [p, z]: [o, z)
+L0 [pp, z]: [o, z)
+L0 [oo, z]: [m, z)
+
+define
+L1
+  1:[a#6,SET-c#inf,RANGEDEL]
+L2
+  2:[b#5,SET-ba#inf,RANGEDEL]
+  3:[bb#5,SET-bba#inf,RANGEDEL]
+  4:[cc#5,SET-cca#inf,RANGEDEL]
+----
+L1:
+  000001:[a#6,SET-c#inf,RANGEDEL]
+L2:
+  000002:[b#5,SET-ba#inf,RANGEDEL]
+  000003:[bb#5,SET-bba#inf,RANGEDEL]
+  000004:[cc#5,SET-cca#inf,RANGEDEL]
+
+inuse-key-ranges
+L0 a c
+L0 a cc
+----
+L0 [a, c]: [a, c)
+L0 [a, cc]: [a, c) [cc, cca)
+
+define
+L1
+  1:[a#6,SET-c#inf,RANGEDEL]
+L2
+  2:[b#5,SET-ba#inf,RANGEDEL]
+  3:[bb#5,SET-bba#inf,RANGEDEL]
+  4:[bc#5,SET-c#inf,RANGEDEL]
+  5:[c#5,SET-ca#inf,RANGEDEL]
+  6:[ca#5,SET-d#inf,RANGEDEL]
+----
+L1:
+  000001:[a#6,SET-c#inf,RANGEDEL]
+L2:
+  000002:[b#5,SET-ba#inf,RANGEDEL]
+  000003:[bb#5,SET-bba#inf,RANGEDEL]
+  000004:[bc#5,SET-c#inf,RANGEDEL]
+  000005:[c#5,SET-ca#inf,RANGEDEL]
+  000006:[ca#5,SET-d#inf,RANGEDEL]
+
+inuse-key-ranges
+L0 a c
+L0 a cc
+L0 a d
+L0 c c
+----
+L0 [a, c]: elide nothing
+L0 [a, cc]: elide nothing
+L0 [a, d]: [a, d)
+L0 [c, c]: elide nothing
+
+define
+L0
+  1:[d#7,SET-i#inf,RANGEDEL]
+L1
+  2:[a#6,SET-aa#inf,RANGEDEL]
+  3:[d#6,SET-da#inf,RANGEDEL]
+  4:[h#6,SET-i#inf,RANGEDEL]
+L2
+  5:[b#5,SET-ba#inf,RANGEDEL]
+  6:[c#5,SET-ca#inf,RANGEDEL]
+  7:[e#5,SET-ea#inf,RANGEDEL]
+L3
+  8:[bb#5,SET-bba#inf,RANGEDEL]
+----
+L0.0:
+  000001:[d#7,SET-i#inf,RANGEDEL]
+L1:
+  000002:[a#6,SET-aa#inf,RANGEDEL]
+  000003:[d#6,SET-da#inf,RANGEDEL]
+  000004:[h#6,SET-i#inf,RANGEDEL]
+L2:
+  000005:[b#5,SET-ba#inf,RANGEDEL]
+  000006:[c#5,SET-ca#inf,RANGEDEL]
+  000007:[e#5,SET-ea#inf,RANGEDEL]
+L3:
+  000008:[bb#5,SET-bba#inf,RANGEDEL]
+
+inuse-key-ranges
+L0 a z
+L1 a z
+----
+L0 [a, z]: [a, aa) [b, ba) [bb, bba) [c, ca) [d, i)
+L1 [a, z]: [b, ba) [bb, bba) [c, ca) [e, ea)

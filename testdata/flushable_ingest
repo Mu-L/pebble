@@ -56,12 +56,11 @@ ls
 000006.sst
 000007.log
 000008.log
-CURRENT
 LOCK
 MANIFEST-000001
 OPTIONS-000003
 ext
-marker.format-version.000015.016
+marker.format-version.000006.019
 marker.manifest.000001.MANIFEST-000001
 
 # Test basic WAL replay
@@ -78,12 +77,11 @@ ls
 000006.sst
 000007.log
 000008.log
-CURRENT
 LOCK
 MANIFEST-000001
 OPTIONS-000003
 ext
-marker.format-version.000015.016
+marker.format-version.000006.019
 marker.manifest.000001.MANIFEST-000001
 
 open
@@ -92,10 +90,11 @@ open
 # Make sure that the sstables got flushed in the correct order on a WAL replay.
 lsm
 ----
-0.1:
+L0.1:
   000004:[a#11,SET-a#11,SET]
-0.0:
-  000009:[a#10,SET-a#10,SET]
+L0.0:
+  000010:[a#10,SET-a#10,SET]
+L6:
   000005:[b#12,SET-b#12,SET]
   000006:[d#13,SET-d#13,SET]
 
@@ -134,11 +133,11 @@ ingest ext1 ext2 ext3
 
 lsm
 ----
-0.1:
+L0.1:
   000004:[a#11,SET-a#11,SET]
-0.0:
+L0.0:
   000009:[a#10,SET-a#10,SET]
-6:
+L6:
   000005:[b#12,SET-b#12,SET]
   000006:[d#13,SET-d#13,SET]
 
@@ -209,11 +208,11 @@ flush
 
 lsm
 ----
-0.2:
+L0.2:
   000007:[a#13,SET-a#13,SET]
-0.1:
+L0.1:
   000004:[a#11,SET-a#11,SET]
-0.0:
+L0.0:
   000010:[a#10,SET-a#10,SET]
   000011:[b#12,SET-b#12,SET]
 
@@ -248,7 +247,7 @@ ingest ext1 ext2
 
 lsm
 ----
-6:
+L6:
   000004:[b#11,SET-b#11,SET]
   000005:[d#12,SET-d#12,SET]
 
@@ -278,11 +277,11 @@ ingest ext1 ext2 ext3
 
 lsm
 ----
-0.1:
+L0.1:
   000004:[a#11,SET-a#11,SET]
-0.0:
+L0.0:
   000009:[a#10,SET-a#10,SET]
-6:
+L6:
   000005:[b#12,SET-b#12,SET]
   000006:[d#13,SET-d#13,SET]
 
@@ -307,16 +306,16 @@ ingest ext4 ext5
 # yet.
 lsm
 ----
-0.3:
+L0.3:
   000010:[a#15,SET-a#15,SET]
-0.2:
+L0.2:
   000014:[a#14,SET-a#14,SET]
-0.1:
+L0.1:
   000004:[a#11,SET-a#11,SET]
-0.0:
+L0.0:
   000009:[a#10,SET-a#10,SET]
   000011:[b#16,SET-b#16,SET]
-6:
+L6:
   000005:[b#12,SET-b#12,SET]
   000006:[d#13,SET-d#13,SET]
 
@@ -387,12 +386,11 @@ ls
 000006.sst
 000007.log
 000008.log
-CURRENT
 LOCK
 MANIFEST-000001
 OPTIONS-000003
 ext
-marker.format-version.000015.016
+marker.format-version.000006.019
 marker.manifest.000001.MANIFEST-000001
 
 close
@@ -408,12 +406,11 @@ ls
 000006.sst
 000007.log
 000008.log
-CURRENT
 LOCK
 MANIFEST-000001
 OPTIONS-000003
 ext
-marker.format-version.000015.016
+marker.format-version.000006.019
 marker.manifest.000001.MANIFEST-000001
 
 open
@@ -422,13 +419,14 @@ open
 # Make sure that the sstables got flushed in the correct order on a WAL replay.
 lsm
 ----
-0.1:
+L0.1:
   000004:[a#11,SET-a#11,SET]
-0.0:
-  000009:[a#10,SET-a#10,SET]
+L0.0:
+  000010:[a#10,SET-a#10,SET]
+  000012:[f#14,SET-f#14,SET]
+L6:
   000005:[b#12,SET-b#12,SET]
   000006:[d#13,SET-d#13,SET]
-  000010:[f#14,SET-f#14,SET]
 
 # Check if the new mutable memtable is using a new log file, and that the
 # previous log files have been deleted appropriately after the flush.
@@ -437,17 +435,16 @@ ls
 000004.sst
 000005.sst
 000006.sst
-000009.sst
 000010.sst
-000011.log
-CURRENT
+000012.sst
+000013.log
 LOCK
 MANIFEST-000001
-MANIFEST-000012
-OPTIONS-000013
+MANIFEST-000011
+OPTIONS-000014
 ext
-marker.format-version.000015.016
-marker.manifest.000002.MANIFEST-000012
+marker.format-version.000006.019
+marker.manifest.000002.MANIFEST-000011
 
 # Make sure that the new mutable memtable can accept writes.
 batch
@@ -556,7 +553,7 @@ b
 a:2
 b:2
 
-ignoreSyncs true
+crash-clone
 ----
 
 lsm
@@ -573,9 +570,9 @@ flush
 # expected.
 lsm
 ----
-0.1:
+L0.1:
   000004:[a#12,SET-b#12,SET]
-0.0:
+L0.0:
   000007:[a#10,SET-b#11,SET]
 
 ls
@@ -585,12 +582,11 @@ ls
 000005.log
 000006.log
 000007.sst
-CURRENT
 LOCK
 MANIFEST-000001
 OPTIONS-000003
 ext
-marker.format-version.000015.016
+marker.format-version.000006.019
 marker.manifest.000001.MANIFEST-000001
 
 close
@@ -598,30 +594,93 @@ close
 
 # At this point, the changes to the manifest should be lost. Note that 7.sst
 # is gone because that file was never synced.
-resetToSynced
+reset-to-crash-clone
 ----
 000002.log
 000004.sst
 000005.log
 000006.log
-CURRENT
 LOCK
 MANIFEST-000001
 OPTIONS-000003
 ext
 ext1
-marker.format-version.000015.016
+marker.format-version.000006.019
 marker.manifest.000001.MANIFEST-000001
-
-ignoreSyncs false
-----
 
 open
 ----
 
 lsm
 ----
-0.1:
+L0.1:
   000004:[a#12,SET-b#12,SET]
-0.0:
+L0.0:
   000007:[a#10,SET-b#11,SET]
+
+close
+----
+
+reset
+----
+
+build small
+set-multiple 10 small
+----
+
+build large
+set-multiple 100000 large
+----
+
+batch
+set small-00001 before-ingest
+set large-00001 before-ingest
+----
+
+blockFlush
+----
+
+ingest small large
+----
+
+allowFlush
+----
+
+# When looking inside the small table, we will read the index block, then we
+# should read the bloom filter, followed by a data block read.
+get with-fs-logging
+small-00001
+----
+read-at(158, 41): 000004.sst
+read-at(199, 74): 000004.sst
+read-at(0, 158): 000004.sst
+small-00001:val-00001
+
+# When the key doesn't pass the bloom filter, we should see only two block
+# reads.
+get with-fs-logging
+small-00001-does-not-exist
+----
+read-at(158, 41): 000004.sst
+read-at(199, 74): 000004.sst
+small-00001-does-not-exist: pebble: not found
+
+# When looking inside the large table, we will not read the bloom filter which
+# is large. We read the top-level index block, a second-level index block, and a
+# data block.
+get with-fs-logging
+large-00001
+----
+read-at(1165164, 65): 000005.sst
+read-at(1159763, 3000): 000005.sst
+read-at(0, 3069): 000005.sst
+large-00001:val-00001
+
+# Same number of block reads for a key that doesn't exist.
+get with-fs-logging
+large-00001-does-not-exist
+----
+read-at(1165164, 65): 000005.sst
+read-at(1159763, 3000): 000005.sst
+read-at(0, 3069): 000005.sst
+large-00001-does-not-exist: pebble: not found

@@ -11,25 +11,43 @@ import (
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/colblk"
+	"github.com/cockroachdb/pebble/sstable/rowblk"
 )
+
+// dataBlockIterator extends the block.IndexBlockIterator interface with a
+// constraint that the implementing type be a pointer to a type I.
+//
+// DataBlockIterator requires that the type be a pointer to its type parameter,
+// D, to allow sstable iterators embed the block iterator within its struct. See
+// this example from the Go generics proposal:
+// https://go.googlesource.com/proposal/+/refs/heads/master/design/43651-type-parameters.md#pointer-method-example
+type dataBlockIterator[D any] interface {
+	block.DataBlockIterator
+
+	*D // non-interface type constraint element
+}
+
+// indexBlockIterator extends the block.IndexBlockIterator interface with a
+// constraint that the implementing type be a pointer to a type I.
+//
+// indexBlockIterator requires that the type be a pointer to its type parameter,
+// I, to allow sstable iterators embed the block iterator within its struct. See
+// this example from the Go generics proposal:
+// https://go.googlesource.com/proposal/+/refs/heads/master/design/43651-type-parameters.md#pointer-method-example
+type indexBlockIterator[I any] interface {
+	block.IndexBlockIterator
+
+	*I // non-interface type constraint element
+}
 
 // Iterator iterates over an entire table of data.
 type Iterator interface {
 	base.InternalIterator
 
 	// NextPrefix implements (base.InternalIterator).NextPrefix.
-	NextPrefix(succKey []byte) (*InternalKey, base.LazyValue)
-
-	// MaybeFilteredKeys may be called when an iterator is exhausted to indicate
-	// whether or not the last positioning method may have skipped any keys due
-	// to block-property filters. This is used by the Pebble levelIter to
-	// control when an iterator steps to the next sstable.
-	//
-	// MaybeFilteredKeys may always return false positives, that is it may
-	// return true when no keys were filtered. It should only be called when the
-	// iterator is exhausted. It must never return false negatives when the
-	// iterator is exhausted.
-	MaybeFilteredKeys() bool
+	NextPrefix(succKey []byte) *base.InternalKV
 
 	SetCloseHook(fn func(i Iterator) error)
 }
@@ -61,10 +79,10 @@ type Iterator interface {
 // The data-exhausted property is tracked in a more subtle manner. We define
 // two predicates:
 // - partial-local-data-exhausted (PLDE):
-//   i.data.isDataInvalidated() || !i.data.valid()
+//   i.data.IsDataInvalidated() || !i.data.Valid()
 // - partial-global-data-exhausted (PGDE):
-//   i.index.isDataInvalidated() || !i.index.valid() || i.data.isDataInvalidated() ||
-//   !i.data.valid()
+//   i.index.IsDataInvalidated() || !i.index.Valid() || i.data.IsDataInvalidated() ||
+//   !i.data.Valid()
 //
 // PLDE is defined for a singleLevelIterator. PGDE is defined for a
 // twoLevelIterator. Oddly, in our code below the singleLevelIterator does not
@@ -105,13 +123,13 @@ type Iterator interface {
 //   state.
 //
 // Implementation detail: In the code PLDE only checks that
-// i.data.isDataInvalidated(). This narrower check is safe, since this is a
+// i.data.IsDataInvalidated(). This narrower check is safe, since this is a
 // subset of the set expressed by the OR expression. Also, it is not a
 // de-optimization since whenever we exhaust the iterator we explicitly call
-// i.data.invalidate(). PGDE checks i.index.isDataInvalidated() &&
-// i.data.isDataInvalidated(). Again, this narrower check is safe, and not a
+// i.data.Invalidate(). PGDE checks i.index.IsDataInvalidated() &&
+// i.data.IsDataInvalidated(). Again, this narrower check is safe, and not a
 // de-optimization since whenever we exhaust the iterator we explicitly call
-// i.index.invalidate() and i.data.invalidate(). The && is questionable -- for
+// i.index.Invalidate() and i.data.Invalidate(). The && is questionable -- for
 // now this is a bit of defensive code. We should seriously consider removing
 // it, since defensive code suggests we are not confident about our invariants
 // (and if we are not confident, we need more invariant assertions, not
@@ -119,173 +137,87 @@ type Iterator interface {
 //
 // TODO(sumeer): remove the aforementioned defensive code.
 
-var singleLevelIterPool = sync.Pool{
-	New: func() interface{} {
-		i := &singleLevelIterator{}
-		// Note: this is a no-op if invariants are disabled or race is enabled.
-		invariants.SetFinalizer(i, checkSingleLevelIterator)
-		return i
-	},
-}
+type (
+	singleLevelIteratorRowBlocks    = singleLevelIterator[rowblk.IndexIter, *rowblk.IndexIter, rowblk.Iter, *rowblk.Iter]
+	twoLevelIteratorRowBlocks       = twoLevelIterator[rowblk.IndexIter, *rowblk.IndexIter, rowblk.Iter, *rowblk.Iter]
+	singleLevelIteratorColumnBlocks = singleLevelIterator[colblk.IndexIter, *colblk.IndexIter, colblk.DataBlockIter, *colblk.DataBlockIter]
+	twoLevelIteratorColumnBlocks    = twoLevelIterator[colblk.IndexIter, *colblk.IndexIter, colblk.DataBlockIter, *colblk.DataBlockIter]
+)
 
-var twoLevelIterPool = sync.Pool{
-	New: func() interface{} {
-		i := &twoLevelIterator{}
-		// Note: this is a no-op if invariants are disabled or race is enabled.
-		invariants.SetFinalizer(i, checkTwoLevelIterator)
-		return i
-	},
-}
+var (
+	singleLevelIterRowBlockPool    sync.Pool // *singleLevelIteratorRowBlocks
+	twoLevelIterRowBlockPool       sync.Pool // *twoLevelIteratorRowBlocks
+	singleLevelIterColumnBlockPool sync.Pool // *singleLevelIteratorColumnBlocks
+	twoLevelIterColumnBlockPool    sync.Pool // *singleLevelIteratorColumnBlocks
+)
 
-// TODO(jackson): rangedel fragmentBlockIters can't be pooled because of some
-// code paths that double Close the iters. Fix the double close and pool the
-// *fragmentBlockIter type directly.
-
-var rangeKeyFragmentBlockIterPool = sync.Pool{
-	New: func() interface{} {
-		i := &rangeKeyFragmentBlockIter{}
-		// Note: this is a no-op if invariants are disabled or race is enabled.
-		invariants.SetFinalizer(i, checkRangeKeyFragmentBlockIterator)
-		return i
-	},
-}
-
-func checkSingleLevelIterator(obj interface{}) {
-	i := obj.(*singleLevelIterator)
-	if p := i.data.handle.Get(); p != nil {
-		fmt.Fprintf(os.Stderr, "singleLevelIterator.data.handle is not nil: %p\n", p)
-		os.Exit(1)
-	}
-	if p := i.index.handle.Get(); p != nil {
-		fmt.Fprintf(os.Stderr, "singleLevelIterator.index.handle is not nil: %p\n", p)
-		os.Exit(1)
-	}
-}
-
-func checkTwoLevelIterator(obj interface{}) {
-	i := obj.(*twoLevelIterator)
-	if p := i.data.handle.Get(); p != nil {
-		fmt.Fprintf(os.Stderr, "singleLevelIterator.data.handle is not nil: %p\n", p)
-		os.Exit(1)
-	}
-	if p := i.index.handle.Get(); p != nil {
-		fmt.Fprintf(os.Stderr, "singleLevelIterator.index.handle is not nil: %p\n", p)
-		os.Exit(1)
-	}
-}
-
-func checkRangeKeyFragmentBlockIterator(obj interface{}) {
-	i := obj.(*rangeKeyFragmentBlockIter)
-	if p := i.blockIter.handle.Get(); p != nil {
-		fmt.Fprintf(os.Stderr, "fragmentBlockIter.blockIter.handle is not nil: %p\n", p)
-		os.Exit(1)
-	}
-}
-
-// compactionIterator is similar to Iterator but it increments the number of
-// bytes that have been iterated through.
-type compactionIterator struct {
-	*singleLevelIterator
-	bytesIterated *uint64
-	prevOffset    uint64
-}
-
-// compactionIterator implements the base.InternalIterator interface.
-var _ base.InternalIterator = (*compactionIterator)(nil)
-
-func (i *compactionIterator) String() string {
-	if i.vState != nil {
-		return i.vState.fileNum.String()
-	}
-	return i.reader.fileNum.String()
-}
-
-func (i *compactionIterator) SeekGE(
-	key []byte, flags base.SeekGEFlags,
-) (*InternalKey, base.LazyValue) {
-	panic("pebble: SeekGE unimplemented")
-}
-
-func (i *compactionIterator) SeekPrefixGE(
-	prefix, key []byte, flags base.SeekGEFlags,
-) (*base.InternalKey, base.LazyValue) {
-	panic("pebble: SeekPrefixGE unimplemented")
-}
-
-func (i *compactionIterator) SeekLT(
-	key []byte, flags base.SeekLTFlags,
-) (*InternalKey, base.LazyValue) {
-	panic("pebble: SeekLT unimplemented")
-}
-
-func (i *compactionIterator) First() (*InternalKey, base.LazyValue) {
-	i.err = nil // clear cached iteration error
-	return i.skipForward(i.singleLevelIterator.First())
-}
-
-func (i *compactionIterator) Last() (*InternalKey, base.LazyValue) {
-	panic("pebble: Last unimplemented")
-}
-
-// Note: compactionIterator.Next mirrors the implementation of Iterator.Next
-// due to performance. Keep the two in sync.
-func (i *compactionIterator) Next() (*InternalKey, base.LazyValue) {
-	if i.err != nil {
-		return nil, base.LazyValue{}
-	}
-	return i.skipForward(i.data.Next())
-}
-
-func (i *compactionIterator) NextPrefix(succKey []byte) (*InternalKey, base.LazyValue) {
-	panic("pebble: NextPrefix unimplemented")
-}
-
-func (i *compactionIterator) Prev() (*InternalKey, base.LazyValue) {
-	panic("pebble: Prev unimplemented")
-}
-
-func (i *compactionIterator) skipForward(
-	key *InternalKey, val base.LazyValue,
-) (*InternalKey, base.LazyValue) {
-	if key == nil {
-		for {
-			if key, _ := i.index.Next(); key == nil {
-				break
+func init() {
+	singleLevelIterRowBlockPool = sync.Pool{
+		New: func() interface{} {
+			i := &singleLevelIteratorRowBlocks{pool: &singleLevelIterRowBlockPool}
+			if invariants.UseFinalizers {
+				invariants.SetFinalizer(i, checkSingleLevelIterator[rowblk.IndexIter, *rowblk.IndexIter, rowblk.Iter, *rowblk.Iter])
 			}
-			result := i.loadBlock(+1)
-			if result != loadBlockOK {
-				if i.err != nil {
-					break
-				}
-				switch result {
-				case loadBlockFailed:
-					// We checked that i.index was at a valid entry, so
-					// loadBlockFailed could not have happened due to to i.index
-					// being exhausted, and must be due to an error.
-					panic("loadBlock should not have failed with no error")
-				case loadBlockIrrelevant:
-					panic("compactionIter should not be using block intervals for skipping")
-				default:
-					panic(fmt.Sprintf("unexpected case %d", result))
-				}
-			}
-			// result == loadBlockOK
-			if key, val = i.data.First(); key != nil {
-				break
-			}
-		}
+			return i
+		},
 	}
-
-	curOffset := i.recordOffset()
-	*i.bytesIterated += uint64(curOffset - i.prevOffset)
-	i.prevOffset = curOffset
-
-	if i.vState != nil && key != nil {
-		cmp := i.cmp(key.UserKey, i.vState.upper.UserKey)
-		if cmp > 0 || (i.vState.upper.IsExclusiveSentinel() && cmp == 0) {
-			return nil, base.LazyValue{}
-		}
+	twoLevelIterRowBlockPool = sync.Pool{
+		New: func() interface{} {
+			i := &twoLevelIteratorRowBlocks{pool: &twoLevelIterRowBlockPool}
+			if invariants.UseFinalizers {
+				invariants.SetFinalizer(i, checkTwoLevelIterator[rowblk.IndexIter, *rowblk.IndexIter, rowblk.Iter, *rowblk.Iter])
+			}
+			return i
+		},
 	}
+	singleLevelIterColumnBlockPool = sync.Pool{
+		New: func() interface{} {
+			i := &singleLevelIteratorColumnBlocks{
+				pool: &singleLevelIterColumnBlockPool,
+			}
+			if invariants.UseFinalizers {
+				invariants.SetFinalizer(i, checkSingleLevelIterator[colblk.IndexIter, *colblk.IndexIter, colblk.DataBlockIter, *colblk.DataBlockIter])
+			}
+			return i
+		},
+	}
+	twoLevelIterColumnBlockPool = sync.Pool{
+		New: func() interface{} {
+			i := &twoLevelIteratorColumnBlocks{
+				pool: &twoLevelIterColumnBlockPool,
+			}
+			if invariants.UseFinalizers {
+				invariants.SetFinalizer(i, checkTwoLevelIterator[colblk.IndexIter, *colblk.IndexIter, colblk.DataBlockIter, *colblk.DataBlockIter])
+			}
+			return i
+		},
+	}
+}
 
-	return key, val
+func checkSingleLevelIterator[I any, PI indexBlockIterator[I], D any, PD dataBlockIterator[D]](
+	obj interface{},
+) {
+	i := obj.(*singleLevelIterator[I, PI, D, PD])
+	if h := PD(&i.data).Handle(); h.Valid() {
+		fmt.Fprintf(os.Stderr, "singleLevelIterator.data.handle is not nil: %#v\n", h)
+		os.Exit(1)
+	}
+	if h := PI(&i.index).Handle(); h.Valid() {
+		fmt.Fprintf(os.Stderr, "singleLevelIterator.index.handle is not nil: %#v\n", h)
+		os.Exit(1)
+	}
+}
+
+func checkTwoLevelIterator[I any, PI indexBlockIterator[I], D any, PD dataBlockIterator[D]](
+	obj interface{},
+) {
+	i := obj.(*twoLevelIterator[I, PI, D, PD])
+	if h := PD(&i.secondLevel.data).Handle(); h.Valid() {
+		fmt.Fprintf(os.Stderr, "singleLevelIterator.data.handle is not nil: %#v\n", h)
+		os.Exit(1)
+	}
+	if h := PI(&i.secondLevel.index).Handle(); h.Valid() {
+		fmt.Fprintf(os.Stderr, "singleLevelIterator.index.handle is not nil: %#v\n", h)
+		os.Exit(1)
+	}
 }

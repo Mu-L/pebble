@@ -5,18 +5,19 @@
 package metamorphic
 
 import (
+	"fmt"
+	"math/rand/v2"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/pebble/internal/randvar"
 	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 func TestGenerator(t *testing.T) {
 	rng := randvar.NewRand()
-	g := newGenerator(rng, defaultConfig(), newKeyManager())
+	g := newGenerator(rng, DefaultOpConfig(), newKeyManager(1 /* numInstances */))
 
 	g.newBatch()
 	g.newBatch()
@@ -61,7 +62,7 @@ func TestGenerator(t *testing.T) {
 		t.Logf("\n%s", g)
 	}
 
-	g = newGenerator(rng, defaultConfig(), newKeyManager())
+	g = newGenerator(rng, DefaultOpConfig(), newKeyManager(1 /* numInstances */))
 
 	g.newSnapshot()
 	g.newSnapshot()
@@ -94,7 +95,7 @@ func TestGenerator(t *testing.T) {
 		t.Logf("\n%s", g)
 	}
 
-	g = newGenerator(rng, defaultConfig(), newKeyManager())
+	g = newGenerator(rng, DefaultOpConfig(), newKeyManager(1 /* numInstances */))
 
 	g.newIndexedBatch()
 	g.newIndexedBatch()
@@ -127,28 +128,69 @@ func TestGenerator(t *testing.T) {
 func TestGeneratorRandom(t *testing.T) {
 	seed := uint64(time.Now().UnixNano())
 	ops := randvar.NewUniform(1000, 10000)
-	generateFromSeed := func() string {
-		rng := rand.New(rand.NewSource(seed))
+	cfgs := []string{"default", "multiInstance"}
+	generateFromSeed := func(cfg OpConfig) string {
+		rng := rand.New(rand.NewPCG(0, seed))
 		count := ops.Uint64(rng)
-		return formatOps(generate(rng, count, defaultConfig(), newKeyManager()))
+		km := newKeyManager(cfg.numInstances)
+		g := newGenerator(rng, cfg, km)
+		return formatOps(km.kf, g.generate(count))
 	}
 
-	// Ensure that generate doesn't use any other source of randomness other
-	// than rng.
-	referenceOps := generateFromSeed()
-	for i := 0; i < 10; i++ {
-		regeneratedOps := generateFromSeed()
-		diff, err := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
-			A:       difflib.SplitLines(referenceOps),
-			B:       difflib.SplitLines(regeneratedOps),
-			Context: 1,
+	for i := range cfgs {
+		t.Run(fmt.Sprintf("config=%s", cfgs[i]), func(t *testing.T) {
+			cfg := DefaultOpConfig
+			if cfgs[i] == "multiInstance" {
+				cfg = func() OpConfig {
+					cfg := multiInstanceConfig()
+					cfg.numInstances = 2
+					return cfg
+				}
+			}
+			// Ensure that generate doesn't use any other source of randomness other
+			// than rng.
+			referenceOps := generateFromSeed(cfg())
+			for i := 0; i < 10; i++ {
+				regeneratedOps := generateFromSeed(cfg())
+				diff, err := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
+					A:       difflib.SplitLines(referenceOps),
+					B:       difflib.SplitLines(regeneratedOps),
+					Context: 1,
+				})
+				require.NoError(t, err)
+				if len(diff) > 0 {
+					t.Fatalf("Diff:\n%s", diff)
+				}
+			}
+			if testing.Verbose() {
+				t.Logf("\nOps:\n%s", referenceOps)
+			}
 		})
-		require.NoError(t, err)
-		if len(diff) > 0 {
-			t.Fatalf("Diff:\n%s", diff)
-		}
 	}
-	if testing.Verbose() {
-		t.Logf("\nOps:\n%s", referenceOps)
+}
+
+func TestGenerateDisjointKeyRanges(t *testing.T) {
+	rng := randvar.NewRand()
+	g := newGenerator(rng, DefaultOpConfig(), newKeyManager(1 /* numInstances */))
+
+	for i := 0; i < 10; i++ {
+		keyRanges := g.generateDisjointKeyRanges(5)
+		for j := range keyRanges {
+			t.Logf("%d: %d: %s", i, j, keyRanges[j])
+			for k := range keyRanges {
+				if j == k {
+					continue
+				}
+				if g.cmp(keyRanges[j].End, keyRanges[k].Start) <= 0 {
+					require.Less(t, j, k)
+					continue
+				}
+				if g.cmp(keyRanges[j].Start, keyRanges[k].End) >= 0 {
+					require.Greater(t, j, k)
+					continue
+				}
+				t.Fatalf("generated key ranges %q and %q overlap", keyRanges[j], keyRanges[k])
+			}
+		}
 	}
 }

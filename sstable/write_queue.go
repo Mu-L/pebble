@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/sstable/block"
 )
 
 type writeTask struct {
@@ -39,7 +40,7 @@ func (task *writeTask) clear() {
 type writeQueue struct {
 	tasks  chan *writeTask
 	wg     sync.WaitGroup
-	writer *Writer
+	writer *RawRowWriter
 
 	// err represents an error which is encountered when the write queue attempts
 	// to write a block to disk. The error is stored here to skip unnecessary block
@@ -48,7 +49,7 @@ type writeQueue struct {
 	closed bool
 }
 
-func newWriteQueue(size int, writer *Writer) *writeQueue {
+func newWriteQueue(size int, writer *RawRowWriter) *writeQueue {
 	w := &writeQueue{}
 	w.tasks = make(chan *writeTask, size)
 	w.writer = writer
@@ -59,15 +60,12 @@ func newWriteQueue(size int, writer *Writer) *writeQueue {
 }
 
 func (w *writeQueue) performWrite(task *writeTask) error {
-	var bh BlockHandle
-	var bhp BlockHandleWithProperties
-
+	var bhp block.HandleWithProperties
 	var err error
-	if bh, err = w.writer.writeCompressedBlock(task.buf.compressed, task.buf.tmp[:]); err != nil {
+	if bhp.Handle, err = w.writer.layout.WritePrecompressedDataBlock(task.buf.physical); err != nil {
 		return err
 	}
-
-	bhp = BlockHandleWithProperties{BlockHandle: bh, Props: task.buf.dataBlockProps}
+	bhp = block.HandleWithProperties{Handle: bhp.Handle, Props: task.buf.dataBlockProps}
 	if err = w.writer.addIndexEntry(
 		task.indexEntrySep, bhp, task.buf.tmp[:], task.flushableIndexBlock, task.currIndexBlock,
 		task.indexInflightSize, task.finishedIndexProps); err != nil {

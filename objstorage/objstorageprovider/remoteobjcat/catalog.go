@@ -5,9 +5,11 @@
 package remoteobjcat
 
 import (
+	"cmp"
 	"fmt"
 	"io"
-	"sort"
+	"path/filepath"
+	"slices"
 	"sync"
 
 	"github.com/cockroachdb/errors"
@@ -114,8 +116,8 @@ func Open(fs vfs.FS, dirname string) (*Catalog, CatalogContents, error) {
 		res.Objects = append(res.Objects, meta)
 	}
 	// Sort the objects so the function is deterministic.
-	sort.Slice(res.Objects, func(i, j int) bool {
-		return res.Objects[i].FileNum.FileNum() < res.Objects[j].FileNum.FileNum()
+	slices.SortFunc(res.Objects, func(a, b RemoteObjectMetadata) int {
+		return cmp.Compare(a.FileNum, b.FileNum)
 	})
 	return c, res, nil
 }
@@ -123,7 +125,7 @@ func Open(fs vfs.FS, dirname string) (*Catalog, CatalogContents, error) {
 // SetCreatorID sets the creator ID. If it is already set, it must match.
 func (c *Catalog) SetCreatorID(id objstorage.CreatorID) error {
 	if !id.IsSet() {
-		return errors.AssertionFailedf("attempt to unset CreatorID")
+		return base.AssertionFailedf("attempt to unset CreatorID")
 	}
 
 	c.mu.Lock()
@@ -131,14 +133,14 @@ func (c *Catalog) SetCreatorID(id objstorage.CreatorID) error {
 
 	if c.mu.creatorID.IsSet() {
 		if c.mu.creatorID != id {
-			return errors.AssertionFailedf("attempt to change CreatorID from %s to %s", c.mu.creatorID, id)
+			return base.AssertionFailedf("attempt to change CreatorID from %s to %s", c.mu.creatorID, id)
 		}
 		return nil
 	}
 
 	ve := VersionEdit{CreatorID: id}
 	if err := c.writeToCatalogFileLocked(&ve); err != nil {
-		return errors.Wrapf(err, "pebble: could not write to remote object catalog: %v", err)
+		return errors.Wrapf(err, "pebble: could not write to remote object catalog")
 	}
 	c.mu.creatorID = id
 	return nil
@@ -146,7 +148,12 @@ func (c *Catalog) SetCreatorID(id objstorage.CreatorID) error {
 
 // Close any open files.
 func (c *Catalog) Close() error {
-	return c.closeCatalogFile()
+	var err error
+	if c.mu.marker != nil {
+		err = c.mu.marker.Close()
+		c.mu.marker = nil
+	}
+	return errors.CombineErrors(err, c.closeCatalogFile())
 }
 
 func (c *Catalog) closeCatalogFile() error {
@@ -218,37 +225,40 @@ func (c *Catalog) ApplyBatch(b Batch) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Sanity checks.
+	toAdd := make(map[base.DiskFileNum]struct{}, len(b.ve.NewObjects))
+	exists := func(n base.DiskFileNum) bool {
+		_, ok := c.mu.objects[n]
+		if !ok {
+			_, ok = toAdd[n]
+		}
+		return ok
+	}
+	for _, meta := range b.ve.NewObjects {
+		if exists(meta.FileNum) {
+			return base.AssertionFailedf("adding existing object %s", meta.FileNum)
+		}
+		toAdd[meta.FileNum] = struct{}{}
+	}
+	for _, n := range b.ve.DeletedObjects {
+		if !exists(n) {
+			return base.AssertionFailedf("deleting non-existent object %s", n)
+		}
+	}
+
+	if err := c.writeToCatalogFileLocked(&b.ve); err != nil {
+		return errors.Wrapf(err, "pebble: could not write to remote object catalog")
+	}
+
 	// Add new objects before deleting any objects. This allows for cases where
 	// the same batch adds and deletes an object.
 	for _, meta := range b.ve.NewObjects {
-		if _, exists := c.mu.objects[meta.FileNum]; exists {
-			return errors.AssertionFailedf("adding existing object %s", meta.FileNum)
-		}
-	}
-	for _, meta := range b.ve.NewObjects {
 		c.mu.objects[meta.FileNum] = meta
 	}
-	removeAddedObjects := func() {
-		for i := range b.ve.NewObjects {
-			delete(c.mu.objects, b.ve.NewObjects[i].FileNum)
-		}
-	}
-	for _, n := range b.ve.DeletedObjects {
-		if _, exists := c.mu.objects[n]; !exists {
-			removeAddedObjects()
-			return errors.AssertionFailedf("deleting non-existent object %s", n)
-		}
-	}
-	// Apply the remainder of the batch to our current state.
 	for _, n := range b.ve.DeletedObjects {
 		delete(c.mu.objects, n)
 	}
 
-	if err := c.writeToCatalogFileLocked(&b.ve); err != nil {
-		return errors.Wrapf(err, "pebble: could not write to remote object catalog: %v", err)
-	}
-
-	b.Reset()
 	return nil
 }
 
@@ -273,13 +283,15 @@ func (c *Catalog) loadFromCatalogFile(filename string) error {
 				errors.Safe(filename))
 		}
 		var ve VersionEdit
-		err = ve.Decode(r)
-		if err != nil {
+		if err := ve.Decode(r); err != nil {
 			return errors.Wrapf(err, "pebble: error when loading remote object catalog file %q",
 				errors.Safe(filename))
 		}
 		// Apply the version edit to the current state.
-		ve.Apply(&c.mu.creatorID, c.mu.objects)
+		if err := ve.Apply(&c.mu.creatorID, c.mu.objects); err != nil {
+			return errors.Wrapf(err, "pebble: error when loading remote object catalog file %q",
+				errors.Safe(filename))
+		}
 	}
 	return nil
 }
@@ -319,11 +331,11 @@ func makeCatalogFilename(iter uint64) string {
 // current catalog and sets c.mu.catalogFile and c.mu.catalogRecWriter.
 func (c *Catalog) createNewCatalogFileLocked() (outErr error) {
 	if c.mu.catalogFile != nil {
-		return errors.AssertionFailedf("catalogFile already open")
+		return base.AssertionFailedf("catalogFile already open")
 	}
 	filename := makeCatalogFilename(c.mu.marker.NextIter())
 	filepath := c.fs.PathJoin(c.dirname, filename)
-	file, err := c.fs.Create(filepath)
+	file, err := c.fs.Create(filepath, "pebble-manifest")
 	if err != nil {
 		return err
 	}
@@ -365,6 +377,28 @@ func (c *Catalog) createNewCatalogFileLocked() (outErr error) {
 	c.mu.catalogRecWriter = recWriter
 	c.mu.catalogFilename = filename
 	return nil
+}
+
+// Checkpoint copies catalog state to a file in the specified directory
+func (c *Catalog) Checkpoint(fs vfs.FS, dir string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// NB: Every write to recWriter is flushed. We don't need to worry about
+	// this new file descriptor not getting all the saved catalog entries.
+	existingCatalogFilepath := filepath.Join(c.dirname, c.mu.catalogFilename)
+	destPath := filepath.Join(dir, c.mu.catalogFilename)
+	if err := vfs.CopyAcrossFS(c.fs, existingCatalogFilepath, fs, destPath); err != nil {
+		return err
+	}
+	catalogMarker, _, err := atomicfs.LocateMarker(fs, dir, catalogMarkerName)
+	if err != nil {
+		return err
+	}
+	if err := catalogMarker.Move(c.mu.catalogFilename); err != nil {
+		return err
+	}
+	return catalogMarker.Close()
 }
 
 func writeRecord(ve *VersionEdit, file vfs.File, recWriter *record.Writer) error {

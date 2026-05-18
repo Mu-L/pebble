@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/crlib/crstrings"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
@@ -351,7 +352,13 @@ func (i *InterleavingIter) InvalidateCachedSpan() {
 }
 
 // SeekGE implements InternalIterator.
-func (i *InterleavingIter) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV {
+func (i *InterleavingIter) SeekGE(key []byte, flags base.SeekGEFlags) (kv *base.InternalKV) {
+	if treesteps.Enabled && treesteps.IsRecording(i) {
+		op := treesteps.StartOpf(i, "SeekGE(%q%s)", key, crstrings.If(flags != 0, ", "+flags.String()))
+		defer func() {
+			op.Finishf("= %s", kv.String())
+		}()
+	}
 	return i.seekGEHelper(key, flags, i.pointIter.SeekGE(key, flags))
 }
 
@@ -398,7 +405,13 @@ func (i *InterleavingIter) seekGEHelper(
 // SeekPrefixGE implements InternalIterator.
 func (i *InterleavingIter) SeekPrefixGE(
 	prefix, key []byte, flags base.SeekGEFlags,
-) *base.InternalKV {
+) (kv *base.InternalKV) {
+	if treesteps.Enabled && treesteps.IsRecording(i) {
+		op := treesteps.StartOpf(i, "SeekPrefixGE(%q, %q%s)", prefix, key, crstrings.If(flags != 0, ", "+flags.String()))
+		defer func() {
+			op.Finishf("= %s", kv.String())
+		}()
+	}
 	if invariants.Enabled {
 		if i.lower != nil && i.cmp.Compare(key, i.lower) < 0 {
 			panic(errors.AssertionFailedf("forward seek (%q) before lower bound %q", key, i.lower))
@@ -407,7 +420,7 @@ func (i *InterleavingIter) SeekPrefixGE(
 			panic(errors.AssertionFailedf("prefix %q does not match key %q", prefix, key))
 		}
 	}
-	kv := i.pointIter.SeekPrefixGE(prefix, key, flags)
+	kv = i.pointIter.SeekPrefixGE(prefix, key, flags)
 	i.checkPoint(kv)
 	if invariants.Enabled && kv != nil && !i.cmp.HasPrefix(kv.K.UserKey, prefix) {
 		panic(errors.AssertionFailedf("pointIter %T did not enforce strict prefix iteration", i.pointIter))
@@ -437,7 +450,13 @@ func (i *InterleavingIter) SeekPrefixGE(
 }
 
 // SeekLT implements InternalIterator.
-func (i *InterleavingIter) SeekLT(key []byte, flags base.SeekLTFlags) *base.InternalKV {
+func (i *InterleavingIter) SeekLT(key []byte, flags base.SeekLTFlags) (kv *base.InternalKV) {
+	if treesteps.Enabled && treesteps.IsRecording(i) {
+		op := treesteps.StartOpf(i, "SeekLT(%q, %d)", key, flags)
+		defer func() {
+			op.Finishf("= %s", kv.String())
+		}()
+	}
 	return i.seekLTHelper(key, i.pointIter.SeekLT(key, flags))
 }
 
@@ -467,7 +486,13 @@ func (i *InterleavingIter) seekLTHelper(key []byte, kv *base.InternalKV) *base.I
 }
 
 // First implements InternalIterator.
-func (i *InterleavingIter) First() *base.InternalKV {
+func (i *InterleavingIter) First() (kv *base.InternalKV) {
+	if treesteps.Enabled && treesteps.IsRecording(i) {
+		op := treesteps.StartOpf(i, "First()")
+		defer func() {
+			op.Finishf("= %s", kv.String())
+		}()
+	}
 	i.dir = +1
 	i.prefix = nil
 	i.atBoundary = false
@@ -505,7 +530,13 @@ func (i *InterleavingIter) First() *base.InternalKV {
 }
 
 // Last implements InternalIterator.
-func (i *InterleavingIter) Last() *base.InternalKV {
+func (i *InterleavingIter) Last() (kv *base.InternalKV) {
+	if treesteps.Enabled && treesteps.IsRecording(i) {
+		op := treesteps.StartOpf(i, "Last()")
+		defer func() {
+			op.Finishf("= %s", kv.String())
+		}()
+	}
 	i.dir = -1
 	i.prefix = nil
 	i.atBoundary = false
@@ -540,7 +571,13 @@ func (i *InterleavingIter) Last() *base.InternalKV {
 }
 
 // Next implements InternalIterator.
-func (i *InterleavingIter) Next() *base.InternalKV {
+func (i *InterleavingIter) Next() (kv *base.InternalKV) {
+	if treesteps.Enabled && treesteps.IsRecording(i) {
+		op := treesteps.StartOpf(i, "Next()")
+		defer func() {
+			op.Finishf("= %s", kv.String())
+		}()
+	}
 	if i.dir == -1 {
 		return i.switchToForward()
 	}
@@ -629,7 +666,13 @@ func (i *InterleavingIter) updateSpanAfterForwardBoundary() {
 }
 
 // Prev implements InternalIterator.
-func (i *InterleavingIter) Prev() *base.InternalKV {
+func (i *InterleavingIter) Prev() (kv *base.InternalKV) {
+	if treesteps.Enabled && treesteps.IsRecording(i) {
+		op := treesteps.StartOpf(i, "Prev()")
+		defer func() {
+			op.Finishf("= %s", kv.String())
+		}()
+	}
 	if i.dir == +1 {
 		return i.switchToBackward()
 	}
@@ -760,15 +803,21 @@ func (i *InterleavingIter) switchToBackward() *base.InternalKV {
 }
 
 // NextPrefix implements InternalIterator.
-func (i *InterleavingIter) NextPrefix(succKey []byte) *base.InternalKV {
+func (i *InterleavingIter) NextPrefix(succKey []byte) (kv *base.InternalKV) {
+	if treesteps.Enabled && treesteps.IsRecording(i) {
+		op := treesteps.StartOpf(i, "NextPrefix(%q)", succKey)
+		defer func() {
+			op.Finishf("= %s", kv.String())
+		}()
+	}
 	if invariants.Enabled && i.atBoundary {
 		panic(errors.AssertionFailedf("NextPrefix called when at boundary key"))
 	}
-	var kv *base.InternalKV
+	var pkv *base.InternalKV
 	if i.pointKV != nil {
-		kv = i.pointIter.NextPrefix(succKey)
+		pkv = i.pointIter.NextPrefix(succKey)
 	}
-	return i.seekGEHelper(succKey, base.SeekGEFlagsNone.EnableTrySeekUsingNext(), kv)
+	return i.seekGEHelper(succKey, base.SeekGEFlagsNone.EnableTrySeekUsingNext(), pkv)
 }
 
 // SetBounds implements InternalIterator.
